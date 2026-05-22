@@ -1,4 +1,4 @@
-from autocode.policy import classify_chat, priority_completion_satisfied, should_continue_after_output
+from autocode.policy import assess_output_state, classify_chat, priority_completion_satisfied, should_continue_after_output
 
 
 def test_classifies_coding_chat():
@@ -53,4 +53,31 @@ def test_negated_completion_marker_is_not_completion():
         "FLEET_MILESTONE_COMPLETE\nThis is not `FLEET_DONE`; transfer/send/receive is still not complete.",
     )
     assert not ok
-    assert reason == "missing FLEET_DONE"
+    assert "milestone" in reason
+
+
+def test_completion_is_inferred_without_magic_marker():
+    goal = (
+        "Make RedWallet production ready. HARD REQUIREMENT: do not call this done until tests prove "
+        "full Utreexo/proof-backed storage and validation for BitAssets asset creation, sending, and receiving."
+    )
+    assessment = assess_output_state(
+        goal,
+        "Completed and verified. Tests passed for Utreexo proof-backed storage, asset creation, sending, and receiving.",
+    )
+    assert assessment.complete
+    assert assessment.state == "done"
+
+
+def test_remaining_work_overrides_completion_language():
+    goal = (
+        "Make RedWallet production ready. HARD REQUIREMENT: do not call this done until tests prove "
+        "full Utreexo/proof-backed storage and validation for BitAssets asset creation, sending, and receiving."
+    )
+    assessment = assess_output_state(
+        goal,
+        "Completed and pushed a clean checkpoint. Current blocker: full transfer/send/receive plus restart persistence proof is still not complete. Next automatic step: fix mining.",
+    )
+    assert not assessment.complete
+    assert assessment.state == "active"
+    assert "remaining work" in assessment.reason

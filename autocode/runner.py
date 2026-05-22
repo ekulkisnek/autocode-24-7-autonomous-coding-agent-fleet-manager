@@ -10,7 +10,7 @@ from sqlite3 import Row
 from .config import DEFAULT_JOB_TIMEOUT, JOBS
 from .config import HOME
 from .models import Chat, ContinuePlan
-from .policy import FLEET_DONE_MARKER, priority_completion_satisfied, should_continue_after_output
+from .policy import assess_output_state
 from .store import Store
 from .util import json_dumps, now_iso, now_ts, read_text
 
@@ -177,7 +177,7 @@ class JobRunner:
                 con.execute("delete from leases where job_id=?", (job["id"],))
                 chat = con.execute("select * from chats where id=?", (job["chat_id"],)).fetchone()
                 output = read_text(out, limit=12000) + "\n" + read_text(err, limit=4000)
-                if FLEET_DONE_MARKER.search(output):
+                if evidence_status == "worked":
                     priority = con.execute(
                         """
                         select * from project_priorities
@@ -187,23 +187,24 @@ class JobRunner:
                         """,
                         (job["chat_id"],),
                     ).fetchone()
-                    accepted = True
-                    reason = "FLEET_DONE accepted"
-                    if priority:
-                        accepted, reason = priority_completion_satisfied(priority["objective"], output)
-                    if accepted:
+                    objective = str(priority["objective"] if priority else (chat["objective"] if chat else ""))
+                    assessment = assess_output_state(objective, output)
+                    if assessment.complete:
                         con.execute("update chats set done=1,state='done',last_evidence_at=? where id=?", (now_iso(), job["chat_id"]))
                         con.execute("update goals set status='complete',updated_at=? where chat_id=? and status='active'", (now_iso(), job["chat_id"]))
                         con.execute("update project_priorities set status='complete',updated_at=? where status='active' and target_chat_id=?", (now_iso(), job["chat_id"]))
                     else:
-                        con.execute("update chats set done=0,state='active',last_evidence_at=? where id=?", (now_iso(), job["chat_id"]))
+                        con.execute("update chats set done=0,state=?,last_evidence_at=? where id=?", (assessment.state, now_iso(), job["chat_id"]))
                         con.execute(
                             "insert into events(ts,kind,chat_id,job_id,details_json) values(?,?,?,?,?)",
-                            (now_iso(), "completion_rejected", job["chat_id"], job["id"], json_dumps({"reason": reason})),
+                            (
+                                now_iso(),
+                                "completion_assessed",
+                                job["chat_id"],
+                                job["id"],
+                                json_dumps({"state": assessment.state, "complete": assessment.complete, "reason": assessment.reason, "missing": list(assessment.missing)}),
+                            ),
                         )
-                elif evidence_status == "worked":
-                    next_state = "active" if should_continue_after_output(output) else "active"
-                    con.execute("update chats set state=?,last_evidence_at=? where id=?", (next_state, now_iso(), job["chat_id"]))
                 else:
                     con.execute("update chats set state='stalled',failure_count=failure_count+1 where id=?", (job["chat_id"],))
         if status != "running":

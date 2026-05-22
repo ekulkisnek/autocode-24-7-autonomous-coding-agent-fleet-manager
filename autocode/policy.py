@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from sqlite3 import Row
 
 from .util import compact, parse_ts
@@ -21,6 +22,35 @@ BLOCKED_NONCODING = re.compile(
     r"\b(ocmma|hardware plugged|fleet captain|captain brain|smoke test|hermes autonomous coding fleet)\b",
     re.I,
 )
+NOT_COMPLETE_WORDS = re.compile(
+    r"\b(not\s+(?:complete|done|finished|verified)|still\s+(?:not|needs?|missing|blocked)|"
+    r"remaining|current blocker|blocker:|next automatic step|next step|todo|needs input|"
+    r"does not complete|failed|fails|stuck|stall(?:ed|s)?)\b",
+    re.I,
+)
+USER_GATED_WORDS = re.compile(
+    r"\b(user action required|need(?:s)? (?:you|luke|hermes)|please grant|permission required|"
+    r"waiting for (?:you|luke|permission)|manual action required|cannot proceed without)\b",
+    re.I,
+)
+COMPLETION_CLAIM_WORDS = re.compile(
+    r"\b(complete(?:d)?|finished|done|production ready|fully verified|all tests pass(?:ed)?|"
+    r"shipped|wrapped up|no remaining work|nothing left)\b",
+    re.I,
+)
+VERIFICATION_WORDS = re.compile(
+    r"\b(verif(?:y|ied|ication)|test(?:s|ed|ing)?|pass(?:ed|ing)?|green|"
+    r"lint(?:ed)?|typecheck(?:ed)?|tsc|jest|pytest|cargo test|detox|smoke)\b",
+    re.I,
+)
+
+
+@dataclass(frozen=True)
+class OutputAssessment:
+    state: str
+    complete: bool
+    reason: str
+    missing: tuple[str, ...] = ()
 
 
 def classify_chat(title: str, cwd: str, latest: str) -> tuple[int, str, str]:
@@ -68,17 +98,14 @@ def should_continue_after_output(text: str) -> bool:
     return bool(MILESTONE_WORDS.search(text) or ASK_WORDS.search(text))
 
 
-def priority_completion_satisfied(objective: str, output: str) -> tuple[bool, str]:
-    """Return whether an auto-completion is strong enough for a pinned priority."""
+def hard_requirement_gaps(objective: str, output: str) -> list[str]:
     text = (output or "").lower()
     goal = (objective or "").lower()
-    if not FLEET_DONE_MARKER.search(output or ""):
-        return False, "missing FLEET_DONE"
     if "hard requirement" not in goal:
-        return True, "FLEET_DONE accepted"
+        return []
 
     missing: list[str] = []
-    if not re.search(r"\b(verif(?:y|ied|ication)|test(?:s|ed|ing)?|pass(?:ed|ing)?)\b", text):
+    if not VERIFICATION_WORDS.search(output or ""):
         missing.append("verification/tests")
     for required in ("utreexo", "proof"):
         if required in goal and required not in text:
@@ -91,9 +118,41 @@ def priority_completion_satisfied(objective: str, output: str) -> tuple[bool, st
     for label, needles in checks:
         if label in goal and not any(n in text for n in needles):
             missing.append(label)
+    return missing
+
+
+def assess_output_state(objective: str, output: str) -> OutputAssessment:
+    """Read job output and infer whether the goal is complete, active, or waiting."""
+    text = output or ""
+    if not text.strip():
+        return OutputAssessment("stalled", False, "no output")
+
+    missing = tuple(hard_requirement_gaps(objective, text))
+    milestone = bool(FLEET_MILESTONE_MARKER.search(text))
+    not_complete = bool(NOT_COMPLETE_WORDS.search(text))
+    user_gated = bool(USER_GATED_WORDS.search(text))
+    completion_claim = bool(FLEET_DONE_MARKER.search(text) or COMPLETION_CLAIM_WORDS.search(text))
+    verified = bool(VERIFICATION_WORDS.search(text))
+
+    if user_gated and not completion_claim:
+        return OutputAssessment("needs_input", False, "output says user action is required", missing)
+    if milestone:
+        return OutputAssessment("active", False, "milestone output with continuing work", missing)
+    if not_complete:
+        return OutputAssessment("active", False, "output describes remaining work or blocker", missing)
     if missing:
-        return False, "missing " + ", ".join(missing)
-    return True, "hard requirement satisfied"
+        return OutputAssessment("active", False, "missing hard requirement evidence: " + ", ".join(missing), missing)
+    if completion_claim and verified:
+        return OutputAssessment("done", True, "output claims completion with verification")
+    if completion_claim and "hard requirement" not in (objective or "").lower():
+        return OutputAssessment("done", True, "output claims completion")
+    return OutputAssessment("active", False, "worked output but no complete verified state", missing)
+
+
+def priority_completion_satisfied(objective: str, output: str) -> tuple[bool, str]:
+    """Return whether output is strong enough to complete a pinned priority."""
+    assessment = assess_output_state(objective, output)
+    return assessment.complete, assessment.reason
 
 
 def build_prompt(row: Row, recovery: bool = False) -> str:
