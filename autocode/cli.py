@@ -407,8 +407,6 @@ def squad_plan_for(lane: dict[str, str], prompt: str, job_dir: Path) -> Continue
                 "--no-alt-screen",
                 "--permission-mode",
                 "bypassPermissions",
-                "--effort",
-                "high",
             ],
             prompt_file=True,
             same_chat=False,

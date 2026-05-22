@@ -194,7 +194,7 @@ class Scheduler:
             continuation=row["continuation"],
         )
         job_dir = self._planned_job_dir()
-        if int(row["failure_count"] or 0) >= 2:
+        if int(row["failure_count"] or 0) >= 2 and not self._pinned_priority(row):
             plan = self.fallback_plan(row, prompt, job_dir)
         else:
             providers = provider_map()
@@ -233,8 +233,6 @@ class Scheduler:
                     "--no-alt-screen",
                     "--permission-mode",
                     "bypassPermissions",
-                    "--effort",
-                    "high",
                 ],
                 prompt_file=True,
                 same_chat=False,
@@ -256,3 +254,9 @@ class Scheduler:
         p = JOBS / ("job-" + uuid.uuid4().hex[:12])
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+    def _pinned_priority(self, row: Row) -> bool:
+        try:
+            return bool(row["priority_id"] and row["priority_objective"])
+        except Exception:
+            return False

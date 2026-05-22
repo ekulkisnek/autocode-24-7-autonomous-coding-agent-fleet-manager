@@ -234,6 +234,11 @@ class JobRunner:
             "no such file or directory",
             "command not found",
             "permission denied",
+            "api error",
+            "bad request",
+            "http_status",
+            "internal error",
+            "does not support parameter",
         ]
         return any(marker in text for marker in fatal)
 

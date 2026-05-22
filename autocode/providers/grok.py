@@ -57,11 +57,8 @@ class GrokProvider(Provider):
                 "--no-alt-screen",
                 "--permission-mode",
                 "bypassPermissions",
-                "--effort",
-                "high",
             ],
             stdin=None,
             prompt_file=True,
             same_chat=True,
         )
-
