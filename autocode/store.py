@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -16,12 +17,17 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.init()
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self):
         con = sqlite3.connect(self.path, timeout=30)
         con.row_factory = sqlite3.Row
         con.execute("pragma journal_mode=wal")
         con.execute("pragma busy_timeout=5000")
-        return con
+        try:
+            yield con
+            con.commit()
+        finally:
+            con.close()
 
     def init(self) -> None:
         with self.connect() as con:
