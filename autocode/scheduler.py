@@ -22,6 +22,7 @@ class Scheduler:
     def tick(self, dispatch: bool = True, max_projects: int | None = None) -> dict:
         self.runner.refresh()
         self._maybe_discover()
+        self.enforce_priority_invariants()
         active = self.active_job_count()
         cap = self.capacity()
         limit = max(0, min(max_projects or cap, cap) - active)
@@ -53,7 +54,58 @@ class Scheduler:
     def force_discover(self) -> dict[str, int]:
         stats = discover(self.store)
         self.store.set_config("last_discovery_ts", str(time.time()))
+        self.enforce_priority_invariants()
         return stats
+
+    def enforce_priority_invariants(self) -> int:
+        """Keep active pinned priorities schedulable in their exact target chat."""
+        priorities = self.store.rows(
+            """
+            select * from project_priorities
+            where status='active' and target_chat_id!=''
+            """
+        )
+        repaired = 0
+        with self.store.connect() as con:
+            for p in priorities:
+                row = con.execute("select * from chats where id=?", (p["target_chat_id"],)).fetchone()
+                if not row:
+                    continue
+                state = "running" if row["state"] == "running" else "active"
+                if row["done"] or row["paused"] or not row["adopted"] or row["state"] not in {"active", "running", "stalled", "needs_input"}:
+                    repaired += 1
+                con.execute(
+                    """
+                    update chats
+                    set adopted=1,paused=0,done=0,state=?,objective=?,
+                      coding_score=max(coding_score, 1)
+                    where id=?
+                    """,
+                    (state, p["objective"], p["target_chat_id"]),
+                )
+                con.execute(
+                    """
+                    insert into goals(id,chat_id,objective,status,source,created_at,updated_at)
+                    values(?,?,?,?,?,?,?)
+                    on conflict(id) do update set objective=excluded.objective,status='active',updated_at=excluded.updated_at
+                    """,
+                    (
+                        f"priority:{p['id']}",
+                        p["target_chat_id"],
+                        p["objective"],
+                        "active",
+                        "priority",
+                        now_iso(),
+                        now_iso(),
+                    ),
+                )
+                con.execute(
+                    "update goals set status='superseded',updated_at=? where chat_id=? and status='active' and id!=?",
+                    (now_iso(), p["target_chat_id"], f"priority:{p['id']}"),
+                )
+        if repaired:
+            self.store.event("priority_invariants_repaired", repaired=repaired)
+        return repaired
 
     def capacity(self) -> int:
         configured = int(self.store.get_config("max_active", str(DEFAULT_MAX_ACTIVE)) or DEFAULT_MAX_ACTIVE)

@@ -66,6 +66,34 @@ def should_continue_after_output(text: str) -> bool:
     return bool(MILESTONE_WORDS.search(text) or ASK_WORDS.search(text))
 
 
+def priority_completion_satisfied(objective: str, output: str) -> tuple[bool, str]:
+    """Return whether an auto-completion is strong enough for a pinned priority."""
+    text = (output or "").lower()
+    goal = (objective or "").lower()
+    if "fleet_done" not in text:
+        return False, "missing FLEET_DONE"
+    if "hard requirement" not in goal:
+        return True, "FLEET_DONE accepted"
+
+    missing: list[str] = []
+    if not re.search(r"\b(verif(?:y|ied|ication)|test(?:s|ed|ing)?|pass(?:ed|ing)?)\b", text):
+        missing.append("verification/tests")
+    for required in ("utreexo", "proof"):
+        if required in goal and required not in text:
+            missing.append(required)
+    checks = [
+        ("asset creation", ("asset", "creat")),
+        ("sending", ("send", "sent", "transfer")),
+        ("receiving", ("receiv",)),
+    ]
+    for label, needles in checks:
+        if label in goal and not any(n in text for n in needles):
+            missing.append(label)
+    if missing:
+        return False, "missing " + ", ".join(missing)
+    return True, "hard requirement satisfied"
+
+
 def build_prompt(row: Row, recovery: bool = False) -> str:
     priority_objective = ""
     try:

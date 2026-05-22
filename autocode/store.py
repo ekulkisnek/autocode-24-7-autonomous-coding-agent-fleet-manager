@@ -178,9 +178,26 @@ class Store:
         alias = chat.alias or chat.id.split(":", 1)[-1]
         with self.connect() as con:
             old = con.execute("select * from chats where id=?", (chat.id,)).fetchone()
+            priority = con.execute(
+                """
+                select * from project_priorities
+                where status='active' and target_chat_id=?
+                order by priority desc, updated_at desc
+                limit 1
+                """,
+                (chat.id,),
+            ).fetchone()
             adopted = int(old["adopted"]) if old else int(coding_score > 0)
             paused = int(old["paused"]) if old else 0
             done = int(old["done"]) if old else 0
+            if priority:
+                adopted = 1
+                paused = 0
+                done = 0
+                coding_score = max(coding_score, 1)
+                objective = str(priority["objective"] or objective)
+                if state == "done":
+                    state = "active"
             if state == "done":
                 done = 1
             old_obj = str(old["objective"]) if old else ""
@@ -204,7 +221,8 @@ class Store:
                   latest_text=excluded.latest_text,transcript_hash=excluded.transcript_hash,continuation=excluded.continuation,
                   coding_score=max(chats.coding_score, excluded.coding_score),state=excluded.state,
                   adopted=max(chats.adopted, excluded.adopted),objective=case when chats.objective='' then excluded.objective else chats.objective end,
-                  last_seen_at=excluded.last_seen_at,metadata_json=excluded.metadata_json
+                  last_seen_at=excluded.last_seen_at,metadata_json=excluded.metadata_json,
+                  paused=excluded.paused,done=excluded.done
                 """,
                 (
                     chat.id, chat.provider, chat.source, chat.provider_chat_id, alias, chat.title, chat.cwd,
@@ -257,6 +275,10 @@ class Store:
         with self.connect() as con:
             con.execute("update chats set objective=?, adopted=1, paused=0, done=0, state='active' where id=?", (objective, chat_id))
             con.execute(
+                "update goals set status='superseded',updated_at=? where chat_id=? and status='active' and id!=?",
+                (now_iso(), chat_id, gid),
+            )
+            con.execute(
                 """
                 insert into goals(id,chat_id,objective,status,source,created_at,updated_at)
                 values(?,?,?,?,?,?,?)
@@ -264,6 +286,17 @@ class Store:
                 """,
                 (gid, chat_id, objective, "active", source, now_iso(), now_iso()),
             )
+
+    def active_priority_for_chat(self, chat_id: str) -> sqlite3.Row | None:
+        return self.row(
+            """
+            select * from project_priorities
+            where status='active' and target_chat_id=?
+            order by priority desc, updated_at desc
+            limit 1
+            """,
+            (chat_id,),
+        )
 
     def add_priority(
         self,
@@ -274,7 +307,19 @@ class Store:
         target_chat_id: str = "",
         worker_lanes: int = 1,
     ) -> str:
-        pid = sha(query.lower().strip() + "\n" + objective.strip())[:20]
+        clean_target = target_chat_id.strip()
+        existing = None
+        if clean_target:
+            existing = self.row(
+                """
+                select * from project_priorities
+                where status='active' and target_chat_id=?
+                order by priority desc, updated_at desc
+                limit 1
+                """,
+                (clean_target,),
+            )
+        pid = str(existing["id"]) if existing else sha(query.lower().strip() + "\n" + objective.strip())[:20]
         with self.connect() as con:
             con.execute(
                 """
@@ -288,10 +333,28 @@ class Store:
                   status='active',updated_at=excluded.updated_at
                 """,
                 (
-                    pid, query.strip(), objective.strip(), resource_path.strip(), target_chat_id.strip(),
+                    pid, query.strip(), objective.strip(), resource_path.strip(), clean_target,
                     max(1, int(worker_lanes or 1)), int(priority), "active", now_iso(), now_iso(),
                 ),
             )
+            if clean_target:
+                con.execute(
+                    "update chats set objective=?,adopted=1,paused=0,done=0,state='active' where id=?",
+                    (objective.strip(), clean_target),
+                )
+                priority_gid = f"priority:{pid}"
+                con.execute(
+                    "update goals set status='superseded',updated_at=? where chat_id=? and status='active' and id!=?",
+                    (now_iso(), clean_target, priority_gid),
+                )
+                con.execute(
+                    """
+                    insert into goals(id,chat_id,objective,status,source,created_at,updated_at)
+                    values(?,?,?,?,?,?,?)
+                    on conflict(id) do update set objective=excluded.objective,status='active',updated_at=excluded.updated_at
+                    """,
+                    (priority_gid, clean_target, objective.strip(), "active", "priority", now_iso(), now_iso()),
+                )
         self.event(
             "priority_added",
             **{
@@ -338,3 +401,4 @@ class Store:
         with self.connect() as con:
             con.execute("update chats set done=1,state='done' where id=?", (chat_id,))
             con.execute("update goals set status='complete',updated_at=? where chat_id=? and status!='complete'", (now_iso(), chat_id))
+            con.execute("update project_priorities set status='complete',updated_at=? where target_chat_id=? and status='active'", (now_iso(), chat_id))
