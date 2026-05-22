@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PYTHONPATH="/Users/lukekensik/autocode${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m autocode.cli "$@"
