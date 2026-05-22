@@ -26,8 +26,7 @@ def print_status(store: Store, limit: int) -> None:
     Scheduler(store).runner.refresh()
     chats = store.rows("select count(*) c from chats")
     active = store.rows("select count(*) c from chats where adopted=1 and done=0 and paused=0 and coding_score>0")
-    jobs = store.rows("select * from jobs order by created_at desc limit ?", (limit,))
-    running = [j for j in jobs if j["status"] == "running"]
+    running = store.rows("select * from jobs where status='running' order by created_at desc limit ?", (limit,))
     goals = store.rows("select g.*,c.alias,c.provider from goals g join chats c on c.id=g.chat_id where g.status='active' order by g.updated_at desc limit ?", (limit,))
     priorities = store.rows("select * from project_priorities where status='active' order by priority desc, updated_at desc limit ?", (limit,))
     recent = store.rows("select * from jobs where status!='running' order by updated_at desc limit ?", (limit,))
