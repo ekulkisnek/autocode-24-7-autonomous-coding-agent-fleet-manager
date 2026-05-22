@@ -22,8 +22,20 @@ autocode daemon start|stop|restart|install
 
 ## State
 
-- Source: `/Users/lukekensik/autocode`
-- DB: `/Users/lukekensik/autocode/state/autocode.sqlite`
-- Jobs: `/Users/lukekensik/autocode/state/jobs`
-- Logs: `/Users/lukekensik/autocode/logs/autocode.log`
+- Source: `$AUTOCODE_HOME` or `~/autocode`
+- DB: `$AUTOCODE_HOME/state/autocode.sqlite`
+- Jobs: `$AUTOCODE_HOME/state/jobs`
+- Logs: `$AUTOCODE_HOME/logs/autocode.log`
 
+## Newer Control Surfaces
+
+```bash
+autocode priority list
+autocode priority add <query> --goal "<goal>" --rank 100 --path <repo> --exact --lanes 3
+autocode last <query>
+autocode squad plan <query>
+autocode squad launch <query>
+autocode squad collect <query> --send-writer
+```
+
+Priority projects pin important work to exact provider chats and repository resources. Squad lanes add bounded helper agents for read-only investigation or isolated worktree experiments while the main writer remains authoritative.
