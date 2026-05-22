@@ -313,8 +313,8 @@ class Store:
             existing = self.row(
                 """
                 select * from project_priorities
-                where status='active' and target_chat_id=?
-                order by priority desc, updated_at desc
+                where target_chat_id=?
+                order by case when status='active' then 0 else 1 end, priority desc, updated_at desc
                 limit 1
                 """,
                 (clean_target,),

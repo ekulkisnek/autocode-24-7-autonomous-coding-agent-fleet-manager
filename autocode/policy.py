@@ -11,8 +11,10 @@ CODING_WORDS = re.compile(
     r"implementation|bug|fix|refactor|deploy|e2e|detox|chrome|cursor|codex|grok build)\b",
     re.I,
 )
-DONE_WORDS = re.compile(r"\b(FLEET_DONE|fully complete|complete and verified|done\.?$|nothing left|all tests pass(?:ed)?)\b", re.I)
-MILESTONE_WORDS = re.compile(r"\b(FLEET_MILESTONE_COMPLETE|milestone complete|next step|remaining|still needs|todo|blocked|needs input|shall i proceed|continue)\b", re.I)
+FLEET_DONE_MARKER = re.compile(r"(?im)^\s*FLEET_DONE\s*:")
+FLEET_MILESTONE_MARKER = re.compile(r"(?im)^\s*FLEET_MILESTONE_COMPLETE\b")
+DONE_WORDS = re.compile(r"\b(fully complete|complete and verified|done\.?$|nothing left|all tests pass(?:ed)?)\b", re.I)
+MILESTONE_WORDS = re.compile(r"\b(milestone complete|next step|remaining|still needs|todo|blocked|needs input|shall i proceed|continue)\b", re.I)
 ASK_WORDS = re.compile(r"\b(shall i|should i|do you want|would you like|please confirm|need permission|waiting for|blocked)\b", re.I)
 BLOCKED_NONCODING = re.compile(
     r"\b(format|erase|partition|wipe)\b.{0,80}\b(drive|disk|ssd|volume)\b|"
@@ -34,7 +36,7 @@ def classify_chat(title: str, cwd: str, latest: str) -> tuple[int, str, str]:
         score += 3
     if len(text) > 500:
         score += 1
-    if DONE_WORDS.search(latest or "") and not MILESTONE_WORDS.search(latest or ""):
+    if FLEET_DONE_MARKER.search(latest or "") or (DONE_WORDS.search(latest or "") and not (FLEET_MILESTONE_MARKER.search(latest or "") or MILESTONE_WORDS.search(latest or ""))):
         state = "done"
     elif ASK_WORDS.search(latest or ""):
         state = "needs_input"
@@ -59,9 +61,9 @@ def infer_objective(title: str, latest: str, cwd: str) -> str:
 def should_continue_after_output(text: str) -> bool:
     if not text:
         return True
-    if "FLEET_DONE" in text:
+    if FLEET_DONE_MARKER.search(text):
         return False
-    if "FLEET_MILESTONE_COMPLETE" in text:
+    if FLEET_MILESTONE_MARKER.search(text):
         return True
     return bool(MILESTONE_WORDS.search(text) or ASK_WORDS.search(text))
 
@@ -70,7 +72,7 @@ def priority_completion_satisfied(objective: str, output: str) -> tuple[bool, st
     """Return whether an auto-completion is strong enough for a pinned priority."""
     text = (output or "").lower()
     goal = (objective or "").lower()
-    if "fleet_done" not in text:
+    if not FLEET_DONE_MARKER.search(output or ""):
         return False, "missing FLEET_DONE"
     if "hard requirement" not in goal:
         return True, "FLEET_DONE accepted"

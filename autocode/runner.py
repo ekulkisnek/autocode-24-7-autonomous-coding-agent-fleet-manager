@@ -10,7 +10,7 @@ from sqlite3 import Row
 from .config import DEFAULT_JOB_TIMEOUT, JOBS
 from .config import HOME
 from .models import Chat, ContinuePlan
-from .policy import priority_completion_satisfied, should_continue_after_output
+from .policy import FLEET_DONE_MARKER, priority_completion_satisfied, should_continue_after_output
 from .store import Store
 from .util import json_dumps, now_iso, now_ts, read_text
 
@@ -177,7 +177,7 @@ class JobRunner:
                 con.execute("delete from leases where job_id=?", (job["id"],))
                 chat = con.execute("select * from chats where id=?", (job["chat_id"],)).fetchone()
                 output = read_text(out, limit=12000) + "\n" + read_text(err, limit=4000)
-                if "FLEET_DONE" in output:
+                if FLEET_DONE_MARKER.search(output):
                     priority = con.execute(
                         """
                         select * from project_priorities

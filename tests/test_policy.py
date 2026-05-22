@@ -16,6 +16,9 @@ def test_done_detection():
 def test_milestone_continues():
     assert should_continue_after_output("FLEET_MILESTONE_COMPLETE\nNext step: run e2e")
     assert not should_continue_after_output("FLEET_DONE: all complete")
+    assert should_continue_after_output("This is not `FLEET_DONE`; continue with next step.")
+    score, state, objective = classify_chat("Task", "/tmp/repo", "FLEET_MILESTONE_COMPLETE\nnot `FLEET_DONE`")
+    assert state == "active"
 
 
 def test_destructive_disk_chat_is_not_auto_adopted():
@@ -38,3 +41,16 @@ def test_hard_priority_completion_requires_named_evidence():
         "FLEET_DONE: verified tests passed for Utreexo proof-backed storage, asset creation, sending, and receiving.",
     )
     assert ok
+
+
+def test_negated_completion_marker_is_not_completion():
+    goal = (
+        "Make RedWallet production ready. HARD REQUIREMENT: do not call this done until tests prove "
+        "full Utreexo/proof-backed storage and validation for BitAssets asset creation, sending, and receiving."
+    )
+    ok, reason = priority_completion_satisfied(
+        goal,
+        "FLEET_MILESTONE_COMPLETE\nThis is not `FLEET_DONE`; transfer/send/receive is still not complete.",
+    )
+    assert not ok
+    assert reason == "missing FLEET_DONE"

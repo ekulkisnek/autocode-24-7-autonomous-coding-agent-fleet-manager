@@ -143,6 +143,36 @@ def test_add_priority_deduplicates_by_target_chat(tmp_path: Path):
     assert row["objective"] == "goal two"
 
 
+def test_add_priority_reactivates_completed_target_priority(tmp_path: Path):
+    db = tmp_path / "autocode.sqlite"
+    store = Store(db)
+    chat = Chat(
+        id="codex:codex.rollout:redwallet",
+        provider="codex",
+        source="codex.rollout",
+        provider_chat_id="redwallet",
+        title="Implement wallet persistence",
+        cwd="/tmp/redwallet",
+        updated_at="2026-05-21T00:00:00-05:00",
+        latest_text="work",
+        transcript_hash="h1",
+        alias="redwallet",
+        continuation="codex exec resume",
+    )
+    store.upsert_chat(chat, 5, "active", "old objective")
+    first = store.add_priority("redwallet", "goal one", 1001, "/tmp/redwallet", chat.id, 3)
+    with store.connect() as con:
+        con.execute("update project_priorities set status='complete' where id=?", (first,))
+
+    second = store.add_priority(chat.id, "goal two", 1001, "/tmp/redwallet", chat.id, 3)
+
+    rows = store.rows("select * from project_priorities where target_chat_id=?", (chat.id,))
+    assert first == second
+    assert len(rows) == 1
+    assert rows[0]["status"] == "active"
+    assert rows[0]["objective"] == "goal two"
+
+
 def test_only_one_active_goal_per_chat(tmp_path: Path):
     db = tmp_path / "autocode.sqlite"
     store = Store(db)
