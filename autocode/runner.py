@@ -20,6 +20,42 @@ class JobRunner:
         self.store = store
 
     def start(self, row: Row, plan: ContinuePlan, prompt: str, job_dir: Path | None = None) -> str:
+        return self._start(
+            chat_id=row["id"],
+            cwd=row["cwd"] or str(HOME),
+            plan=plan,
+            prompt=prompt,
+            job_dir=job_dir,
+            lease_resource=self.resource_for(row),
+        )
+
+    def start_aux(
+        self,
+        chat_id: str,
+        cwd: str,
+        plan: ContinuePlan,
+        prompt: str,
+        job_dir: Path | None = None,
+        lease_resource: str = "",
+    ) -> str:
+        return self._start(
+            chat_id=chat_id,
+            cwd=cwd,
+            plan=plan,
+            prompt=prompt,
+            job_dir=job_dir,
+            lease_resource=lease_resource,
+        )
+
+    def _start(
+        self,
+        chat_id: str,
+        cwd: str,
+        plan: ContinuePlan,
+        prompt: str,
+        job_dir: Path | None = None,
+        lease_resource: str = "",
+    ) -> str:
         job_id = job_dir.name if job_dir else "job-" + uuid.uuid4().hex[:12]
         job_dir = job_dir or JOBS / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -32,7 +68,7 @@ class JobRunner:
         err_f = stderr.open("wb")
         env = os.environ.copy()
         env.update(plan.env or {})
-        cwd = plan.cwd if plan.cwd and Path(plan.cwd).exists() else str(HOME)
+        cwd = plan.cwd if plan.cwd and Path(plan.cwd).exists() else (cwd if cwd and Path(cwd).exists() else str(HOME))
         proc = subprocess.Popen(
             plan.cmd,
             cwd=cwd or None,
@@ -52,16 +88,48 @@ class JobRunner:
                 insert into jobs(id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,created_at,updated_at)
                 values(?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
-                (job_id, row["id"], plan.provider, "running", proc.pid, cwd, json_dumps(plan.cmd), prompt, str(stdout), str(stderr), now_iso(), now_iso()),
+                (job_id, chat_id, plan.provider, "running", proc.pid, cwd, json_dumps(plan.cmd), prompt, str(stdout), str(stderr), now_iso(), now_iso()),
             )
-            resource = self.resource_for(row)
-            con.execute("insert or replace into leases(resource,chat_id,job_id,expires_at) values(?,?,?,?)", (resource, row["id"], job_id, now_iso()))
-            con.execute("update chats set state='running',last_drive_at=? where id=?", (now_iso(), row["id"]))
-        self.store.event("job_started", row["id"], job_id, provider=plan.provider, pid=proc.pid, same_chat=plan.same_chat)
+            if lease_resource:
+                con.execute("insert or replace into leases(resource,chat_id,job_id,expires_at) values(?,?,?,?)", (lease_resource, chat_id, job_id, now_iso()))
+            con.execute("update chats set state='running',last_drive_at=? where id=?", (now_iso(), chat_id))
+        self.store.event("job_started", chat_id, job_id, provider=plan.provider, pid=proc.pid, same_chat=plan.same_chat)
         return job_id
 
     def resource_for(self, row: Row) -> str:
-        return row["cwd"] or row["id"]
+        priority_resource = self._row_value(row, "priority_resource_path")
+        if priority_resource:
+            return self._resource_from_path(priority_resource)
+        return self._resource_from_path(row["cwd"] or "") or row["id"]
+
+    def _resource_from_path(self, value: str) -> str:
+        if not value:
+            return ""
+        path = Path(value).expanduser()
+        if not path.exists():
+            return str(path)
+        if path.is_file():
+            path = path.parent
+        try:
+            found = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                text=True,
+                capture_output=True,
+                timeout=3,
+            )
+            if found.returncode == 0 and found.stdout.strip():
+                return str(Path(found.stdout.strip()).resolve())
+        except Exception:
+            pass
+        return str(path.resolve())
+
+    def _row_value(self, row: Row, key: str) -> str:
+        try:
+            if key in row.keys():
+                return str(row[key] or "")
+        except Exception:
+            return ""
+        return ""
 
     def refresh(self) -> None:
         jobs = self.store.rows("select * from jobs where status='running' order by created_at")

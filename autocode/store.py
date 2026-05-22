@@ -76,6 +76,20 @@ class Store:
                 );
                 create index if not exists idx_goals_status on goals(status, updated_at desc);
 
+                create table if not exists project_priorities (
+                  id text primary key,
+                  query text not null,
+                  objective text not null,
+                  resource_path text not null default '',
+                  target_chat_id text not null default '',
+                  worker_lanes integer not null default 1,
+                  priority integer not null default 100,
+                  status text not null default 'active',
+                  created_at text not null,
+                  updated_at text not null
+                );
+                create index if not exists idx_project_priorities_status on project_priorities(status, priority desc, updated_at desc);
+
                 create table if not exists jobs (
                   id text primary key,
                   chat_id text not null,
@@ -126,6 +140,18 @@ class Store:
             con.execute("insert or ignore into config(key,value) values('yolo','on')")
             con.execute("insert or ignore into config(key,value) values('autoadopt','all_coding_chats')")
             con.execute("insert or ignore into config(key,value) values('max_active','5')")
+            try:
+                con.execute("alter table project_priorities add column resource_path text not null default ''")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                con.execute("alter table project_priorities add column target_chat_id text not null default ''")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                con.execute("alter table project_priorities add column worker_lanes integer not null default 1")
+            except sqlite3.OperationalError:
+                pass
 
     def set_default(self, key: str, value: str) -> None:
         with self.connect() as con:
@@ -167,7 +193,7 @@ class Store:
                 state = "done"
             elif paused:
                 state = "paused"
-            elif old_state in {"active", "needs_input", "stalled"} and state not in {"done", "paused", "blocked", "reference"}:
+            elif old_state in {"active", "needs_input", "stalled", "running"} and state not in {"done", "paused", "blocked", "reference"}:
                 state = old_state
             con.execute(
                 """
@@ -238,6 +264,70 @@ class Store:
                 """,
                 (gid, chat_id, objective, "active", source, now_iso(), now_iso()),
             )
+
+    def add_priority(
+        self,
+        query: str,
+        objective: str,
+        priority: int = 100,
+        resource_path: str = "",
+        target_chat_id: str = "",
+        worker_lanes: int = 1,
+    ) -> str:
+        pid = sha(query.lower().strip() + "\n" + objective.strip())[:20]
+        with self.connect() as con:
+            con.execute(
+                """
+                insert into project_priorities(id,query,objective,resource_path,target_chat_id,worker_lanes,priority,status,created_at,updated_at)
+                values(?,?,?,?,?,?,?,?,?,?)
+                on conflict(id) do update set
+                  query=excluded.query,objective=excluded.objective,priority=excluded.priority,
+                  resource_path=case when excluded.resource_path!='' then excluded.resource_path else project_priorities.resource_path end,
+                  target_chat_id=case when excluded.target_chat_id!='' then excluded.target_chat_id else project_priorities.target_chat_id end,
+                  worker_lanes=max(1, excluded.worker_lanes),
+                  status='active',updated_at=excluded.updated_at
+                """,
+                (
+                    pid, query.strip(), objective.strip(), resource_path.strip(), target_chat_id.strip(),
+                    max(1, int(worker_lanes or 1)), int(priority), "active", now_iso(), now_iso(),
+                ),
+            )
+        self.event(
+            "priority_added",
+            **{
+                "priority_id": pid,
+                "query": query,
+                "priority": priority,
+                "resource_path": resource_path,
+                "target_chat_id": target_chat_id,
+                "worker_lanes": worker_lanes,
+            },
+        )
+        return pid
+
+    def remove_priority(self, query_or_id: str) -> int:
+        q = f"%{query_or_id.lower()}%"
+        with self.connect() as con:
+            cur = con.execute(
+                """
+                update project_priorities set status='paused',updated_at=?
+                where status='active' and (id=? or lower(query) like ? or lower(objective) like ?)
+                """,
+                (now_iso(), query_or_id, q, q),
+            )
+            return cur.rowcount
+
+    def find_priority(self, query_or_id: str) -> sqlite3.Row | None:
+        q = f"%{query_or_id.lower()}%"
+        return self.row(
+            """
+            select * from project_priorities
+            where status='active' and (id=? or lower(query) like ? or lower(objective) like ?)
+            order by priority desc, updated_at desc
+            limit 1
+            """,
+            (query_or_id, q, q),
+        )
 
     def pause_chat(self, chat_id: str) -> None:
         with self.connect() as con:

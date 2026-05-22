@@ -116,3 +116,10 @@ def load1() -> float:
     except Exception:
         return 0.0
 
+
+def memory_free_percent() -> int | None:
+    code, out, _ = run_text(["memory_pressure"], timeout=5)
+    if code != 0:
+        return None
+    match = re.search(r"System-wide memory free percentage:\s*(\d+)%", out)
+    return int(match.group(1)) if match else None

@@ -67,7 +67,13 @@ def should_continue_after_output(text: str) -> bool:
 
 
 def build_prompt(row: Row, recovery: bool = False) -> str:
-    objective = row["objective"] or infer_objective(row["title"], row["latest_text"], row["cwd"])
+    priority_objective = ""
+    try:
+        if "priority_objective" in row.keys():
+            priority_objective = row["priority_objective"] or ""
+    except Exception:
+        priority_objective = ""
+    objective = priority_objective or row["objective"] or infer_objective(row["title"], row["latest_text"], row["cwd"])
     latest = compact(row["latest_text"], 1200)
     prefix = "RECOVERY: previous work stalled or lacked evidence.\n\n" if recovery else ""
     return (

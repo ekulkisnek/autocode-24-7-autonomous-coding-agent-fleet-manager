@@ -11,7 +11,7 @@ from .policy import build_prompt
 from .providers import provider_map
 from .runner import JobRunner
 from .store import Store
-from .util import load1, now_iso, parse_ts
+from .util import load1, memory_free_percent, now_iso, parse_ts
 
 
 class Scheduler:
@@ -58,6 +58,13 @@ class Scheduler:
     def capacity(self) -> int:
         configured = int(self.store.get_config("max_active", str(DEFAULT_MAX_ACTIVE)) or DEFAULT_MAX_ACTIVE)
         l1 = load1()
+        mem_free = memory_free_percent()
+        if mem_free is not None and mem_free < 12:
+            return 0
+        if mem_free is not None and mem_free < 20:
+            configured = min(configured, 1)
+        elif mem_free is not None and mem_free < 30:
+            configured = min(configured, 2)
         if l1 >= 10:
             return min(configured, 1)
         if l1 >= 7:
@@ -71,7 +78,11 @@ class Scheduler:
         return int(row["c"] if row else 0)
 
     def candidates(self, limit: int) -> list[Row]:
-        return self.store.rows(
+        priority_rows = self.priority_candidates(limit)
+        seen = {r["id"] for r in priority_rows}
+        if len(priority_rows) >= limit:
+            return priority_rows[:limit]
+        general = self.store.rows(
             """
             select * from chats
             where adopted=1 and paused=0 and done=0 and coding_score>0
@@ -82,19 +93,93 @@ class Scheduler:
               updated_at desc
             limit ?
             """,
-            (limit,),
+            (max(limit * 2, 20),),
         )
+        rows = list(priority_rows)
+        for row in general:
+            if row["id"] in seen:
+                continue
+            rows.append(row)
+            if len(rows) >= limit:
+                break
+        return rows
+
+    def priority_candidates(self, limit: int) -> list[Row]:
+        priorities = self.store.rows(
+            """
+            select * from project_priorities
+            where status='active'
+            order by priority desc, updated_at desc
+            limit 50
+            """
+        )
+        if not priorities:
+            return []
+        rows: list[Row] = []
+        seen: set[str] = set()
+        for p in priorities:
+            target = str(p["target_chat_id"] or "")
+            if target:
+                match = self.store.row(
+                    """
+                    select *, ? as priority_objective, ? as priority_rank, ? as priority_id,
+                      ? as priority_resource_path, ? as priority_worker_lanes
+                    from chats
+                    where id=? and paused=0 and done=0 and coding_score>0
+                    limit 1
+                    """,
+                    (p["objective"], p["priority"], p["id"], p["resource_path"], p["worker_lanes"], target),
+                )
+                if match and match["id"] not in seen:
+                    seen.add(match["id"])
+                    rows.append(match)
+                    if len(rows) >= limit:
+                        return rows
+            q = f"%{str(p['query']).lower()}%"
+            matches = self.store.rows(
+                """
+                select *, ? as priority_objective, ? as priority_rank, ? as priority_id,
+                  ? as priority_resource_path, ? as priority_worker_lanes
+                from chats
+                where paused=0 and done=0 and coding_score>0
+                  and (
+                    lower(id)=lower(?) or lower(alias)=lower(?) or lower(provider_chat_id)=lower(?)
+                    or lower(title) like ? or lower(alias) like ? or lower(cwd) like ?
+                  )
+                order by
+                  case state when 'needs_input' then 0 when 'stalled' then 1 when 'active' then 2 when 'running' then 3 else 4 end,
+                  failure_count asc,
+                  updated_at desc
+                limit 8
+                """,
+                (
+                    p["objective"], p["priority"], p["id"], p["resource_path"], p["worker_lanes"],
+                    p["query"], p["query"], p["query"], q, q, q,
+                ),
+            )
+            for row in matches:
+                if row["id"] in seen:
+                    continue
+                seen.add(row["id"])
+                rows.append(row)
+                if len(rows) >= limit:
+                    return rows
+        return rows
 
     def has_active_job(self, chat_id: str) -> bool:
         row = self.store.row("select count(*) c from jobs where chat_id=? and status='running'", (chat_id,))
         return int(row["c"] if row else 0) > 0
 
     def has_active_lease(self, row: Row) -> bool:
-        resource = row["cwd"] or row["id"]
+        resource = self.runner.resource_for(row)
         lease = self.store.row("select * from leases where resource=?", (resource,))
         return bool(lease)
 
     def dispatch(self, row: Row) -> str | None:
+        prompt = build_prompt(row, recovery=row["state"] == "stalled")
+        return self.dispatch_with_prompt(row, prompt)
+
+    def dispatch_with_prompt(self, row: Row, prompt: str) -> str | None:
         chat = Chat(
             id=row["id"],
             provider=row["provider"],
@@ -108,7 +193,6 @@ class Scheduler:
             alias=row["alias"],
             continuation=row["continuation"],
         )
-        prompt = build_prompt(row, recovery=row["state"] == "stalled")
         job_dir = self._planned_job_dir()
         if int(row["failure_count"] or 0) >= 2:
             plan = self.fallback_plan(row, prompt, job_dir)
