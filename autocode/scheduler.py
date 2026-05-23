@@ -132,6 +132,8 @@ class Scheduler:
 
     def candidates(self, limit: int) -> list[Row]:
         priority_rows = self.priority_candidates(limit)
+        if self.store.get_config("priority_only", "off").lower() in {"1", "true", "yes", "on"}:
+            return priority_rows[:limit]
         seen = {r["id"] for r in priority_rows}
         if len(priority_rows) >= limit:
             return priority_rows[:limit]

@@ -108,3 +108,40 @@ def test_priority_candidate_can_override_failure_backoff(tmp_path: Path):
 
     candidates = Scheduler(store).candidates(10)
     assert [row["id"] for row in candidates] == [chat.id]
+
+
+def test_priority_only_mode_excludes_general_backlog(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    priority_chat = Chat(
+        id="codex:codex.rollout:redwallet",
+        provider="codex",
+        source="codex.rollout",
+        provider_chat_id="redwallet",
+        title="Implement wallet persistence",
+        cwd="/tmp/redwallet",
+        updated_at="2026-05-21T00:00:00-05:00",
+        latest_text="fix code",
+        transcript_hash="h1",
+        alias="redwallet",
+        continuation="codex exec resume",
+    )
+    backlog_chat = Chat(
+        id="codex:codex.rollout:other",
+        provider="codex",
+        source="codex.rollout",
+        provider_chat_id="other",
+        title="Other project",
+        cwd="/tmp/other",
+        updated_at="2026-05-22T00:00:00-05:00",
+        latest_text="fix code",
+        transcript_hash="h2",
+        alias="other",
+        continuation="codex exec resume",
+    )
+    store.upsert_chat(priority_chat, 5, "active", "fix redwallet")
+    store.upsert_chat(backlog_chat, 5, "active", "fix other")
+    store.add_priority("redwallet", "finish redwallet", 1001, "/tmp/redwallet", priority_chat.id, 1)
+    store.set_config("priority_only", "on")
+
+    candidates = Scheduler(store).candidates(10)
+    assert [row["id"] for row in candidates] == [priority_chat.id]
