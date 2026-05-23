@@ -55,6 +55,7 @@ class CursorProvider(Provider):
         return ""
 
     def continue_plan(self, chat: Chat, prompt: str, job_dir: Path) -> ContinuePlan:
+        cwd = chat.cwd if chat.cwd and Path(chat.cwd).exists() else str(HOME)
         context = read_text(Path(chat.metadata.get("file", "")), limit=12000)
         combined = (
             "Continue this Cursor conversation by taking over the project work in Codex. "
@@ -64,10 +65,9 @@ class CursorProvider(Provider):
         return ContinuePlan(
             True,
             "codex",
-            chat.cwd or str(HOME),
-            cmd=["codex", "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-C", chat.cwd or str(HOME), "-"],
+            cwd,
+            cmd=["codex", "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-C", cwd, "-"],
             stdin=combined,
             same_chat=False,
             reason="Cursor local transcript is continued by Codex takeover.",
         )
-

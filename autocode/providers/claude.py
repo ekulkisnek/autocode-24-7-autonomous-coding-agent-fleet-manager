@@ -63,6 +63,7 @@ class ClaudeProvider(Provider):
         return first, "\n".join(latest[-12:])
 
     def continue_plan(self, chat: Chat, prompt: str, job_dir: Path) -> ContinuePlan:
+        cwd = chat.cwd if chat.cwd and Path(chat.cwd).exists() else str(HOME)
         if not re.match(r"^[0-9a-fA-F-]{36}$", chat.provider_chat_id):
             context = read_text(Path(chat.metadata.get("file", "")), limit=12000)
             combined = (
@@ -73,8 +74,8 @@ class ClaudeProvider(Provider):
             return ContinuePlan(
                 True,
                 "codex",
-                chat.cwd or str(HOME),
-                cmd=["codex", "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-C", chat.cwd or str(HOME), "-"],
+                cwd,
+                cmd=["codex", "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-C", cwd, "-"],
                 stdin=combined,
                 same_chat=False,
                 reason="Claude transcript is not directly resumable; using Codex takeover.",
@@ -82,7 +83,7 @@ class ClaudeProvider(Provider):
         return ContinuePlan(
             True,
             self.name,
-            chat.cwd or str(HOME),
+            cwd,
             cmd=[
                 "claude",
                 "--print",

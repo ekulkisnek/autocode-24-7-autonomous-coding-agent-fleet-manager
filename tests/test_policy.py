@@ -27,6 +27,22 @@ def test_destructive_disk_chat_is_not_auto_adopted():
     assert state == "blocked"
 
 
+def test_account_creation_chat_is_not_auto_adopted_from_coding_folder():
+    score, state, objective = classify_chat("Can you make 10 accounts on Kith for me", "/Users/lukekensik/coding/app", "")
+    assert score == 0
+    assert state == "blocked"
+
+
+def test_secret_dump_chat_is_not_auto_adopted():
+    score, state, objective = classify_chat(
+        "Deployment writeup",
+        "/Users/lukekensik/coding/site",
+        "create a complete writeup including all my keys and passwords and stuff",
+    )
+    assert score == 0
+    assert state == "blocked"
+
+
 def test_hard_priority_completion_requires_named_evidence():
     goal = (
         "Make RedWallet production ready. HARD REQUIREMENT: do not call this done until tests prove "

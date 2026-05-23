@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from sqlite3 import Row
 
-from .config import DEFAULT_DISCOVERY_INTERVAL, DEFAULT_MAX_ACTIVE
+from .config import DEFAULT_DISCOVERY_INTERVAL, DEFAULT_MAX_ACTIVE, HOME
 from .discovery import discover
 from .models import Chat
 from .models import ContinuePlan
@@ -138,6 +139,7 @@ class Scheduler:
             """
             select * from chats
             where adopted=1 and paused=0 and done=0 and coding_score>0
+              and failure_count < 3
             order by
               case state when 'needs_input' then 0 when 'stalled' then 1 when 'active' then 2 when 'running' then 3 else 4 end,
               case when objective!='' then 0 else 1 end,
@@ -263,7 +265,8 @@ class Scheduler:
         return job_id
 
     def fallback_plan(self, row: Row, prompt: str, job_dir) -> ContinuePlan:
-        cwd = row["cwd"] or "/Users/lukekensik"
+        raw_cwd = row["cwd"] or str(HOME)
+        cwd = raw_cwd if Path(raw_cwd).exists() else str(HOME)
         takeover = (
             "AutoCode provider recovery takeover.\n"
             f"Original provider: {row['provider']} / {row['source']}\n"

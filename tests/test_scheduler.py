@@ -62,3 +62,49 @@ def test_scheduler_repairs_done_priority_target(tmp_path: Path):
     goals = store.rows("select * from goals where chat_id=? and status='active'", (chat.id,))
     assert len(goals) == 1
     assert goals[0]["source"] == "priority"
+
+
+def test_scheduler_skips_repeatedly_failed_non_priority(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    chat = Chat(
+        id="cursor:cursor.transcript:noisy",
+        provider="cursor",
+        source="cursor.transcript",
+        provider_chat_id="noisy",
+        title="Old transcript",
+        cwd="/tmp/missing-project",
+        updated_at="2026-05-21T00:00:00-05:00",
+        latest_text="fix code",
+        transcript_hash="h",
+        alias="noisy",
+        continuation="fork-to-codex",
+    )
+    store.upsert_chat(chat, 5, "active", "fix code")
+    with store.connect() as con:
+        con.execute("update chats set failure_count=3 where id=?", (chat.id,))
+
+    assert Scheduler(store).candidates(10) == []
+
+
+def test_priority_candidate_can_override_failure_backoff(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    chat = Chat(
+        id="codex:codex.rollout:redwallet",
+        provider="codex",
+        source="codex.rollout",
+        provider_chat_id="redwallet",
+        title="Implement wallet persistence",
+        cwd="/tmp/redwallet",
+        updated_at="2026-05-21T00:00:00-05:00",
+        latest_text="fix code",
+        transcript_hash="h",
+        alias="redwallet",
+        continuation="codex exec resume",
+    )
+    store.upsert_chat(chat, 5, "active", "fix code")
+    store.add_priority("redwallet", "finish redwallet", 1001, "/tmp/redwallet", chat.id, 1)
+    with store.connect() as con:
+        con.execute("update chats set failure_count=99 where id=?", (chat.id,))
+
+    candidates = Scheduler(store).candidates(10)
+    assert [row["id"] for row in candidates] == [chat.id]

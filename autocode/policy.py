@@ -19,6 +19,9 @@ MILESTONE_WORDS = re.compile(r"\b(milestone complete|next step|remaining|still n
 ASK_WORDS = re.compile(r"\b(shall i|should i|do you want|would you like|please confirm|need permission|waiting for|blocked)\b", re.I)
 BLOCKED_NONCODING = re.compile(
     r"\b(format|erase|partition|wipe)\b.{0,80}\b(drive|disk|ssd|volume)\b|"
+    r"\b(create|make|register|sign\s*up|signup)\b.{0,80}\b(accounts?|profiles?)\b|"
+    r"\b(keys?|passwords?|passphrases?|secrets?|tokens?|credentials?)\b.{0,80}\b(leak|dump|includ(?:e|ing)|show|print|share|expose|writeup|all)\b|"
+    r"\b(leak|dump|includ(?:e|ing)|show|print|share|expose)\b.{0,80}\b(keys?|passwords?|passphrases?|secrets?|tokens?|credentials?)\b|"
     r"\b(ocmma|hardware plugged|fleet captain|captain brain|smoke test|hermes autonomous coding fleet)\b",
     re.I,
 )
