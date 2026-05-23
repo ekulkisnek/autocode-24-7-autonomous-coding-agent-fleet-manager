@@ -46,6 +46,10 @@ VERIFICATION_WORDS = re.compile(
     r"lint(?:ed)?|typecheck(?:ed)?|tsc|jest|pytest|cargo test|detox|smoke)\b",
     re.I,
 )
+ONGOING_OBJECTIVE_WORDS = re.compile(
+    r"\b(ongoing|continuous|continually|keep working|keep polishing|until (?:luke|user|i) (?:explicitly )?(?:says?|tell)|until .*stop)\b",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -130,6 +134,7 @@ def assess_output_state(objective: str, output: str) -> OutputAssessment:
     if not text.strip():
         return OutputAssessment("stalled", False, "no output")
 
+    ongoing = bool(ONGOING_OBJECTIVE_WORDS.search(objective or ""))
     missing = tuple(hard_requirement_gaps(objective, text))
     milestone = bool(FLEET_MILESTONE_MARKER.search(text))
     not_complete = bool(NOT_COMPLETE_WORDS.search(text))
@@ -145,6 +150,8 @@ def assess_output_state(objective: str, output: str) -> OutputAssessment:
         return OutputAssessment("active", False, "output describes remaining work or blocker", missing)
     if missing:
         return OutputAssessment("active", False, "missing hard requirement evidence: " + ", ".join(missing), missing)
+    if ongoing and completion_claim:
+        return OutputAssessment("active", False, "ongoing objective remains active until explicitly stopped")
     if completion_claim and verified:
         return OutputAssessment("done", True, "output claims completion with verification")
     if completion_claim and "hard requirement" not in (objective or "").lower():

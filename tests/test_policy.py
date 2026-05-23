@@ -85,6 +85,17 @@ def test_completion_is_inferred_without_magic_marker():
     assert assessment.state == "done"
 
 
+def test_ongoing_priority_does_not_complete_itself():
+    goal = "RedWallet ongoing security polish. Keep working until Luke explicitly says stop."
+    assessment = assess_output_state(
+        goal,
+        "FLEET_DONE: completed and verified this pass. Tests passed.",
+    )
+    assert not assessment.complete
+    assert assessment.state == "active"
+    assert "ongoing" in assessment.reason
+
+
 def test_remaining_work_overrides_completion_language():
     goal = (
         "Make RedWallet production ready. HARD REQUIREMENT: do not call this done until tests prove "
