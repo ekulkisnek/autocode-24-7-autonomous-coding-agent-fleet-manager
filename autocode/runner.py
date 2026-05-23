@@ -176,7 +176,12 @@ class JobRunner:
             if status != "running":
                 con.execute("delete from leases where job_id=?", (job["id"],))
                 chat = con.execute("select * from chats where id=?", (job["chat_id"],)).fetchone()
-                output = read_text(out, limit=12000) + "\n" + read_text(err, limit=4000)
+                stdout_text = read_text(out, limit=12000)
+                stderr_text = read_text(err, limit=4000)
+                # Codex writes prompt/session framing to stderr. Completion state must be
+                # judged from assistant output first, otherwise our own prompt text can
+                # keep a finished priority artificially active.
+                assessment_text = stdout_text if stdout_text.strip() else stderr_text
                 if evidence_status == "worked":
                     priority = con.execute(
                         """
@@ -188,7 +193,7 @@ class JobRunner:
                         (job["chat_id"],),
                     ).fetchone()
                     objective = str(priority["objective"] if priority else (chat["objective"] if chat else ""))
-                    assessment = assess_output_state(objective, output)
+                    assessment = assess_output_state(objective, assessment_text)
                     if assessment.complete:
                         con.execute("update chats set done=1,state='done',last_evidence_at=? where id=?", (now_iso(), job["chat_id"]))
                         con.execute("update goals set status='complete',updated_at=? where chat_id=? and status='active'", (now_iso(), job["chat_id"]))
