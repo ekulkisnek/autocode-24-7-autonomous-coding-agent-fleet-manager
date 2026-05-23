@@ -1,4 +1,4 @@
-from autocode.policy import assess_output_state, classify_chat, priority_completion_satisfied, should_continue_after_output
+from autocode.policy import assess_output_state, build_prompt, classify_chat, priority_completion_satisfied, should_continue_after_output
 
 
 def test_classifies_coding_chat():
@@ -81,3 +81,27 @@ def test_remaining_work_overrides_completion_language():
     assert not assessment.complete
     assert assessment.state == "active"
     assert "remaining work" in assessment.reason
+
+
+def test_prompt_forbids_long_passive_waits():
+    class Row(dict):
+        def keys(self):
+            return super().keys()
+
+    row = Row(
+        id="codex:codex.rollout:redwallet",
+        provider="codex",
+        source="codex.rollout",
+        provider_chat_id="redwallet",
+        title="RedWallet",
+        cwd="/tmp/redwallet",
+        updated_at="2026-05-21T00:00:00-05:00",
+        latest_text="Android proof running in tmux",
+        transcript_hash="h",
+        alias="redwallet",
+        continuation="codex exec resume",
+        objective="Finish RedWallet",
+    )
+    prompt = build_prompt(row)
+    assert "Do not spend a turn passively waiting" in prompt
+    assert "do not sleep longer than 30 seconds" in prompt

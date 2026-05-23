@@ -173,6 +173,8 @@ def build_prompt(row: Row, recovery: bool = False) -> str:
         "- Take the fastest safe path to complete the goal.\n"
         "- Do not wait for Luke/Hermes if a safe next action exists.\n"
         "- Edit files, run tests, commit, and push when appropriate.\n"
+        "- Do not spend a turn passively waiting on long tests or background processes. If work will take more than 30 seconds, start it in tmux/background, record the log path/status command, report current evidence, and exit so AutoCode can re-enter immediately.\n"
+        "- When a background test/process is already running, inspect its current log/process state and either fix/continue from new evidence or report that it is still running; do not sleep longer than 30 seconds inside the agent turn.\n"
         "- If this is only a milestone, output FLEET_MILESTONE_COMPLETE and continueable next steps.\n"
         "- Output FLEET_DONE only when the whole goal is complete and verified.\n"
         "- If blocked, state the exact blocker and the best automatic fallback.\n\n"
