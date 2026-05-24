@@ -82,7 +82,7 @@ def test_completion_is_inferred_without_magic_marker_for_normal_goals():
     assert assessment.state == "done"
 
 
-def test_hard_completion_definition_requires_marker():
+def test_hard_completion_definition_rejects_vague_completion():
     goal = (
         "RedWallet native signer / BitAssets / Floresta production-ready completion. "
         "Hard completion definition: do not mark this done until the live proof passes."
@@ -94,6 +94,27 @@ def test_hard_completion_definition_requires_marker():
     assert not assessment.complete
     assert assessment.state == "active"
     assert "missing hard requirement evidence" in assessment.reason
+
+
+def test_hard_completion_definition_accepts_substantial_evidence_without_marker():
+    goal = (
+        "RedWallet native signer / BitAssets / Floresta production-ready completion. "
+        "Hard completion definition: complete Issue #28 protocol path, native Floresta proof persistence, "
+        "BitAssets asset creation/sending/receiving, live full-system proof, restart persistence, Android/iOS gates."
+    )
+    assessment = assess_output_state(
+        goal,
+        """
+        Production-ready completion is verified with evidence in this chat.
+        Issue #28 protocol path implemented and tested in plain-bitassets and floresta-bitassets.
+        Native Floresta/mobile proof-backed state sync persists UTXOs, tips, proofs, and wallet state across restart.
+        BitAssets reserve/register asset creation and transfer sending/receiving live smoke passed.
+        Live full-system proof completed with asset_id=abc, reserve_tx=def, register_tx=ghi, transfer_tx=jkl.
+        Android and iOS Detox BitAssets E2E passed, plus cargo check, Jest, TypeScript, and pushed heads recorded.
+        """,
+    )
+    assert assessment.complete
+    assert assessment.state == "done"
 
 
 def test_ongoing_priority_does_not_complete_itself():

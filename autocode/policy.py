@@ -114,6 +114,14 @@ def hard_requirement_gaps(objective: str, output: str) -> list[str]:
     missing: list[str] = []
     if not VERIFICATION_WORDS.search(output or ""):
         missing.append("verification/tests")
+    if re.search(r"\b(live|full-system|full system|smoke|e2e|detox|restart)\b", goal) and not re.search(
+        r"\b(live|full-system|full system|smoke|e2e|detox|restart|txid|tx=|asset_id|pushed heads?)\b", text
+    ):
+        missing.append("live/e2e evidence")
+    if re.search(r"\b(persist|persistence|durable|restart|storage)\b", goal) and not re.search(
+        r"\b(persist|persistence|durable|restart|storage|cache|reload)\b", text
+    ):
+        missing.append("persistence evidence")
     for required in ("utreexo", "proof"):
         if required in goal and required not in text:
             missing.append(required)
@@ -126,6 +134,23 @@ def hard_requirement_gaps(objective: str, output: str) -> list[str]:
         if label in goal and not any(n in text for n in needles):
             missing.append(label)
     return missing
+
+
+def hard_completion_has_substantial_evidence(objective: str, output: str) -> bool:
+    goal = (objective or "").lower()
+    if "hard requirement" not in goal and "hard completion definition" not in goal:
+        return True
+    text = (output or "").lower()
+    if hard_requirement_gaps(objective, output):
+        return False
+    evidence_groups = [
+        ("implementation", ("implemented", "changed", "commit", "pushed heads", "constructors", "protocol", "client")),
+        ("verification", ("test", "passed", "verified", "green", "cargo", "jest", "detox", "e2e", "smoke")),
+        ("live proof", ("live", "full-system", "full system", "asset_id", "tx", "txid", "sidechain", "restart")),
+        ("persistence", ("persist", "persistence", "durable", "restart", "cache", "reload", "storage")),
+    ]
+    hits = sum(1 for _, needles in evidence_groups if any(needle in text for needle in needles))
+    return hits >= 2 and len(text.split()) >= 12
 
 
 def assess_output_state(objective: str, output: str) -> OutputAssessment:
@@ -151,8 +176,8 @@ def assess_output_state(objective: str, output: str) -> OutputAssessment:
         return OutputAssessment("active", False, "output describes remaining work or blocker", missing)
     if missing:
         return OutputAssessment("active", False, "missing hard requirement evidence: " + ", ".join(missing), missing)
-    if hard_goal and completion_claim and not FLEET_DONE_MARKER.search(text):
-        return OutputAssessment("active", False, "hard completion goal requires explicit FLEET_DONE marker")
+    if hard_goal and completion_claim and not hard_completion_has_substantial_evidence(objective, text):
+        return OutputAssessment("active", False, "hard completion claim lacks substantial evidence")
     if ongoing and completion_claim:
         return OutputAssessment("active", False, "ongoing objective remains active until explicitly stopped")
     if completion_claim and verified:
