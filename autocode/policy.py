@@ -12,7 +12,7 @@ CODING_WORDS = re.compile(
     r"implementation|bug|fix|refactor|deploy|e2e|detox|chrome|cursor|codex|grok build)\b",
     re.I,
 )
-FLEET_DONE_MARKER = re.compile(r"(?im)^\s*FLEET_DONE\s*:")
+FLEET_DONE_MARKER = re.compile(r"(?im)^\s*FLEET_DONE(?:\s*:|\b)")
 FLEET_MILESTONE_MARKER = re.compile(r"(?im)^\s*FLEET_MILESTONE_COMPLETE\b")
 DONE_WORDS = re.compile(r"\b(fully complete|complete and verified|done\.?$|nothing left|all tests pass(?:ed)?)\b", re.I)
 MILESTONE_WORDS = re.compile(r"\b(milestone complete|next step|remaining|still needs|todo|blocked|needs input|shall i proceed|continue)\b", re.I)
@@ -108,7 +108,7 @@ def should_continue_after_output(text: str) -> bool:
 def hard_requirement_gaps(objective: str, output: str) -> list[str]:
     text = (output or "").lower()
     goal = (objective or "").lower()
-    if "hard requirement" not in goal:
+    if "hard requirement" not in goal and "hard completion definition" not in goal:
         return []
 
     missing: list[str] = []
@@ -141,6 +141,7 @@ def assess_output_state(objective: str, output: str) -> OutputAssessment:
     user_gated = bool(USER_GATED_WORDS.search(text))
     completion_claim = bool(FLEET_DONE_MARKER.search(text) or COMPLETION_CLAIM_WORDS.search(text))
     verified = bool(VERIFICATION_WORDS.search(text))
+    hard_goal = "hard requirement" in (objective or "").lower() or "hard completion definition" in (objective or "").lower()
 
     if user_gated and not completion_claim:
         return OutputAssessment("needs_input", False, "output says user action is required", missing)
@@ -150,6 +151,8 @@ def assess_output_state(objective: str, output: str) -> OutputAssessment:
         return OutputAssessment("active", False, "output describes remaining work or blocker", missing)
     if missing:
         return OutputAssessment("active", False, "missing hard requirement evidence: " + ", ".join(missing), missing)
+    if hard_goal and completion_claim and not FLEET_DONE_MARKER.search(text):
+        return OutputAssessment("active", False, "hard completion goal requires explicit FLEET_DONE marker")
     if ongoing and completion_claim:
         return OutputAssessment("active", False, "ongoing objective remains active until explicitly stopped")
     if completion_claim and verified:

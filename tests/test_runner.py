@@ -155,7 +155,7 @@ def test_runner_marks_quiet_job_as_silent_without_killing_before_timeout(tmp_pat
     assert "no output or child process activity" in row["evidence_reason"]
 
 
-def test_runner_fails_cursor_job_when_external_activity_is_idle_too_long(tmp_path: Path, monkeypatch):
+def test_runner_keeps_quiet_cursor_job_running_until_normal_timeout(tmp_path: Path, monkeypatch):
     store = Store(tmp_path / "autocode.sqlite")
     job_id = insert_running_job(
         store,
@@ -184,7 +184,30 @@ def test_runner_fails_cursor_job_when_external_activity_is_idle_too_long(tmp_pat
     runner.refresh()
 
     row = store.row("select * from jobs where id=?", (job_id,))
-    assert row["status"] == "failed"
-    assert row["evidence_status"] == "cursor_idle_failed"
-    assert terminated == [12345]
-    assert "no recent child/terminal activity" in row["evidence_reason"]
+    assert row["status"] == "running"
+    assert row["evidence_status"] == "running_external_idle"
+    assert terminated == []
+    assert "terminal_idle=1200s" in row["evidence_reason"]
+
+
+def test_runner_uses_longer_cursor_timeout(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    job_id = insert_running_job(
+        store,
+        tmp_path,
+        job_id="job-cursor-long",
+        provider="cursor",
+        created_at="2026-05-24T00:00:00-05:00",
+    )
+    runner = JobRunner(store)
+    monkeypatch.setattr(runner, "_pid_running", lambda pid: True)
+    monkeypatch.setattr(runner, "_process_tree_snapshot", lambda pid: ProcessActivity())
+    monkeypatch.setattr("autocode.runner.DEFAULT_JOB_TIMEOUT", 1800)
+    monkeypatch.setattr("autocode.runner.DEFAULT_CURSOR_JOB_TIMEOUT", 14400)
+    monkeypatch.setattr("autocode.runner.now_ts", lambda: parse_ts("2026-05-24T01:00:00-05:00"))
+
+    runner.refresh()
+
+    row = store.row("select * from jobs where id=?", (job_id,))
+    assert row["status"] == "running"
+    assert row["evidence_status"] == "running_silent"

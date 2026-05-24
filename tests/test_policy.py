@@ -72,17 +72,28 @@ def test_negated_completion_marker_is_not_completion():
     assert "milestone" in reason
 
 
-def test_completion_is_inferred_without_magic_marker():
-    goal = (
-        "Make RedWallet production ready. HARD REQUIREMENT: do not call this done until tests prove "
-        "full Utreexo/proof-backed storage and validation for BitAssets asset creation, sending, and receiving."
-    )
+def test_completion_is_inferred_without_magic_marker_for_normal_goals():
+    goal = "Make RedWallet production ready with proof-backed storage and validation."
     assessment = assess_output_state(
         goal,
         "Completed and verified. Tests passed for Utreexo proof-backed storage, asset creation, sending, and receiving.",
     )
     assert assessment.complete
     assert assessment.state == "done"
+
+
+def test_hard_completion_definition_requires_marker():
+    goal = (
+        "RedWallet native signer / BitAssets / Floresta production-ready completion. "
+        "Hard completion definition: do not mark this done until the live proof passes."
+    )
+    assessment = assess_output_state(
+        goal,
+        "Latest context is already the verified completion state. No additional implementation, test, commit, or smoke action remains.",
+    )
+    assert not assessment.complete
+    assert assessment.state == "active"
+    assert "missing hard requirement evidence" in assessment.reason
 
 
 def test_ongoing_priority_does_not_complete_itself():

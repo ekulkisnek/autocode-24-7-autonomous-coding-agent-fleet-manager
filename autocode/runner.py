@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Row
 
-from .config import DEFAULT_CURSOR_IDLE_SECONDS, DEFAULT_JOB_TIMEOUT, DEFAULT_STALL_SECONDS, JOBS
+from .config import DEFAULT_CURSOR_JOB_TIMEOUT, DEFAULT_JOB_TIMEOUT, DEFAULT_STALL_SECONDS, JOBS
 from .config import HOME
 from .models import Chat, ContinuePlan
 from .policy import assess_output_state
@@ -188,13 +188,8 @@ class JobRunner:
             elif age > DEFAULT_STALL_SECONDS:
                 evidence_status = "running_silent"
                 evidence_reason = f"{evidence_reason}; no output or child process activity for {int(age)}s"
-            if job["provider"] == "cursor" and age > DEFAULT_CURSOR_IDLE_SECONDS and evidence_status in {"running_silent", "running_external_idle"}:
-                self._terminate(pid)
-                status = "failed"
-                completed = now_iso()
-                evidence_status = "cursor_idle_failed"
-                evidence_reason = f"cursor job had no stdout/stderr and no recent child/terminal activity after {int(age)}s; {evidence_reason}"
-        if age > DEFAULT_JOB_TIMEOUT and running:
+        job_timeout = DEFAULT_CURSOR_JOB_TIMEOUT if job["provider"] == "cursor" else DEFAULT_JOB_TIMEOUT
+        if age > job_timeout and running:
             self._terminate(pid)
             status = "failed"
             completed = now_iso()
