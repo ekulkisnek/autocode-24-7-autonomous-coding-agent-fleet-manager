@@ -228,7 +228,11 @@ def _job_working_text(row: Row, limit: int) -> str:
     text = stdout or stderr
     if text:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
-        useful = [line for line in lines if not line.startswith(("diff --git", "index ", "@@ "))]
+        useful = [
+            line for line in lines
+            if not line.startswith(("diff --git", "index ", "@@ "))
+            and "WARN codex_core_skills::loader" not in line
+        ]
         if useful:
             return compact(" ".join(useful[-8:]), limit)
     return prompt

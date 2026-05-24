@@ -22,6 +22,7 @@ class Scheduler:
 
     def tick(self, dispatch: bool = True, max_projects: int | None = None) -> dict:
         self.runner.refresh()
+        stale_leases = self.cleanup_stale_leases()
         self._maybe_discover()
         self.enforce_priority_invariants()
         active = self.active_job_count()
@@ -43,6 +44,7 @@ class Scheduler:
             "active_jobs": self.active_job_count(),
             "capacity": cap,
             "candidates": len(self.candidates(50)),
+            "stale_leases": stale_leases,
         }
 
     def _maybe_discover(self) -> None:
@@ -228,8 +230,38 @@ class Scheduler:
 
     def has_active_lease(self, row: Row) -> bool:
         resource = self.runner.resource_for(row)
-        lease = self.store.row("select * from leases where resource=?", (resource,))
-        return bool(lease)
+        lease = self.store.row(
+            """
+            select l.*,j.status job_status,j.pid job_pid
+            from leases l left join jobs j on j.id=l.job_id
+            where l.resource=?
+            """,
+            (resource,),
+        )
+        if not lease:
+            return False
+        if lease["job_status"] == "running":
+            return True
+        with self.store.connect() as con:
+            con.execute("delete from leases where resource=?", (resource,))
+        self.store.event("stale_lease_removed", lease["chat_id"], lease["job_id"], resource=resource, job_status=lease["job_status"] or "missing")
+        return False
+
+    def cleanup_stale_leases(self) -> int:
+        stale = self.store.rows(
+            """
+            select l.*,j.status job_status
+            from leases l left join jobs j on j.id=l.job_id
+            where j.id is null or j.status!='running'
+            """
+        )
+        if not stale:
+            return 0
+        with self.store.connect() as con:
+            for lease in stale:
+                con.execute("delete from leases where resource=? and job_id=?", (lease["resource"], lease["job_id"]))
+        self.store.event("stale_leases_removed", count=len(stale))
+        return len(stale)
 
     def dispatch(self, row: Row) -> str | None:
         prompt = build_prompt(row, recovery=row["state"] == "stalled")

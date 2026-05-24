@@ -3,6 +3,7 @@ from pathlib import Path
 from autocode.models import Chat
 from autocode.scheduler import Scheduler
 from autocode.store import Store
+from autocode.util import json_dumps, now_iso
 
 
 def test_failed_codex_falls_back_to_grok(tmp_path: Path):
@@ -170,3 +171,53 @@ def test_repeated_cursor_cli_failures_stay_on_direct_cursor_lane(tmp_path: Path)
     row = store.find_chat("cursor-cli-task")
 
     assert Scheduler(store)._direct_cursor_lane(row) is True
+
+
+def test_stale_lease_does_not_block_priority_dispatch(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    chat = Chat(
+        id="codex:codex.rollout:redwallet",
+        provider="codex",
+        source="codex.rollout",
+        provider_chat_id="redwallet",
+        title="Implement wallet persistence",
+        cwd=str(tmp_path),
+        updated_at="2026-05-21T00:00:00-05:00",
+        latest_text="fix code",
+        transcript_hash="h",
+        alias="redwallet",
+        continuation="codex exec resume",
+    )
+    store.upsert_chat(chat, 5, "active", "fix redwallet")
+    store.add_priority("redwallet", "finish redwallet", 1001, str(tmp_path), chat.id, 1)
+    with store.connect() as con:
+        con.execute(
+            """
+            insert into jobs(id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,created_at,updated_at)
+            values(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "job-old",
+                chat.id,
+                "codex",
+                "completed",
+                0,
+                str(tmp_path),
+                json_dumps(["codex", "exec"]),
+                "old",
+                str(tmp_path / "out.txt"),
+                str(tmp_path / "err.txt"),
+                now_iso(),
+                now_iso(),
+            ),
+        )
+        con.execute(
+            "insert into leases(resource,chat_id,job_id,expires_at) values(?,?,?,?)",
+            (str(tmp_path.resolve()), chat.id, "job-old", now_iso()),
+        )
+
+    row = Scheduler(store).candidates(1)[0]
+    scheduler = Scheduler(store)
+
+    assert scheduler.has_active_lease(row) is False
+    assert store.rows("select * from leases") == []
