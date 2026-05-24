@@ -54,6 +54,7 @@ def test_dashboard_renders_running_job_model_and_usage(tmp_path: Path):
     assert "session prompts:" in text
     assert "Driving Now" in text
     assert "prompts: session=" in text
+    assert "resources:" in text
     assert "composer-2.5" in text
     assert "redwallet-cursor-helper" in text
     assert "Provider Usage / Health" in text

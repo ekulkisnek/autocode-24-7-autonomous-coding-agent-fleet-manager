@@ -12,9 +12,10 @@ from typing import Any
 
 from .config import DB, HOME, LOG
 from .launchd import status as launchd_status
+from .resources import format_job_resource, format_system_resource, job_resource, system_resource
 from .scheduler import Scheduler
 from .store import Store
-from .util import command_exists, compact, disk_free_gb, json_loads, load1, memory_free_percent, now_iso, parse_ts, read_text, rel_time
+from .util import command_exists, compact, json_loads, now_iso, parse_ts, read_text, rel_time
 
 
 PROVIDERS = ("codex", "claude", "antigravity", "grok", "cursor")
@@ -48,16 +49,13 @@ def render_dashboard(store: Store | None = None, *, width: int | None = None, li
     total_chats = _count(store, "select count(*) c from chats")
     yolo = store.get_config("yolo", "off")
     priority_only = store.get_config("priority_only", "off")
-    mem = memory_free_percent()
-    mem_label = f"{mem}% free" if mem is not None else "unknown"
-    disk = disk_free_gb(DB.parent)
-    disk_label = f"{disk:.1f}GiB free" if disk is not None else "unknown"
+    resources = system_resource()
 
     lines: list[str] = []
     lines.append(_bar("AutoCode Dashboard", width))
     lines.append(
         f"{now_iso()} | daemon={'on' if daemon_ok else 'off'} | yolo={yolo} | "
-        f"priority_only={priority_only} | jobs={active_jobs}/{cap} | load1={load1():.2f} | mem={mem_label} | disk={disk_label}"
+        f"priority_only={priority_only} | jobs={active_jobs}/{cap} | {format_system_resource(resources)}"
     )
     lines.append(f"db={DB} | chats={total_chats} total, {active_chats} active/adopted")
     lines.extend(_session_summary(store, width))
@@ -125,6 +123,8 @@ def _running_section(store: Store, width: int, limit: int) -> list[str]:
         lines.append(f"        prompts: session={counts[0]} total={counts[1]}")
         if row["cwd"]:
             lines.append(f"        cwd: {_fit(row['cwd'], width - 13)}")
+        resource = job_resource(row)
+        lines.append(f"        resources: {_fit(format_job_resource(resource), width - 19)}")
         lines.append(f"        doing: {_fit(working, width - 15)}")
     return lines
 
