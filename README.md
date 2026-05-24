@@ -27,9 +27,10 @@ autocode daemon start|stop|restart|install
 autocode dashboard                  # live ASCII dashboard
 autocode dashboard --interval 1     # faster refresh
 autocode dashboard --once --limit 8 # one snapshot for logs/Hermes
+autocode dashboard --no-alt-screen  # keep output in normal scrollback
 ```
 
-Exact provider quota remaining is only shown when a provider exposes a reliable local endpoint. Otherwise the dashboard reports `unknown` and shows observed AutoCode usage counts for `1h`, `24h`, and `7d` instead of guessing.
+Live mode uses the terminal alternate screen by default, so it updates in place instead of appending frames into scrollback. Exact provider quota remaining is only shown when a provider exposes a reliable local endpoint. Otherwise the dashboard reports `not exposed` and shows observed AutoCode usage counts for `1h`, `24h`, and `7d` instead of guessing.
 
 ## Cursor
 

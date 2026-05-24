@@ -56,7 +56,7 @@ def test_dashboard_renders_running_job_model_and_usage(tmp_path: Path):
     assert "Provider Usage / Health" in text
     assert "cursor" in text
     assert "remaining" in text
-    assert "unknown" in text
+    assert "not exposed" in text
 
 
 def test_model_info_reads_effort_and_fast_model(tmp_path: Path):

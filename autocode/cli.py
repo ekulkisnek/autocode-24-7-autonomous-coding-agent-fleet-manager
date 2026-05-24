@@ -834,7 +834,7 @@ def cmd_daemon(args: argparse.Namespace) -> None:
 
 
 def cmd_dashboard(args: argparse.Namespace) -> None:
-    run_dashboard(interval=args.interval, limit=args.limit, once=args.once)
+    run_dashboard(interval=args.interval, limit=args.limit, once=args.once, alt_screen=not args.no_alt_screen)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -846,6 +846,7 @@ def build_parser() -> argparse.ArgumentParser:
     dash.add_argument("--interval", type=float, default=2.0, help="refresh interval in seconds")
     dash.add_argument("--limit", type=int, default=12, help="rows per dashboard section")
     dash.add_argument("--once", action="store_true", help="render one snapshot and exit")
+    dash.add_argument("--no-alt-screen", action="store_true", help="do not use the terminal alternate screen buffer")
     dash.set_defaults(func=cmd_dashboard)
     last = sub.add_parser("last"); last.add_argument("query"); last.set_defaults(func=cmd_last)
     g = sub.add_parser("goals"); g.add_argument("--limit", type=int, default=20); g.set_defaults(func=cmd_goals)

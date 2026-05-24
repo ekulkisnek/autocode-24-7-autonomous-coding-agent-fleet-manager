@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,21 +67,32 @@ def render_dashboard(store: Store | None = None, *, width: int | None = None, li
     lines.append("")
     lines.extend(_recent_section(store, width, min(limit, 8)))
     lines.append("")
-    lines.append("Quota note: remaining subscription/API quota is shown as unknown unless a provider exposes an exact local endpoint.")
+    lines.append("Quota note: exact remaining quota shows as 'not exposed' unless a provider exposes a reliable local endpoint.")
     lines.append("Usage columns are observed AutoCode jobs, not provider billing totals.")
     return "\n".join(lines).rstrip() + "\n"
 
 
-def run_dashboard(interval: float = 2.0, limit: int = 12, once: bool = False) -> None:
+def run_dashboard(interval: float = 2.0, limit: int = 12, once: bool = False, alt_screen: bool = True) -> None:
     store = Store()
-    while True:
-        text = render_dashboard(store, limit=limit)
-        if once:
-            print(text, end="")
-            return
-        print("\033[2J\033[H", end="")
-        print(text, end="", flush=True)
-        time.sleep(max(0.5, interval))
+    if not sys.stdout.isatty():
+        print(render_dashboard(store, limit=limit), end="")
+        return
+    if once:
+        print(render_dashboard(store, limit=limit), end="")
+        return
+    if alt_screen:
+        print("\033[?1049h\033[?25l", end="", flush=True)
+    try:
+        while True:
+            text = render_dashboard(store, limit=limit)
+            print("\033[H\033[2J\033[3J", end="")
+            print(text, end="", flush=True)
+            time.sleep(max(0.5, interval))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if alt_screen:
+            print("\033[?25h\033[?1049l", end="", flush=True)
 
 
 def _running_section(store: Store, width: int, limit: int) -> list[str]:
@@ -158,7 +170,7 @@ def _usage_section(store: Store, width: int) -> list[str]:
     now = time.time()
     jobs = store.rows("select provider,status,created_at,updated_at,evidence_status from jobs")
     lines = [_title("Provider Usage / Health", width)]
-    lines.append("  provider     health        running  1h   24h  7d   fail24  default/model       remaining")
+    lines.append("  provider     health        running  1h   24h  7d   fail24  default/model       quota remaining")
     for provider in PROVIDERS:
         provider_jobs = [j for j in jobs if j["provider"] == provider]
         running = sum(1 for j in provider_jobs if j["status"] == "running")
@@ -168,7 +180,7 @@ def _usage_section(store: Store, width: int) -> list[str]:
         fail24 = sum(1 for j in provider_jobs if j["status"] == "failed" and parse_ts(j["updated_at"]) >= now - 86400)
         health = _provider_health(provider)
         default = _provider_default(store, provider)
-        remaining = "unknown"
+        remaining = _quota_remaining(provider)
         lines.append(
             f"  {provider:<12} {health:<13} {running:>7} {one_h:>4} {day:>5} {week:>4} "
             f"{fail24:>7}  {_fit(default, 18):<18} {remaining}"
@@ -232,6 +244,8 @@ def _job_working_text(row: Row, limit: int) -> str:
             line for line in lines
             if not line.startswith(("diff --git", "index ", "@@ "))
             and "WARN codex_core_skills::loader" not in line
+            and line not in {"codex", "exec"}
+            and not line.startswith(("- Edit files", "- Do not spend", "- When a background", "- If this is only", "- Output FLEET_DONE", "- If blocked"))
         ]
         if useful:
             return compact(" ".join(useful[-8:]), limit)
@@ -288,7 +302,25 @@ def _provider_health(provider: str) -> str:
     command = {
         "cursor": "cursor-agent",
     }.get(provider, provider)
-    return "cmd-ok" if command_exists(command) else "cmd-missing"
+    return "cmd-ok" if _command_available(command) else "cmd-missing"
+
+
+def _quota_remaining(provider: str) -> str:
+    # None of these CLIs currently expose a reliable local "remaining usage" value.
+    # Keep this explicit so the dashboard does not invent subscription counters.
+    return "not exposed"
+
+
+def _command_available(command: str) -> bool:
+    if command_exists(command) or shutil.which(command):
+        return True
+    common = {
+        "codex": ["/Applications/Codex.app/Contents/Resources/codex"],
+        "claude": [str(HOME / ".local" / "bin" / "claude")],
+        "grok": [str(HOME / ".grok" / "bin" / "grok")],
+        "cursor-agent": [str(HOME / ".local" / "bin" / "cursor-agent")],
+    }
+    return any(Path(path).exists() for path in common.get(command, []))
 
 
 def _count(store: Store, sql: str) -> int:
