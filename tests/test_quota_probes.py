@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 
-from autocode.quota_probes import QuotaProbeResult, _grok_jwt_tier, _window_summary, format_report
+from autocode.quota_probes import QuotaProbeResult, _claude_usage_windows, _grok_jwt_tier, _window_summary, format_report
 
 
 def test_window_summary_formats_remaining_percent():
@@ -31,6 +31,24 @@ def _make_jwt(claims: dict) -> str:
     return f"{header}.{payload}.fakesig"
 
 
+def test_claude_usage_windows_maps_utilization():
+    usage = {
+        "five_hour": {"utilization": 67.0, "resets_at": "2026-05-25T02:00:00+00:00"},
+        "seven_day": {"utilization": 5.0, "resets_at": "2026-05-26T20:00:00+00:00"},
+    }
+    primary, secondary = _claude_usage_windows(usage)
+    assert primary["usedPercent"] == 67
+    assert primary["windowDurationMins"] == 300
+    assert secondary["usedPercent"] == 5
+    assert secondary["windowDurationMins"] == 10080
+
+
+def test_claude_usage_windows_returns_empty_on_missing_data():
+    primary, secondary = _claude_usage_windows({})
+    assert primary == {}
+    assert secondary == {}
+
+
 def test_grok_jwt_tier_extracts_tier_claim():
     token = _make_jwt({"tier": 5, "sub": "user123"})
     assert _grok_jwt_tier(token) == " · tier=5"
@@ -45,6 +63,32 @@ def test_grok_jwt_tier_returns_empty_on_invalid_input():
     assert _grok_jwt_tier("") == ""
     assert _grok_jwt_tier("notajwt") == ""
     assert _grok_jwt_tier("a.!!!.c") == ""
+
+
+def test_probe_claude_returns_ok_with_live_usage_windows(monkeypatch):
+    from autocode import quota_probes
+
+    monkeypatch.setattr(quota_probes, "_command_available", lambda _: True)
+    monkeypatch.setattr(
+        quota_probes,
+        "_claude_auth_status",
+        lambda: {"loggedIn": True, "subscriptionType": "pro"},
+    )
+    monkeypatch.setattr(quota_probes, "_claude_keychain_meta", lambda: {"rateLimitTier": "default_claude_ai", "subscriptionType": "pro", "expiresAt": None})
+    monkeypatch.setattr(
+        quota_probes,
+        "_claude_oauth_get",
+        lambda path: {
+            "five_hour": {"utilization": 67.0, "resets_at": "2026-05-25T02:00:00+00:00"},
+            "seven_day": {"utilization": 5.0, "resets_at": "2026-05-26T20:00:00+00:00"},
+        } if "usage" in path else {},
+    )
+
+    result = quota_probes.probe_claude()
+    assert result.status == "ok"
+    assert "33% left" in result.summary  # 100 - 67
+    assert "95% left" in result.summary  # 100 - 5
+    assert result.source == "claude.ai /api/oauth/usage"
 
 
 def test_probe_claude_summary_uses_keychain_tier(monkeypatch):

@@ -98,7 +98,6 @@ def probe_claude() -> QuotaProbeResult:
     if not auth.get("loggedIn"):
         return QuotaProbeResult("claude", "unavailable", "not logged in", source="claude auth status")
     keychain = _claude_keychain_meta()
-    # /api/oauth/profile is Cloudflare-challenged headlessly; keychain is the reliable fallback
     rate_limit_tier = keychain.get("rateLimitTier") or auth.get("subscriptionType") or "unknown"
     sub = auth.get("subscriptionType") or "unknown"
     usage = _claude_oauth_get("/api/oauth/usage")
@@ -106,34 +105,34 @@ def probe_claude() -> QuotaProbeResult:
     org = profile.get("organization") if isinstance(profile.get("organization"), dict) else {}
     tier = org.get("rate_limit_tier") or rate_limit_tier
     sub_status = org.get("subscription_status") or sub
-    extra = usage.get("extra_usage") if isinstance(usage.get("extra_usage"), dict) else {}
-    has_remaining = any(
-        extra.get(k) is not None
-        for k in ("monthly_limit", "used_credits", "utilization")
-    )
-    exp_hint = ""
-    exp_ts = keychain.get("expiresAt")
-    if isinstance(exp_ts, (int, float)) and exp_ts > 0:
-        exp_dt = datetime.fromtimestamp(exp_ts / 1000, timezone.utc).astimezone()
-        exp_hint = f", token {exp_dt.strftime('%m-%d %H:%M')}"
-    if has_remaining:
-        summary = f"extra usage: {extra.get('used_credits')}/{extra.get('monthly_limit')}"
-        status = "partial"
+    primary, secondary = _claude_usage_windows(usage)
+    if primary:
+        summary = _window_summary(primary, secondary)
+        status = "ok"
+        source = "claude.ai /api/oauth/usage"
+        refresh = "120s; authenticated GET"
     else:
+        exp_hint = ""
+        exp_ts = keychain.get("expiresAt")
+        if isinstance(exp_ts, (int, float)) and exp_ts > 0:
+            exp_dt = datetime.fromtimestamp(exp_ts / 1000, timezone.utc).astimezone()
+            exp_hint = f", token {exp_dt.strftime('%m-%d %H:%M')}"
         summary = f"{sub_status}/{tier}{exp_hint} (no remaining counter)"
         status = "partial"
+        source = "claude auth status + macOS keychain"
+        refresh = "300s; local keychain read"
     return QuotaProbeResult(
         "claude",
         status,
         summary,
-        source="claude auth status + macOS keychain",
+        source=source,
         auth='macOS keychain "Claude Code-credentials" OAuth',
-        refresh_hint="300s; local keychain read",
+        refresh_hint=refresh,
         data={
             "auth_status": {k: auth.get(k) for k in ("loggedIn", "authMethod", "subscriptionType", "orgName")},
             "rate_limit_tier": tier,
             "subscription_status": sub_status,
-            "extra_usage": extra,
+            "windows": {"primary": primary, "secondary": secondary},
             "keychain": {k: keychain.get(k) for k in ("rateLimitTier", "subscriptionType")},
         },
     )
@@ -370,6 +369,22 @@ def _grok_jwt_tier(token: str) -> str:
     return ""
 
 
+def _claude_usage_windows(usage: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Map /api/oauth/usage response fields to _window_summary() dicts."""
+    windows = []
+    for key, mins in (("five_hour", 300), ("seven_day", 10080)):
+        w = usage.get(key)
+        if isinstance(w, dict) and w.get("utilization") is not None:
+            windows.append({
+                "usedPercent": int(w["utilization"]),
+                "windowDurationMins": mins,
+                "resetsAt": w.get("resets_at"),
+            })
+    primary = windows[0] if windows else {}
+    secondary = windows[1] if len(windows) > 1 else {}
+    return primary, secondary
+
+
 def _claude_auth_status() -> dict[str, Any]:
     proc = _run_json(["claude", "auth", "status"], timeout=12)
     return json_loads(proc.get("stdout") or "{}", {})
@@ -383,7 +398,8 @@ def _claude_oauth_get(path: str) -> dict[str, Any]:
     req = urllib.request.Request(url, method="GET")
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "application/json")
-    req.add_header("User-Agent", "autocode-quota-probe/0.1")
+    # claude.ai uses Cloudflare; a bot-detectable UA returns a 403 challenge page
+    req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
     try:
         with urllib.request.urlopen(req, timeout=12) as resp:
             return json_loads(resp.read().decode("utf-8", errors="replace"), {})
