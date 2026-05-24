@@ -170,13 +170,21 @@ def probe_grok() -> QuotaProbeResult:
         summary,
         source=str(auth_path),
         auth=str(auth_path),
-        refresh_hint="300s; local file read",
+        # api.x.ai/v1/me works (user info only); /v1/usage, /v1/credits, /v1/me/usage all 404;
+        # grok.com REST API is CF/auth blocked headlessly — no stable usage endpoint exists.
+        refresh_hint="300s; local file read (x.ai API has no public usage endpoint for CLI tokens)",
         data={
             "auth_mode": entry.get("auth_mode") if isinstance(entry, dict) else None,
             "email": entry.get("email") if isinstance(entry, dict) else None,
             "expires_at": expires_at,
             "tier_from_jwt": tier_hint.lstrip(" · tier=") if tier_hint else None,
             "leader_running": has_leader,
+            "checked_endpoints": [
+                "api.x.ai/v1/me (ok, user info only)",
+                "api.x.ai/v1/usage (404)",
+                "api.x.ai/v1/credits (404)",
+                "grok.com/rest/app-chat/conversations/quota (403/CF)",
+            ],
         },
     )
 
@@ -192,20 +200,51 @@ def probe_cursor() -> QuotaProbeResult:
     tier = about_obj.get("subscriptionTier") or _cursor_membership_type() or "unknown"
     model = about_obj.get("model") or "auto"
     stripe_status = _cursor_subscription_status()
-    status_hint = f" · {stripe_status}" if stripe_status else ""
-    summary = f"{tier} / model={model}{status_hint} (no remaining counter)"
+
+    # Live usage from api2.cursor.sh (Bearer JWT from state.vscdb)
+    usage = _cursor_usage_api()
+    gpt4 = usage.get("gpt-4") if isinstance(usage.get("gpt-4"), dict) else {}
+    num_req = gpt4.get("numRequests") if isinstance(gpt4.get("numRequests"), int) else None
+    max_req = gpt4.get("maxRequestUsage")  # None means no cap
+    start_of_month = usage.get("startOfMonth", "") if usage else ""
+
+    period_hint = ""
+    if start_of_month:
+        try:
+            period_dt = datetime.fromisoformat(start_of_month.replace("Z", "+00:00")).astimezone()
+            period_hint = f", period since {period_dt.strftime('%m-%d')}"
+        except Exception:
+            pass
+
+    if isinstance(max_req, (int, float)) and max_req > 0 and isinstance(num_req, int):
+        remaining = max(0, int(max_req) - num_req)
+        summary = f"{tier} / model={model} · {remaining}/{int(max_req)} req remaining{period_hint}"
+        probe_status = "ok"
+    elif usage:
+        status_hint = f" · {stripe_status}" if stripe_status else ""
+        summary = f"{tier} / model={model}{status_hint} (unlimited{period_hint})"
+        probe_status = "partial"
+    else:
+        status_hint = f" · {stripe_status}" if stripe_status else ""
+        summary = f"{tier} / model={model}{status_hint} (no remaining counter)"
+        probe_status = "partial"
+
     return QuotaProbeResult(
         "cursor",
-        "partial",
+        probe_status,
         summary,
-        source="cursor-agent about + Cursor IDE state.vscdb",
-        auth="cursor-agent login session; CURSOR_API_KEY for cloud API only",
-        refresh_hint="300s; local CLI read",
+        source="cursor-agent about + api2.cursor.sh/auth/usage + state.vscdb",
+        auth="cursor-agent JWT session (cursorAuth/accessToken in state.vscdb)",
+        refresh_hint="120s; authenticated GET to api2.cursor.sh",
         data={
             "about": {k: about_obj.get(k) for k in ("cliVersion", "subscriptionTier", "model")},
             "stripe_membership_type": _cursor_membership_type(),
             "stripe_subscription_status": stripe_status,
-            "cursor_api_usage_endpoint": "not exposed (/v1/usage -> 404)",
+            "api_usage": {
+                "numRequests": num_req,
+                "maxRequestUsage": max_req,
+                "startOfMonth": start_of_month,
+            } if usage else "api2.cursor.sh/auth/usage unavailable",
         },
     )
 
@@ -226,7 +265,9 @@ def probe_antigravity() -> QuotaProbeResult:
         summary,
         source="Antigravity language_server PredictionService/FetchQuotaStatus",
         auth="Antigravity IDE session",
-        refresh_hint="requires running Antigravity.app + LS address",
+        # agentapi only has get-conversation-metadata and new-conversation subcommands;
+        # antigravity_state.pbtxt has only onboarding state; no network quota endpoint found.
+        refresh_hint="requires running Antigravity.app + LS address (agentapi has no quota subcommand)",
         data={
             "agentapi": str(agentapi),
             "antigravity_app": str(app),
@@ -362,6 +403,23 @@ def _claude_access_token() -> str:
         return str(oauth.get("accessToken") or oauth.get("access_token") or "")
     except Exception:
         return ""
+
+
+def _cursor_usage_api() -> dict[str, Any]:
+    """Fetch live usage from api2.cursor.sh using the stored JWT session token."""
+    token = _cursor_state_value("cursorAuth/accessToken").strip('"')
+    if not token:
+        return {}
+    url = "https://api2.cursor.sh/auth/usage"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "cursor-agent/1.0")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json_loads(resp.read().decode("utf-8", errors="replace"), {})
+    except Exception:
+        return {}
 
 
 def _cursor_membership_type() -> str:

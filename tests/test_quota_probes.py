@@ -82,7 +82,7 @@ def test_grok_probe_summary_format():
     assert "no remaining counter" in result.summary
 
 
-def test_probe_cursor_includes_subscription_status(monkeypatch):
+def test_probe_cursor_shows_unlimited_with_period_when_no_cap(monkeypatch):
     from autocode import quota_probes
 
     monkeypatch.setattr(quota_probes, "_cursor_agent_bin", lambda: "/fake/cursor-agent")
@@ -93,8 +93,62 @@ def test_probe_cursor_includes_subscription_status(monkeypatch):
     )
     monkeypatch.setattr(quota_probes, "_cursor_membership_type", lambda: "pro_plus")
     monkeypatch.setattr(quota_probes, "_cursor_subscription_status", lambda: "active")
+    monkeypatch.setattr(
+        quota_probes,
+        "_cursor_usage_api",
+        lambda: {
+            "gpt-4": {"numRequests": 42, "numRequestsTotal": 100, "numTokens": 5000, "maxTokenUsage": None, "maxRequestUsage": None},
+            "startOfMonth": "2026-04-25T16:15:24.000Z",
+        },
+    )
 
     result = quota_probes.probe_cursor()
     assert result.status == "partial"
-    assert "active" in result.summary
     assert "Pro+" in result.summary
+    assert "unlimited" in result.summary
+    assert "04-25" in result.summary  # billing period date
+
+
+def test_probe_cursor_shows_remaining_when_cap_present(monkeypatch):
+    from autocode import quota_probes
+
+    monkeypatch.setattr(quota_probes, "_cursor_agent_bin", lambda: "/fake/cursor-agent")
+    monkeypatch.setattr(
+        quota_probes,
+        "_run_json",
+        lambda cmd, **_kw: {"stdout": '{"subscriptionTier":"Pro","model":"Auto","cliVersion":"1.0"}', "returncode": 0},
+    )
+    monkeypatch.setattr(quota_probes, "_cursor_membership_type", lambda: "pro")
+    monkeypatch.setattr(quota_probes, "_cursor_subscription_status", lambda: "active")
+    monkeypatch.setattr(
+        quota_probes,
+        "_cursor_usage_api",
+        lambda: {
+            "gpt-4": {"numRequests": 350, "numRequestsTotal": 350, "numTokens": 0, "maxTokenUsage": None, "maxRequestUsage": 500},
+            "startOfMonth": "2026-04-25T16:15:24.000Z",
+        },
+    )
+
+    result = quota_probes.probe_cursor()
+    assert result.status == "ok"
+    assert "150/500" in result.summary  # 500 - 350 = 150 remaining
+    assert "req remaining" in result.summary
+
+
+def test_probe_cursor_falls_back_gracefully_when_api_unavailable(monkeypatch):
+    from autocode import quota_probes
+
+    monkeypatch.setattr(quota_probes, "_cursor_agent_bin", lambda: "/fake/cursor-agent")
+    monkeypatch.setattr(
+        quota_probes,
+        "_run_json",
+        lambda cmd, **_kw: {"stdout": '{"subscriptionTier":"Pro+","model":"Auto"}', "returncode": 0},
+    )
+    monkeypatch.setattr(quota_probes, "_cursor_membership_type", lambda: "pro_plus")
+    monkeypatch.setattr(quota_probes, "_cursor_subscription_status", lambda: "active")
+    monkeypatch.setattr(quota_probes, "_cursor_usage_api", lambda: {})
+
+    result = quota_probes.probe_cursor()
+    assert result.status == "partial"
+    assert "Pro+" in result.summary
+    assert "no remaining counter" in result.summary
