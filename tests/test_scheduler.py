@@ -221,3 +221,10 @@ def test_stale_lease_does_not_block_priority_dispatch(tmp_path: Path):
 
     assert scheduler.has_active_lease(row) is False
     assert store.rows("select * from leases") == []
+
+
+def test_capacity_is_zero_when_state_disk_is_almost_full(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    monkeypatch.setattr("autocode.scheduler.disk_free_gb", lambda path: 0.2)
+
+    assert Scheduler(store).capacity() == 0

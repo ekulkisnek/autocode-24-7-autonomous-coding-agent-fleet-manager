@@ -12,7 +12,7 @@ from .policy import build_prompt
 from .providers import provider_map
 from .runner import JobRunner
 from .store import Store
-from .util import load1, memory_free_percent, now_iso, parse_ts
+from .util import disk_free_gb, load1, memory_free_percent, now_iso, parse_ts
 
 
 class Scheduler:
@@ -112,6 +112,9 @@ class Scheduler:
 
     def capacity(self) -> int:
         configured = int(self.store.get_config("max_active", str(DEFAULT_MAX_ACTIVE)) or DEFAULT_MAX_ACTIVE)
+        disk_free = disk_free_gb(self.store.path.parent)
+        if disk_free is not None and disk_free < 0.75:
+            return 0
         l1 = load1()
         mem_free = memory_free_percent()
         if mem_free is not None and mem_free < 12:

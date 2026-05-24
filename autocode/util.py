@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -123,3 +124,11 @@ def memory_free_percent() -> int | None:
         return None
     match = re.search(r"System-wide memory free percentage:\s*(\d+)%", out)
     return int(match.group(1)) if match else None
+
+
+def disk_free_gb(path: str | Path) -> float | None:
+    try:
+        usage = shutil.disk_usage(str(path))
+        return usage.free / (1024 ** 3)
+    except Exception:
+        return None

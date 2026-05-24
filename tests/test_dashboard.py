@@ -50,6 +50,7 @@ def test_dashboard_renders_running_job_model_and_usage(tmp_path: Path):
     text = render_dashboard(store, width=120, limit=5, refresh_jobs=False)
 
     assert "AutoCode Dashboard" in text
+    assert "disk=" in text
     assert "Driving Now" in text
     assert "composer-2.5" in text
     assert "redwallet-cursor-helper" in text
