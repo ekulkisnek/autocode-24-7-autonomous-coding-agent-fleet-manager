@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -96,34 +97,44 @@ def probe_claude() -> QuotaProbeResult:
     auth = _claude_auth_status()
     if not auth.get("loggedIn"):
         return QuotaProbeResult("claude", "unavailable", "not logged in", source="claude auth status")
+    keychain = _claude_keychain_meta()
+    # /api/oauth/profile is Cloudflare-challenged headlessly; keychain is the reliable fallback
+    rate_limit_tier = keychain.get("rateLimitTier") or auth.get("subscriptionType") or "unknown"
+    sub = auth.get("subscriptionType") or "unknown"
     usage = _claude_oauth_get("/api/oauth/usage")
     profile = _claude_oauth_get("/api/oauth/profile")
     org = profile.get("organization") if isinstance(profile.get("organization"), dict) else {}
-    tier = org.get("rate_limit_tier") or auth.get("subscriptionType") or "unknown"
-    sub = org.get("subscription_status") or auth.get("subscriptionType") or "unknown"
+    tier = org.get("rate_limit_tier") or rate_limit_tier
+    sub_status = org.get("subscription_status") or sub
     extra = usage.get("extra_usage") if isinstance(usage.get("extra_usage"), dict) else {}
     has_remaining = any(
         extra.get(k) is not None
         for k in ("monthly_limit", "used_credits", "utilization")
     )
+    exp_hint = ""
+    exp_ts = keychain.get("expiresAt")
+    if isinstance(exp_ts, (int, float)) and exp_ts > 0:
+        exp_dt = datetime.fromtimestamp(exp_ts / 1000, timezone.utc).astimezone()
+        exp_hint = f", token {exp_dt.strftime('%m-%d %H:%M')}"
     if has_remaining:
         summary = f"extra usage: {extra.get('used_credits')}/{extra.get('monthly_limit')}"
         status = "partial"
     else:
-        summary = f"{sub}/{tier} (no session remaining counter)"
+        summary = f"{sub_status}/{tier}{exp_hint} (no remaining counter)"
         status = "partial"
     return QuotaProbeResult(
         "claude",
         status,
         summary,
-        source="claude.ai /api/oauth/{usage,profile}",
+        source="claude auth status + macOS keychain",
         auth='macOS keychain "Claude Code-credentials" OAuth',
-        refresh_hint="300s; 0-cost GET",
+        refresh_hint="300s; local keychain read",
         data={
             "auth_status": {k: auth.get(k) for k in ("loggedIn", "authMethod", "subscriptionType", "orgName")},
             "rate_limit_tier": tier,
-            "subscription_status": sub,
+            "subscription_status": sub_status,
             "extra_usage": extra,
+            "keychain": {k: keychain.get(k) for k in ("rateLimitTier", "subscriptionType")},
         },
     )
 
@@ -140,21 +151,32 @@ def probe_grok() -> QuotaProbeResult:
     except Exception as exc:
         return QuotaProbeResult("grok", "error", "auth parse failed", source=str(auth_path), error=str(exc))
     entry = auth_doc.get("https://accounts.x.ai/sign-in") or next(iter(auth_doc.values()), {})
+    tier_hint = _grok_jwt_tier(entry.get("key") if isinstance(entry, dict) else "")
+    expires_hint = ""
+    expires_at = entry.get("expires_at") if isinstance(entry, dict) else None
+    if expires_at:
+        try:
+            exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).astimezone()
+            expires_hint = f", token {exp_dt.strftime('%m-%d %H:%M')}"
+        except Exception:
+            pass
     leader = _run_json([grok, "leader", "list"], timeout=8)
     leader_text = (leader.get("stdout") or "").strip()
     has_leader = bool(leader_text and "No leader candidates found" not in leader_text)
-    summary = "billing/quota via x.ai leader session (not exposed offline)"
+    summary = f"oidc{tier_hint}{expires_hint} (no remaining counter)"
     return QuotaProbeResult(
         "grok",
-        "unavailable",
+        "partial",
         summary,
-        source="grok leader + internal billing ext (x.ai/bundle/status)",
+        source=str(auth_path),
         auth=str(auth_path),
-        refresh_hint="requires running `grok` leader; no stable public REST quota",
+        refresh_hint="300s; local file read",
         data={
             "auth_mode": entry.get("auth_mode") if isinstance(entry, dict) else None,
+            "email": entry.get("email") if isinstance(entry, dict) else None,
+            "expires_at": expires_at,
+            "tier_from_jwt": tier_hint.lstrip(" · tier=") if tier_hint else None,
             "leader_running": has_leader,
-            "leader_list": leader_text[:240],
         },
     )
 
@@ -169,7 +191,9 @@ def probe_cursor() -> QuotaProbeResult:
         about_obj = {}
     tier = about_obj.get("subscriptionTier") or _cursor_membership_type() or "unknown"
     model = about_obj.get("model") or "auto"
-    summary = f"{tier} / model={model} (no remaining counter)"
+    stripe_status = _cursor_subscription_status()
+    status_hint = f" · {stripe_status}" if stripe_status else ""
+    summary = f"{tier} / model={model}{status_hint} (no remaining counter)"
     return QuotaProbeResult(
         "cursor",
         "partial",
@@ -180,7 +204,7 @@ def probe_cursor() -> QuotaProbeResult:
         data={
             "about": {k: about_obj.get(k) for k in ("cliVersion", "subscriptionTier", "model")},
             "stripe_membership_type": _cursor_membership_type(),
-            "stripe_subscription_status": _cursor_subscription_status(),
+            "stripe_subscription_status": stripe_status,
             "cursor_api_usage_endpoint": "not exposed (/v1/usage -> 404)",
         },
     )
@@ -266,6 +290,43 @@ def _codex_rate_limits(codex: str) -> dict[str, Any]:
         if obj.get("id") == 2 and isinstance(obj.get("result"), dict):
             return obj["result"]
     raise RuntimeError("account/rateLimits/read response missing")
+
+
+def _claude_keychain_meta() -> dict[str, Any]:
+    """Read non-secret metadata (tier, expiry, scopes) from the Claude Code keychain entry."""
+    try:
+        raw = subprocess.check_output(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        doc = json.loads(raw)
+        oauth = doc.get("claudeAiOauth") if isinstance(doc.get("claudeAiOauth"), dict) else doc
+        return {
+            "rateLimitTier": str(oauth.get("rateLimitTier") or ""),
+            "subscriptionType": str(oauth.get("subscriptionType") or ""),
+            "expiresAt": oauth.get("expiresAt"),
+        }
+    except Exception:
+        return {}
+
+
+def _grok_jwt_tier(token: str) -> str:
+    """Decode tier claim from Grok JWT token payload (local, no network, no secret exposure)."""
+    if not token or not isinstance(token, str):
+        return ""
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return ""
+        payload = base64.urlsafe_b64decode(parts[1] + "==")
+        claims = json.loads(payload.decode("utf-8"))
+        tier = claims.get("tier")
+        if tier is not None:
+            return f" · tier={tier}"
+    except Exception:
+        pass
+    return ""
 
 
 def _claude_auth_status() -> dict[str, Any]:
