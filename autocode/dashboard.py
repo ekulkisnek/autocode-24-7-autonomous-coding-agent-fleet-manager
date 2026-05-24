@@ -147,7 +147,7 @@ def _queue_section(store: Store, width: int, limit: int) -> list[str]:
         for p in priorities[: min(5, limit)]:
             target = f" -> {_fit(p['target_chat_id'], 34)}" if p["target_chat_id"] else ""
             lines.append(f"    p{p['priority']} {_fit(p['query'], 32)}{target} lanes={p['worker_lanes']}")
-            lines.append(f"      goal: {_fit(p['objective'], width - 14)}")
+            lines.append(f"      goal: {_fit(_objective_summary(p['objective']), width - 14)}")
     if not rows:
         if not priorities and store.get_config("priority_only", "off").lower() in {"1", "true", "yes", "on"}:
             lines.append("  no schedulable chats right now because priority_only=on and no active priority projects exist")
@@ -162,7 +162,7 @@ def _queue_section(store: Store, width: int, limit: int) -> list[str]:
         title = row["alias"] or row["title"] or row["provider_chat_id"]
         state = row["state"]
         flag = "P" if _is_priority(store, row["id"]) else "-"
-        objective = row["objective"] or row["title"] or row["latest_text"]
+        objective = _objective_summary(row["objective"] or row["title"] or row["latest_text"])
         counts = _chat_drive_counts(store, row["id"])
         lines.append(
             f"    {flag} {rel_time(row['updated_at']):>4} {row['provider']:<11} {model:<22} "
@@ -194,7 +194,7 @@ def _usage_section(store: Store, width: int) -> list[str]:
     jobs = store.rows("select provider,status,created_at,updated_at,evidence_status from jobs")
     quota = _quota_results()
     lines = [_title("Provider Usage / Health", width)]
-    lines.append("  provider     health        running  1h   24h  7d   fail24  default/model       quota remaining")
+    lines.append("  provider     health        running  1h   24h  7d   fail24  default/model")
     for provider in PROVIDERS:
         provider_jobs = [j for j in jobs if j["provider"] == provider]
         running = sum(1 for j in provider_jobs if j["status"] == "running")
@@ -204,12 +204,30 @@ def _usage_section(store: Store, width: int) -> list[str]:
         fail24 = sum(1 for j in provider_jobs if j["status"] == "failed" and parse_ts(j["updated_at"]) >= now - 86400)
         health = _provider_health(provider)
         default = _provider_default(store, provider)
-        remaining = _quota_remaining(provider, quota)
         lines.append(
             f"  {provider:<12} {health:<13} {running:>7} {one_h:>4} {day:>5} {week:>4} "
-            f"{fail24:>7}  {_fit(default, 18):<18} {remaining}"
+            f"{fail24:>7}  {_fit(default, 18):<18}"
         )
+        lines.append(f"      quota: {_quota_remaining(provider, quota, width=width)}")
     return lines
+
+
+def _objective_summary(text: str) -> str:
+    clean = " ".join((text or "").split())
+    if not clean:
+        return ""
+    for pattern in (
+        r"\bHard completion definition:\s*[^.!?]+[.!?]?\s*",
+        r"\bOperating rule:\s*[^.!?]+[.!?]?\s*",
+    ):
+        clean = re.sub(pattern, "", clean, flags=re.IGNORECASE).strip()
+    if len(clean) < 40:
+        return clean
+    parts = re.split(r"(?<=[.!?])\s+", clean)
+    for part in parts:
+        if 25 <= len(part) <= 220:
+            return part.strip()
+    return clean[:220].rstrip()
 
 
 def _recent_section(store: Store, width: int, limit: int) -> list[str]:
@@ -229,13 +247,15 @@ def _recent_section(store: Store, width: int, limit: int) -> list[str]:
         return lines
     for row in rows:
         label = row["alias"] or row["title"] or row["chat_id"]
-        reason = row["evidence_reason"] or _job_working_text(row, 260)
+        summary, byte_note = _job_done_summary(row, 260)
         lines.append(
             f"  {rel_time(row['updated_at']):>4} {row['provider']:<11} {row['status']:<9} "
             f"{row['evidence_status']:<16} {_fit(label, 42)}"
         )
-        if reason:
-            lines.append(f"       {_fit(reason, width - 8)}")
+        if summary:
+            lines.append(f"        done: {_fit(summary, width - 15)}")
+        if byte_note:
+            lines.append(f"             {_fit(byte_note, width - 14)}")
     return lines
 
 
@@ -258,12 +278,14 @@ def chat_model_info(row: Row, meta: dict[str, Any]) -> ModelInfo:
 
 
 def _job_working_text(row: Row, limit: int) -> str:
-    stdout = read_text(Path(row["stdout_path"]), limit=limit * 4).strip() if row["stdout_path"] else ""
-    stderr = read_text(Path(row["stderr_path"]), limit=limit * 4).strip() if row["stderr_path"] else ""
-    text = stdout or stderr
+    read_limit = limit * 4
+    stdout = _read_job_log(Path(row["stdout_path"]), read_limit).strip() if row["stdout_path"] else ""
+    stderr = _read_job_log(Path(row["stderr_path"]), read_limit).strip() if row["stderr_path"] else ""
+    text = "\n".join(part for part in (stdout, stderr) if part)
     if text:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
-        useful = [line for line in lines if _useful_working_line(line)]
+        useful = [_clean_working_line(line) for line in lines if _useful_working_line(line)]
+        useful = [line for line in useful if line]
         if useful:
             build = _build_progress_summary(useful)
             if build:
@@ -271,8 +293,22 @@ def _job_working_text(row: Row, limit: int) -> str:
             status = _status_lines(useful)
             if status:
                 return compact(" ".join(status[-3:]), limit)
+            tests = _test_progress_summary(useful)
+            if tests:
+                return compact(tests, limit)
             return compact(" ".join(useful[-4:]), limit)
     return _prompt_summary(row["prompt"], limit)
+
+
+def _read_job_log(path: Path, limit: int) -> str:
+    text = read_text(path, limit=limit)
+    try:
+        truncated = path.exists() and path.stat().st_size > limit
+    except OSError:
+        truncated = False
+    if truncated and "\n" in text:
+        return text.split("\n", 1)[1]
+    return text
 
 
 def _prompt_summary(prompt: str, limit: int) -> str:
@@ -292,9 +328,52 @@ def _useful_prompt_line(line: str) -> bool:
     lower = line.lower()
     if lower.startswith(("operating rule:", "rules:", "hard completion definition:", "do not ", "use the fastest", "if ", "when ", "output ", "- ")):
         return False
+    if re.match(r"^\d+\.\s", line.strip()):
+        return False
+    if "autocode is driving this project" in lower or "maximum yolo mode" in lower:
+        return False
     if "FLEET_DONE" in line or "FLEET_MILESTONE_COMPLETE" in line:
         return False
     return len(line) >= 20
+
+
+def _job_done_summary(row: Row, limit: int) -> tuple[str, str]:
+    working = _job_working_text(row, limit)
+    if working and not working.startswith("Waiting for first agent output"):
+        summary = working
+    else:
+        summary = _evidence_reason_summary(row["evidence_reason"] or "", limit)
+    return summary, _evidence_byte_note(row["evidence_reason"] or "")
+
+
+def _evidence_reason_summary(reason: str, limit: int) -> str:
+    text = reason or ""
+    text = re.sub(r"stdout_bytes=\d+;?\s*", "", text)
+    text = re.sub(r"stderr_bytes=\d+;?\s*", "", text)
+    text = re.sub(r"^process exited;?\s*", "", text, flags=re.IGNORECASE)
+    text = text.strip(" ;")
+    return compact(text, limit) if text else ""
+
+
+def _evidence_byte_note(reason: str) -> str:
+    if not reason:
+        return ""
+    parts: list[str] = []
+    stdout_match = re.search(r"stdout_bytes=(\d+)", reason)
+    stderr_match = re.search(r"stderr_bytes=(\d+)", reason)
+    if stdout_match:
+        parts.append(f"stdout {_human_bytes(int(stdout_match.group(1)))}")
+    if stderr_match:
+        parts.append(f"stderr {_human_bytes(int(stderr_match.group(1)))}")
+    return ", ".join(parts)
+
+
+def _human_bytes(size: int) -> str:
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f}MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f}kB"
+    return f"{size}B"
 
 
 def _build_progress_summary(lines: list[str]) -> str:
@@ -302,10 +381,22 @@ def _build_progress_summary(lines: list[str]) -> str:
     if gradle:
         task = gradle[-1].replace("> Task ", "").strip()
         return f"Android/Gradle build running: latest task {task}"
+    return ""
+
+
+def _test_progress_summary(lines: list[str]) -> str:
     tests = [line for line in lines if re.search(r"\b(pass|passed|fail|failed|tests?)\b", line, re.IGNORECASE)]
     if tests:
         return tests[-1]
     return ""
+
+
+def _clean_working_line(line: str) -> str:
+    clean = line.strip()
+    clean = re.sub(r"^(?:FLEET_MILESTONE_COMPLETE|FLEET_DONE)\b[:\s-]*", "", clean).strip()
+    clean = re.split(r"\bCompleted evidence:\s*", clean, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    clean = re.sub(r"^\s*[-*]\s+", "", clean).strip()
+    return clean
 
 
 def _status_lines(lines: list[str]) -> list[str]:
@@ -333,9 +424,15 @@ def _useful_working_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
+    lower = stripped.lower()
     noise_prefixes = (
         "diff --git",
         "index ",
+        "new file mode ",
+        "deleted file mode ",
+        "similarity index ",
+        "rename from ",
+        "rename to ",
         "@@ ",
         "+++ ",
         "--- ",
@@ -364,13 +461,68 @@ def _useful_working_line(line: str) -> bool:
     )
     if stripped in {"codex", "exec", "```", "```text", "```bash", "```sh"}:
         return False
-    if stripped.lower().startswith(("operating rule:", "rules:", "hard completion definition:", "current status to assume:")):
+    if re.match(r"^[{}\[\],:\s]+$", stripped):
+        return False
+    if lower.startswith(("operating rule:", "rules:", "hard completion definition:", "current status to assume:")):
+        return False
+    if lower.startswith(("current known next step:", "autocode instruction:", "latest known context:")):
+        return False
+    if lower.startswith((
+        "handoff here:",
+        "i also linked it from",
+        "and logged the context/handoff",
+        "the handoff includes",
+        "short current checkpoint:",
+    )):
+        return False
+    if any(
+        token in lower
+        for token in (
+            "codex_handoff_native_signer.md",
+            "agent_coordination.md",
+            "local_development_notes.md",
+            "the handoff includes",
+            "short current checkpoint",
+        )
+    ):
         return False
     if stripped.startswith(noise_prefixes):
+        return False
+    if re.match(r"^\d+\.\s", stripped):
+        return False
+    if lower.startswith("(use `node --trace-deprecation"):
         return False
     if "WARN codex_core_skills::loader" in stripped:
         return False
     if stripped.startswith(("/bin/", "./", "docker compose ", "git diff ", "tail ", "TMUX_TMPDIR=")):
+        return False
+    if lower.startswith(("succeeded in ", "failed in ", "errored in ")):
+        return False
+    if " child-process:exec_cmd " in lower or " child-process:exec_try " in lower:
+        return False
+    if re.match(r"^\d+\s+\d+:\d+(?::\d+)?\s+", stripped):
+        return False
+    if re.match(r"^\d+:\d{2}:\d{2}:\d{2}\.\d+\s+", stripped):
+        return False
+    if re.match(r"^\d{2}:\d{2}:\d{2}\.\d+\s+detox\[\d+\]\s+", stripped):
+        return False
+    if re.match(r"^\d+\s+\d+:\d+\s+(node|python|ruby|java|gradle|bash|sh)\b", stripped):
+        return False
+    if re.match(r"^\d+\s+\d+:\d+(?::\d+)?\s+/.+\b(ps|rg|tmux|autocode)\b", stripped):
+        return False
+    if "node_modules/.bin/" in stripped or "/.bin/detox " in stripped:
+        return False
+    if any(path in stripped for path in ("$HOME/Library/Android/sdk", "/Volumes/T705/code/android-commandlinetools", "/opt/homebrew/share/android")):
+        return False
+    if "\\" in stripped and ("/" in stripped or "$" in stripped):
+        return False
+    if lower.startswith(("npx ", "npm run ", "ps -axo ", "rg ", "tmux ", "status commands:")):
+        return False
+    if re.match(r"^(?:/usr/bin/)?(?:ps|rg|tmux)\b", stripped):
+        return False
+    if re.match(r'^"[A-Z0-9_]+=.*",?$', stripped):
+        return False
+    if re.match(r'^"[A-Za-z0-9:_+.\-]+":\s*', stripped):
         return False
     if stripped.startswith("> Task "):
         return True
@@ -444,12 +596,13 @@ def _quota_results() -> dict[str, Any]:
         return {}
 
 
-def _quota_remaining(provider: str, quota: dict[str, Any]) -> str:
+def _quota_remaining(provider: str, quota: dict[str, Any], *, width: int = 120) -> str:
     result = quota.get(provider)
     if not result:
         return "not exposed"
     if getattr(result, "status", "") in {"ok", "partial"}:
-        return compact(str(getattr(result, "summary", "") or "not exposed"), 30)
+        summary = str(getattr(result, "summary", "") or "not exposed")
+        return _fit(summary, max(48, width - 15))
     return "not exposed"
 
 
