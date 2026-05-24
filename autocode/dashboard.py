@@ -89,6 +89,7 @@ def run_dashboard(
         return
     if alt_screen:
         print("\033[?1049h\033[?25l", end="", flush=True)
+    previous_lines = 0
     try:
         while True:
             text = render_dashboard(store, limit=limit)
@@ -98,8 +99,10 @@ def run_dashboard(
             elif append_history:
                 print(text, end="\n", flush=True)
             else:
-                print("\033[H\033[2J", end="")
+                if previous_lines:
+                    print(f"\033[{previous_lines}F\033[J", end="")
                 print(text, end="", flush=True)
+                previous_lines = text.count("\n")
             time.sleep(max(0.5, interval))
     except KeyboardInterrupt:
         pass
