@@ -12,7 +12,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from ..config import HOME
+from ..config import DB, HOME
 from ..models import Chat, ContinuePlan
 from ..util import compact, iso_from_ts, json_loads, parse_ts, read_text, sha, slug
 from .base import Provider
@@ -77,6 +77,7 @@ class CursorProvider(Provider):
                     "history_quality": "full transcript jsonl",
                     "active": self._is_recent(self._mtime(path)),
                     "activity_status": self._activity_status(self._mtime(path)),
+                    "model": self.cursor_model(),
                 },
             ))
         return chats
@@ -117,6 +118,7 @@ class CursorProvider(Provider):
                     "history_quality": "full local Cursor Agent store.db transcript",
                     "active": self._is_recent(updated_ts),
                     "activity_status": self._activity_status(updated_ts),
+                    "model": self.cursor_model(),
                 },
             ))
         return chats
@@ -178,6 +180,7 @@ class CursorProvider(Provider):
                         "active": active,
                         "activity_status": self._activity_status(updated, active=active),
                         "cloud_agent_id": cloud_id,
+                        "model": item.get("model") or self.cursor_model(),
                     },
                 )
                 old = chats.get(chat.id)
@@ -232,6 +235,7 @@ class CursorProvider(Provider):
                     "history_quality": "Cursor Cloud API metadata",
                     "active": self._cloud_status_active(status),
                     "activity_status": self._cloud_activity_status(status, updated),
+                    "model": item.get("model") or self.cursor_model(),
                 },
             ))
         return chats
@@ -517,6 +521,26 @@ class CursorProvider(Provider):
         api_key = self._cursor_api_key()
         return {"CURSOR_API_KEY": api_key} if api_key else {}
 
+    def cursor_model(self) -> str:
+        env_model = os.environ.get("AUTOCODE_CURSOR_MODEL", "").strip()
+        if env_model:
+            return env_model
+        try:
+            con = sqlite3.connect(DB, timeout=1)
+            row = con.execute("select value from config where key='cursor_model'").fetchone()
+            con.close()
+            if row and str(row[0]).strip():
+                return str(row[0]).strip()
+        except Exception:
+            pass
+        return "auto"
+
+    def cursor_agent_cmd(self, base: list[str], model: str | None = None) -> list[str]:
+        selected = (model or self.cursor_model() or "auto").strip()
+        if selected:
+            return base + ["--model", selected]
+        return base
+
     def continue_plan(self, chat: Chat, prompt: str, job_dir: Path) -> ContinuePlan:
         cwd = chat.cwd if chat.cwd and Path(chat.cwd).exists() else str(HOME)
         if chat.source == "cursor.cli":
@@ -526,16 +550,18 @@ class CursorProvider(Provider):
                 "cursor",
                 cwd,
                 cmd=[
-                    "cursor-agent",
-                    "--resume",
-                    chat.provider_chat_id,
-                    "--print",
-                    "--output-format",
-                    "text",
-                    "--force",
-                    "--trust",
-                    "--workspace",
-                    cwd,
+                    *self.cursor_agent_cmd([
+                        "cursor-agent",
+                        "--resume",
+                        chat.provider_chat_id,
+                        "--print",
+                        "--output-format",
+                        "text",
+                        "--force",
+                        "--trust",
+                        "--workspace",
+                        cwd,
+                    ]),
                     same_chat_prompt,
                 ],
                 env=self.cursor_env(),
@@ -554,6 +580,7 @@ class CursorProvider(Provider):
                     "followup",
                     chat.provider_chat_id,
                     str(job_dir / "prompt.txt"),
+                    self.cursor_model(),
                 ],
                 env=self.cursor_env(),
                 prompt_file=True,
@@ -572,14 +599,16 @@ class CursorProvider(Provider):
             "cursor",
             cwd,
             cmd=[
-                "cursor-agent",
-                "--print",
-                "--output-format",
-                "text",
-                "--force",
-                "--trust",
-                "--workspace",
-                cwd,
+                *self.cursor_agent_cmd([
+                    "cursor-agent",
+                    "--print",
+                    "--output-format",
+                    "text",
+                    "--force",
+                    "--trust",
+                    "--workspace",
+                    cwd,
+                ]),
                 combined,
             ],
             env=self.cursor_env(),

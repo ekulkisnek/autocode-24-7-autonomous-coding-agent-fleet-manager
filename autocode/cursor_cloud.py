@@ -30,10 +30,13 @@ def request(method: str, path: str, body: dict | None = None, timeout: int = 30)
     return json.loads(raw.decode("utf-8", errors="replace") or "{}")
 
 
-def followup(agent_id: str, prompt_file: str) -> None:
+def followup(agent_id: str, prompt_file: str, model: str = "auto") -> None:
     prompt = Path(prompt_file).read_text(encoding="utf-8", errors="replace")
     aid = urllib.parse.quote(agent_id, safe="")
-    data = request("POST", f"/v1/agents/{aid}/runs", {"prompt": {"text": prompt}})
+    body: dict = {"prompt": {"text": prompt}}
+    if model and model != "auto":
+        body["model"] = {"id": model}
+    data = request("POST", f"/v1/agents/{aid}/runs", body)
     run = data.get("run") or data
     run_id = run.get("id") or run.get("runId") or "(unknown)"
     status = run.get("status") or "(unknown)"
@@ -41,15 +44,16 @@ def followup(agent_id: str, prompt_file: str) -> None:
     print(f"agent: {agent_id}")
     print(f"run: {run_id}")
     print(f"status: {status}")
+    print(f"model: {model or 'auto'}")
     print(f"url: https://cursor.com/agents?id={agent_id}")
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv or sys.argv[1:]
-    if len(argv) != 3 or argv[0] != "followup":
-        print("usage: python -m autocode.cursor_cloud followup <agent_id> <prompt_file>", file=sys.stderr)
+    if len(argv) not in {3, 4} or argv[0] != "followup":
+        print("usage: python -m autocode.cursor_cloud followup <agent_id> <prompt_file> [model]", file=sys.stderr)
         return 2
-    followup(argv[1], argv[2])
+    followup(argv[1], argv[2], argv[3] if len(argv) == 4 else "auto")
     return 0
 
 

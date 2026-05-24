@@ -34,11 +34,16 @@ autocode cursor status
 autocode cursor chats --source cursor.cli --limit 20
 autocode cursor chats --source cursor.cloud --limit 20
 autocode cursor history <query>
-autocode cursor new --workspace <path> --goal "<goal>"
-autocode drive <cursor-query-or-id> --goal "<goal>"
+autocode cursor models
+autocode cursor model                 # show default model
+autocode cursor model auto            # set default model
+autocode cursor model composer-2.5    # set default model
+autocode cursor new --workspace <path> --goal "<goal>" --model composer-2.5
+autocode drive <cursor-query-or-id> --goal "<goal>" --model composer-2.5
 ```
 
 Headless Cursor sends load `CURSOR_API_KEY` from the environment, `~/.hermes/.env`, or `~/grok-cursor-bridge/.env` without storing the key in AutoCode state.
+The default Cursor model is stored as AutoCode config key `cursor_model` and defaults to `auto`; per-send `--model` overrides do not change that default.
 
 ## State
 

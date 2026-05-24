@@ -567,7 +567,8 @@ def cmd_chats(args: argparse.Namespace) -> None:
 
 def cmd_cursor(args: argparse.Namespace) -> None:
     store = Store()
-    Scheduler(store).force_discover()
+    if args.cursor_cmd not in {"model", "models"}:
+        Scheduler(store).force_discover()
     if args.cursor_cmd == "status":
         rows = store.rows(
             """
@@ -592,6 +593,7 @@ def cmd_cursor(args: argparse.Namespace) -> None:
         line = mask_contacts(auth.stdout.strip() or auth.stderr.strip())
         print(f"- cursor-agent account: {line or 'unknown'}")
         print(f"- headless API key: {'configured' if cursor_provider.cursor_env().get('CURSOR_API_KEY') else 'missing'}")
+        print(f"- default model: {cursor_provider.cursor_model()}")
         print("- direct drive: cursor.cli resumes same chat with cursor-agent --resume")
         print("- cloud drive: cursor.cloud posts same-agent follow-ups through Cursor Cloud API when the agent id is bc-*")
         print("- IDE drive: readable now; continued through a new Cursor Agent worker unless Cursor exposes a stable same-chat IDE composer API")
@@ -619,7 +621,8 @@ def cmd_cursor(args: argparse.Namespace) -> None:
             direct = "same-chat" if meta.get("direct_continue") else "worker"
             active = meta.get("activity_status") or ("active" if meta.get("active") else "idle")
             provider_status = f", status={meta.get('status')}" if meta.get("status") else ""
-            print(f"- {rel_time(r['updated_at'])} {r['source']} {short(r['alias'])} [{active}, {direct}{provider_status}]")
+            model = f", model={meta.get('model')}" if meta.get("model") else ""
+            print(f"- {rel_time(r['updated_at'])} {r['source']} {short(r['alias'])} [{active}, {direct}{provider_status}{model}]")
             print(f"  {compact(r['title'] or r['latest_text'], 180)}")
         return
     if args.cursor_cmd == "history":
@@ -630,8 +633,28 @@ def cmd_cursor(args: argparse.Namespace) -> None:
         print(f"{row['alias']} [{row['source']}]")
         print(f"updated: {rel_time(row['updated_at'])} | state: {row['state']} | continue: {row['continuation']}")
         print(f"activity: {meta.get('activity_status', 'unknown')} | history: {meta.get('history_quality', 'unknown')}")
+        print(f"model: {meta.get('model') or 'auto'}")
         print()
         print(compact(row["latest_text"] or row["title"], args.chars))
+        return
+    if args.cursor_cmd == "models":
+        from .providers.cursor import CursorProvider
+        cursor_env = os.environ.copy()
+        cursor_env.update(CursorProvider().cursor_env())
+        res = subprocess.run(["cursor-agent", "models"], text=True, capture_output=True, timeout=20, env=cursor_env)
+        print(res.stdout.strip() or res.stderr.strip())
+        return
+    if args.cursor_cmd == "model":
+        from .providers.cursor import CursorProvider
+        current = CursorProvider().cursor_model()
+        if not args.model:
+            print(f"cursor_model={current}")
+            return
+        available = cursor_models()
+        if available and args.model not in available:
+            raise SystemExit(f"Unknown Cursor model: {args.model}\nRun `autocode cursor models` to list valid ids.")
+        store.set_config("cursor_model", args.model)
+        print(f"cursor_model={args.model}")
         return
     if args.cursor_cmd == "new":
         from .models import ContinuePlan
@@ -639,19 +662,22 @@ def cmd_cursor(args: argparse.Namespace) -> None:
         workspace = Path(args.workspace).expanduser()
         cwd = str(workspace if workspace.exists() else Path.home())
         provider = CursorProvider()
+        model = args.model or provider.cursor_model()
         plan = ContinuePlan(
             True,
             "cursor",
             cwd,
             cmd=[
-                "cursor-agent",
-                "--print",
-                "--output-format",
-                "text",
-                "--force",
-                "--trust",
-                "--workspace",
-                cwd,
+                *provider.cursor_agent_cmd([
+                    "cursor-agent",
+                    "--print",
+                    "--output-format",
+                    "text",
+                    "--force",
+                    "--trust",
+                    "--workspace",
+                    cwd,
+                ], model),
                 args.goal,
             ],
             env=provider.cursor_env(),
@@ -661,7 +687,21 @@ def cmd_cursor(args: argparse.Namespace) -> None:
         job_id = Scheduler(store).runner.start_aux(f"cursor:new:{sha(cwd + args.goal)[:16]}", cwd, plan, args.goal)
         print(f"Started Cursor Agent chat job: {job_id}")
         print(f"workspace: {cwd}")
+        print(f"model: {model}")
         print(f"goal: {args.goal}")
+
+
+def cursor_models() -> set[str]:
+    from .providers.cursor import CursorProvider
+    cursor_env = os.environ.copy()
+    cursor_env.update(CursorProvider().cursor_env())
+    res = subprocess.run(["cursor-agent", "models"], text=True, capture_output=True, timeout=20, env=cursor_env)
+    text = res.stdout or res.stderr
+    models: set[str] = set()
+    for line in text.splitlines():
+        if " - " in line:
+            models.add(line.split(" - ", 1)[0].strip())
+    return models
 
 
 def cmd_drive(args: argparse.Namespace) -> None:
@@ -680,9 +720,18 @@ def cmd_drive(args: argparse.Namespace) -> None:
         return
     sched = Scheduler(store)
     if not sched.has_active_job(row["id"]) and not sched.has_active_lease(row):
-        job_id = sched.dispatch(row)
+        old_model = store.get_config("cursor_model", "auto")
+        if args.model and row["provider"] == "cursor":
+            store.set_config("cursor_model", args.model)
+        try:
+            job_id = sched.dispatch(row)
+        finally:
+            if args.model and row["provider"] == "cursor":
+                store.set_config("cursor_model", old_model)
     print(f"Driving {row['alias']}")
     print(f"goal: {args.goal}")
+    if args.model and row["provider"] == "cursor":
+        print(f"model: {args.model}")
     if args.priority:
         print(f"priority: p{args.rank}")
         if args.path:
@@ -801,8 +850,10 @@ def build_parser() -> argparse.ArgumentParser:
     cust = cusub.add_parser("status"); cust.set_defaults(func=cmd_cursor)
     cuch = cusub.add_parser("chats"); cuch.add_argument("--limit", type=int, default=30); cuch.add_argument("--source", choices=["cursor.cli", "cursor.transcript", "cursor.ide", "cursor.cloud"], default=""); cuch.set_defaults(func=cmd_cursor)
     cuhi = cusub.add_parser("history"); cuhi.add_argument("query"); cuhi.add_argument("--chars", type=int, default=3000); cuhi.set_defaults(func=cmd_cursor)
-    cune = cusub.add_parser("new"); cune.add_argument("--workspace", default=str(Path.home())); cune.add_argument("--goal", required=True); cune.set_defaults(func=cmd_cursor)
-    d = sub.add_parser("drive"); d.add_argument("query"); d.add_argument("--goal", required=True); d.add_argument("--no-start", action="store_true"); d.add_argument("--priority", action="store_true"); d.add_argument("--rank", type=int, default=100); d.add_argument("--path", default=""); d.add_argument("--exact", action="store_true"); d.add_argument("--lanes", type=int, default=1); d.set_defaults(func=cmd_drive)
+    cumo = cusub.add_parser("model"); cumo.add_argument("model", nargs="?"); cumo.set_defaults(func=cmd_cursor)
+    cumos = cusub.add_parser("models"); cumos.set_defaults(func=cmd_cursor)
+    cune = cusub.add_parser("new"); cune.add_argument("--workspace", default=str(Path.home())); cune.add_argument("--goal", required=True); cune.add_argument("--model", default=""); cune.set_defaults(func=cmd_cursor)
+    d = sub.add_parser("drive"); d.add_argument("query"); d.add_argument("--goal", required=True); d.add_argument("--no-start", action="store_true"); d.add_argument("--priority", action="store_true"); d.add_argument("--rank", type=int, default=100); d.add_argument("--path", default=""); d.add_argument("--exact", action="store_true"); d.add_argument("--lanes", type=int, default=1); d.add_argument("--model", default="", help="Cursor-only per-send model override, e.g. auto or composer-2.5"); d.set_defaults(func=cmd_drive)
     sq = sub.add_parser("squad")
     sqsub = sq.add_subparsers(dest="squad_cmd", required=True)
     sqp = sqsub.add_parser("plan"); sqp.add_argument("query"); sqp.set_defaults(func=cmd_squad)

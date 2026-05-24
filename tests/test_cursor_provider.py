@@ -121,6 +121,8 @@ def test_cursor_cli_continue_uses_cursor_agent_resume(tmp_path: Path):
     assert plan.same_chat is True
     assert plan.cmd[:2] == ["cursor-agent", "--resume"]
     assert "agent-123" in plan.cmd
+    assert "--model" in plan.cmd
+    assert "auto" in plan.cmd
     assert plan.env == {"CURSOR_API_KEY": "secret"}
 
 
@@ -141,4 +143,5 @@ def test_cursor_cloud_continue_uses_api_followup(tmp_path: Path):
     assert plan.same_chat is True
     assert plan.prompt_file is True
     assert plan.cmd[:4] == ["python3", "-m", "autocode.cursor_cloud", "followup"]
+    assert plan.cmd[-1] == "auto"
     assert plan.env == {"CURSOR_API_KEY": "secret"}
