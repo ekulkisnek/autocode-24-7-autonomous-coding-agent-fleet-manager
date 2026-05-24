@@ -123,6 +123,8 @@ def test_cursor_cli_continue_uses_cursor_agent_resume(tmp_path: Path):
     assert "agent-123" in plan.cmd
     assert "--model" in plan.cmd
     assert "auto" in plan.cmd
+    assert "Do not run commands that can wait" in plan.cmd[-1]
+    assert "finish with a concise status summary" in plan.cmd[-1]
     assert plan.env == {"CURSOR_API_KEY": "secret"}
 
 

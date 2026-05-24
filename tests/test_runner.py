@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from autocode.models import Chat
-from autocode.runner import JobRunner
+from autocode.runner import JobRunner, ProcessActivity
 from autocode.store import Store
 from autocode.util import now_iso, parse_ts
 
@@ -121,8 +121,8 @@ def test_runner_marks_quiet_cursor_job_with_child_processes_as_external_activity
     monkeypatch.setattr(runner, "_pid_running", lambda pid: True)
     monkeypatch.setattr(
         runner,
-        "_process_tree_activity",
-        lambda pid: "child_processes=2; busy_children=1; child_sample=12346:cursor-agent; 12347:codex exec",
+        "_process_tree_snapshot",
+        lambda pid: ProcessActivity(child_count=2, busy_children=1, child_sample="12346:cursor-agent; 12347:codex exec"),
     )
 
     runner.refresh()
@@ -139,11 +139,12 @@ def test_runner_marks_quiet_job_as_silent_without_killing_before_timeout(tmp_pat
         store,
         tmp_path,
         job_id="job-silent",
+        provider="codex",
         created_at="2026-05-24T00:00:00-05:00",
     )
     runner = JobRunner(store)
     monkeypatch.setattr(runner, "_pid_running", lambda pid: True)
-    monkeypatch.setattr(runner, "_process_tree_activity", lambda pid: "")
+    monkeypatch.setattr(runner, "_process_tree_snapshot", lambda pid: ProcessActivity())
     monkeypatch.setattr("autocode.runner.now_ts", lambda: parse_ts("2026-05-24T00:20:00-05:00"))
 
     runner.refresh()
@@ -152,3 +153,38 @@ def test_runner_marks_quiet_job_as_silent_without_killing_before_timeout(tmp_pat
     assert row["status"] == "running"
     assert row["evidence_status"] == "running_silent"
     assert "no output or child process activity" in row["evidence_reason"]
+
+
+def test_runner_fails_cursor_job_when_external_activity_is_idle_too_long(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    job_id = insert_running_job(
+        store,
+        tmp_path,
+        job_id="job-cursor-idle",
+        provider="cursor",
+        created_at="2026-05-24T00:00:00-05:00",
+    )
+    runner = JobRunner(store)
+    terminated: list[int] = []
+    monkeypatch.setattr(runner, "_pid_running", lambda pid: True)
+    monkeypatch.setattr(
+        runner,
+        "_process_tree_snapshot",
+        lambda pid: ProcessActivity(
+            child_count=2,
+            busy_children=0,
+            child_sample="12346:zsh claude doctor; 12347:zsh codex help",
+            newest_terminal_age=1200,
+            terminal_sample="318544.txt:claude doctor",
+        ),
+    )
+    monkeypatch.setattr(runner, "_terminate", lambda pid: terminated.append(pid))
+    monkeypatch.setattr("autocode.runner.now_ts", lambda: parse_ts("2026-05-24T00:20:00-05:00"))
+
+    runner.refresh()
+
+    row = store.row("select * from jobs where id=?", (job_id,))
+    assert row["status"] == "failed"
+    assert row["evidence_status"] == "cursor_idle_failed"
+    assert terminated == [12345]
+    assert "no recent child/terminal activity" in row["evidence_reason"]

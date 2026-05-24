@@ -70,7 +70,7 @@ def render_dashboard(store: Store | None = None, *, width: int | None = None, li
     lines.append("")
     lines.extend(_recent_section(store, width, min(limit, 8)))
     lines.append("")
-    lines.append("Quota note: exact remaining quota shows as 'not exposed' unless a provider exposes a reliable local endpoint.")
+    lines.append("Quota note: exact counters are shown only when a provider exposes a reliable read-only endpoint.")
     lines.append("Usage columns are observed AutoCode jobs, not provider billing totals.")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -192,6 +192,7 @@ def _session_summary(store: Store, width: int) -> list[str]:
 def _usage_section(store: Store, width: int) -> list[str]:
     now = time.time()
     jobs = store.rows("select provider,status,created_at,updated_at,evidence_status from jobs")
+    quota = _quota_results()
     lines = [_title("Provider Usage / Health", width)]
     lines.append("  provider     health        running  1h   24h  7d   fail24  default/model       quota remaining")
     for provider in PROVIDERS:
@@ -203,7 +204,7 @@ def _usage_section(store: Store, width: int) -> list[str]:
         fail24 = sum(1 for j in provider_jobs if j["status"] == "failed" and parse_ts(j["updated_at"]) >= now - 86400)
         health = _provider_health(provider)
         default = _provider_default(store, provider)
-        remaining = _quota_remaining(provider)
+        remaining = _quota_remaining(provider, quota)
         lines.append(
             f"  {provider:<12} {health:<13} {running:>7} {one_h:>4} {day:>5} {week:>4} "
             f"{fail24:>7}  {_fit(default, 18):<18} {remaining}"
@@ -328,9 +329,20 @@ def _provider_health(provider: str) -> str:
     return "cmd-ok" if _command_available(command) else "cmd-missing"
 
 
-def _quota_remaining(provider: str) -> str:
-    # None of these CLIs currently expose a reliable local "remaining usage" value.
-    # Keep this explicit so the dashboard does not invent subscription counters.
+def _quota_results() -> dict[str, Any]:
+    try:
+        from .quota_probes import probe_all
+        return probe_all(use_cache=True)
+    except Exception:
+        return {}
+
+
+def _quota_remaining(provider: str, quota: dict[str, Any]) -> str:
+    result = quota.get(provider)
+    if not result:
+        return "not exposed"
+    if getattr(result, "status", "") in {"ok", "partial"}:
+        return compact(str(getattr(result, "summary", "") or "not exposed"), 30)
     return "not exposed"
 
 

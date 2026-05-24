@@ -4,15 +4,46 @@ import os
 import signal
 import subprocess
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Row
 
-from .config import DEFAULT_JOB_TIMEOUT, DEFAULT_STALL_SECONDS, JOBS
+from .config import DEFAULT_CURSOR_IDLE_SECONDS, DEFAULT_JOB_TIMEOUT, DEFAULT_STALL_SECONDS, JOBS
 from .config import HOME
 from .models import Chat, ContinuePlan
 from .policy import assess_output_state
 from .store import Store
 from .util import json_dumps, now_iso, now_ts, read_text
+
+
+@dataclass(frozen=True)
+class ProcessActivity:
+    child_count: int = 0
+    busy_children: int = 0
+    child_sample: str = ""
+    newest_terminal_age: float | None = None
+    terminal_sample: str = ""
+
+    def summary(self) -> str:
+        parts = [
+            f"child_processes={self.child_count}",
+            f"busy_children={self.busy_children}",
+        ]
+        if self.child_sample:
+            parts.append(f"child_sample={self.child_sample}")
+        if self.newest_terminal_age is not None:
+            parts.append(f"terminal_idle={int(self.newest_terminal_age)}s")
+        if self.terminal_sample:
+            parts.append(f"terminal_sample={self.terminal_sample}")
+        return "; ".join(parts)
+
+    def has_activity(self) -> bool:
+        return self.child_count > 0 or self.newest_terminal_age is not None
+
+    def is_recent_or_busy(self, idle_seconds: int) -> bool:
+        if self.busy_children > 0:
+            return True
+        return self.newest_terminal_age is not None and self.newest_terminal_age <= idle_seconds
 
 
 class JobRunner:
@@ -150,13 +181,19 @@ class JobRunner:
         status = "running" if running else "completed"
         completed = ""
         if running and not (out_size or err_size):
-            child_activity = self._process_tree_activity(pid)
-            if child_activity:
-                evidence_status = "running_external_activity"
-                evidence_reason = f"{evidence_reason}; {child_activity}"
+            activity = self._process_tree_snapshot(pid)
+            if activity.has_activity():
+                evidence_status = "running_external_activity" if activity.is_recent_or_busy(DEFAULT_STALL_SECONDS) else "running_external_idle"
+                evidence_reason = f"{evidence_reason}; {activity.summary()}"
             elif age > DEFAULT_STALL_SECONDS:
                 evidence_status = "running_silent"
                 evidence_reason = f"{evidence_reason}; no output or child process activity for {int(age)}s"
+            if job["provider"] == "cursor" and age > DEFAULT_CURSOR_IDLE_SECONDS and evidence_status in {"running_silent", "running_external_idle"}:
+                self._terminate(pid)
+                status = "failed"
+                completed = now_iso()
+                evidence_status = "cursor_idle_failed"
+                evidence_reason = f"cursor job had no stdout/stderr and no recent child/terminal activity after {int(age)}s; {evidence_reason}"
         if age > DEFAULT_JOB_TIMEOUT and running:
             self._terminate(pid)
             status = "failed"
@@ -259,8 +296,11 @@ class JobRunner:
                 pass
 
     def _process_tree_activity(self, pid: int) -> str:
+        return self._process_tree_snapshot(pid).summary()
+
+    def _process_tree_snapshot(self, pid: int) -> ProcessActivity:
         if pid <= 0:
-            return ""
+            return ProcessActivity()
         try:
             proc = subprocess.run(
                 ["ps", "-axo", "pid=,ppid=,stat=,%cpu=,command="],
@@ -269,7 +309,7 @@ class JobRunner:
                 timeout=3,
             )
         except Exception:
-            return ""
+            return ProcessActivity()
         children: dict[int, list[tuple[int, str, float, str]]] = {}
         for line in proc.stdout.splitlines():
             parts = line.strip().split(None, 4)
@@ -293,11 +333,38 @@ class JobRunner:
             seen.add(child_pid)
             active.append(item)
             stack.extend(children.get(child_pid, []))
-        if not active:
-            return ""
         busy = sum(1 for _, _, cpu, _ in active if cpu >= 1.0)
         sample = "; ".join(f"{p}:{cmd[:70]}" for p, _, _, cmd in active[:3])
-        return f"child_processes={len(active)}; busy_children={busy}; child_sample={sample}"
+        newest_terminal_age, terminal_sample = self._cursor_terminal_activity(pid)
+        return ProcessActivity(
+            child_count=len(active),
+            busy_children=busy,
+            child_sample=sample,
+            newest_terminal_age=newest_terminal_age,
+            terminal_sample=terminal_sample,
+        )
+
+    def _cursor_terminal_activity(self, pid: int) -> tuple[float | None, str]:
+        projects = HOME / ".cursor" / "projects"
+        if not projects.exists():
+            return None, ""
+        newest_age: float | None = None
+        sample = ""
+        for path in projects.glob("**/terminals/*.txt"):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if f"pid: {pid}" not in text and f"ppid: {pid}" not in text:
+                continue
+            try:
+                age = max(0.0, now_ts() - path.stat().st_mtime)
+            except Exception:
+                continue
+            if newest_age is None or age < newest_age:
+                newest_age = age
+                sample = f"{path.name}:{read_text(path, limit=160).replace(chr(10), ' ')[:120]}"
+        return newest_age, sample
 
     def _meaningful_stderr(self, path: Path) -> bool:
         text = read_text(path, limit=4000).lower()

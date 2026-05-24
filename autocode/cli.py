@@ -664,6 +664,7 @@ def cmd_cursor(args: argparse.Namespace) -> None:
         cwd = str(workspace if workspace.exists() else Path.home())
         provider = CursorProvider()
         model = args.model or provider.cursor_model()
+        goal = provider._cursor_safe_prompt(args.goal)
         plan = ContinuePlan(
             True,
             "cursor",
@@ -679,13 +680,13 @@ def cmd_cursor(args: argparse.Namespace) -> None:
                     "--workspace",
                     cwd,
                 ], model),
-                args.goal,
+                goal,
             ],
             env=provider.cursor_env(),
             same_chat=False,
             reason="Start a new Cursor Agent chat.",
         )
-        job_id = Scheduler(store).runner.start_aux(f"cursor:new:{sha(cwd + args.goal)[:16]}", cwd, plan, args.goal)
+        job_id = Scheduler(store).runner.start_aux(f"cursor:new:{sha(cwd + args.goal)[:16]}", cwd, plan, goal)
         print(f"Started Cursor Agent chat job: {job_id}")
         print(f"workspace: {cwd}")
         print(f"model: {model}")

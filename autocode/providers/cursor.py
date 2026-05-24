@@ -544,7 +544,7 @@ class CursorProvider(Provider):
     def continue_plan(self, chat: Chat, prompt: str, job_dir: Path) -> ContinuePlan:
         cwd = chat.cwd if chat.cwd and Path(chat.cwd).exists() else str(HOME)
         if chat.source == "cursor.cli":
-            same_chat_prompt = self._same_chat_prompt(prompt)
+            same_chat_prompt = self._cursor_safe_prompt(self._same_chat_prompt(prompt))
             return ContinuePlan(
                 True,
                 "cursor",
@@ -594,6 +594,7 @@ class CursorProvider(Provider):
             "Preserve existing files and do not undo unrelated user changes.\n\n"
             f"Cursor context:\n{context[-12000:]}\n\nAutoCode instruction:\n{prompt}\n"
         )
+        combined = self._cursor_safe_prompt(combined)
         return ContinuePlan(
             True,
             "cursor",
@@ -625,3 +626,13 @@ class CursorProvider(Provider):
     def _same_chat_prompt(self, prompt: str) -> str:
         text = prompt.split("\n\nLatest known context:", 1)[0].strip()
         return text or prompt.strip()
+
+    def _cursor_safe_prompt(self, prompt: str) -> str:
+        return (
+            f"{prompt.strip()}\n\n"
+            "Cursor AutoCode execution rules:\n"
+            "- Do not run commands that can wait for a UI, daemon, server, login, REPL, watch mode, or human input unless wrapped in a short timeout.\n"
+            "- Use read-only inspection first; if a probe may hang, run `timeout 20s ...` or the macOS equivalent `perl -e 'alarm 20; exec @ARGV' ...`.\n"
+            "- If a command needs an interactive session or long-lived daemon, report the exact command and stop instead of waiting inside this turn.\n"
+            "- Always finish with a concise status summary so AutoCode receives stdout evidence.\n"
+        )
