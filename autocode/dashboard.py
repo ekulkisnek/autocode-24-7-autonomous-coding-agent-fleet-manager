@@ -5,6 +5,7 @@ import re
 import shutil
 import sys
 import time
+import curses
 from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Row
@@ -87,6 +88,9 @@ def run_dashboard(
     if once:
         print(render_dashboard(store, limit=limit), end="")
         return
+    if not alt_screen and not append_history:
+        _run_dashboard_curses(store, interval=interval, limit=limit)
+        return
     if alt_screen:
         print("\033[?1049h\033[?25l", end="", flush=True)
     previous_lines = 0
@@ -109,6 +113,64 @@ def run_dashboard(
     finally:
         if alt_screen:
             print("\033[?25h\033[?1049l", end="", flush=True)
+
+
+def _run_dashboard_curses(store: Store, *, interval: float, limit: int) -> None:
+    def draw(stdscr: Any) -> None:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+        top = 0
+        last_refresh = 0.0
+        lines: list[str] = []
+        while True:
+            now = time.monotonic()
+            height, width = stdscr.getmaxyx()
+            body_height = max(1, height - 1)
+            if now - last_refresh >= max(0.5, interval) or not lines:
+                text = render_dashboard(store, width=width, limit=limit)
+                lines = text.rstrip("\n").splitlines() or [""]
+                max_top = max(0, len(lines) - body_height)
+                top = min(top, max_top)
+                last_refresh = now
+
+            stdscr.erase()
+            visible = lines[top : top + body_height]
+            for idx, line in enumerate(visible):
+                stdscr.addnstr(idx, 0, line, max(0, width - 1))
+
+            max_top = max(0, len(lines) - body_height)
+            if max_top:
+                footer = f"scroll {top + 1}-{min(top + body_height, len(lines))}/{len(lines)}  q quit"
+            else:
+                footer = "q quit"
+            stdscr.addnstr(height - 1, 0, footer.ljust(max(0, width - 1)), max(0, width - 1), curses.A_REVERSE)
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                return
+            if key in (curses.KEY_UP, ord("k")):
+                top = max(0, top - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                top = min(max_top, top + 1)
+            elif key == curses.KEY_PPAGE:
+                top = max(0, top - body_height)
+            elif key == curses.KEY_NPAGE:
+                top = min(max_top, top + body_height)
+            elif key == curses.KEY_HOME:
+                top = 0
+            elif key == curses.KEY_END:
+                top = max_top
+            time.sleep(0.05)
+
+    try:
+        curses.wrapper(draw)
+    except KeyboardInterrupt:
+        pass
 
 
 def _running_section(store: Store, width: int, limit: int) -> list[str]:
