@@ -10,7 +10,7 @@ from pathlib import Path
 from sqlite3 import Row
 from typing import Any
 
-from .config import DB, HOME
+from .config import DB, HOME, LOG
 from .launchd import status as launchd_status
 from .scheduler import Scheduler
 from .store import Store
@@ -60,6 +60,7 @@ def render_dashboard(store: Store | None = None, *, width: int | None = None, li
         f"priority_only={priority_only} | jobs={active_jobs}/{cap} | load1={load1():.2f} | mem={mem_label} | disk={disk_label}"
     )
     lines.append(f"db={DB} | chats={total_chats} total, {active_chats} active/adopted")
+    lines.extend(_session_summary(store, width))
     lines.append("")
     lines.extend(_running_section(store, width, limit))
     lines.append("")
@@ -116,10 +117,12 @@ def _running_section(store: Store, width: int, limit: int) -> list[str]:
         label = row["alias"] or row["chat_id"]
         model = model_info(row).label()
         working = _job_working_text(row, 900)
+        counts = _chat_drive_counts(store, row["chat_id"])
         lines.append(
             f"  {rel_time(row['created_at']):>4}  {row['provider']:<11} {model:<24} "
             f"{row['evidence_status']:<16} {row['id']}  {_fit(label, 42)}"
         )
+        lines.append(f"        prompts: session={counts[0]} total={counts[1]}")
         if row["cwd"]:
             lines.append(f"        cwd: {_fit(row['cwd'], width - 13)}")
         lines.append(f"        doing: {_fit(working, width - 15)}")
@@ -160,12 +163,30 @@ def _queue_section(store: Store, width: int, limit: int) -> list[str]:
         state = row["state"]
         flag = "P" if _is_priority(store, row["id"]) else "-"
         objective = row["objective"] or row["title"] or row["latest_text"]
+        counts = _chat_drive_counts(store, row["id"])
         lines.append(
             f"    {flag} {rel_time(row['updated_at']):>4} {row['provider']:<11} {model:<22} "
-            f"{state:<11} {_fit(title, 44)}"
+            f"{state:<11} prompts={counts[0]}/{counts[1]} {_fit(title, 34)}"
         )
         lines.append(f"      next: {_fit(objective, width - 12)}")
     return lines
+
+
+def _session_summary(store: Store, width: int) -> list[str]:
+    start = _session_started_at()
+    rows = store.rows(
+        """
+        select provider,count(*) c
+        from jobs
+        where created_at>=?
+        group by provider
+        order by c desc, provider
+        """,
+        (start,),
+    )
+    total = sum(int(row["c"]) for row in rows)
+    split = ", ".join(f"{row['provider']}={row['c']}" for row in rows) or "none"
+    return [f"session prompts: {total} since {rel_time(start)} ({_fit(split, width - 38)})"]
 
 
 def _usage_section(store: Store, width: int) -> list[str]:
@@ -332,6 +353,25 @@ def _count(store: Store, sql: str) -> int:
 
 def _count_since(rows: list[Row], cutoff: float) -> int:
     return sum(1 for row in rows if parse_ts(row["created_at"]) >= cutoff)
+
+
+def _chat_drive_counts(store: Store, chat_id: str) -> tuple[int, int]:
+    start = _session_started_at()
+    session_row = store.row(
+        "select count(*) c from jobs where chat_id=? and created_at>=?",
+        (chat_id, start),
+    )
+    total_row = store.row("select count(*) c from jobs where chat_id=?", (chat_id,))
+    return int(session_row["c"] if session_row else 0), int(total_row["c"] if total_row else 0)
+
+
+def _session_started_at() -> str:
+    text = read_text(LOG, limit=300000)
+    for line in reversed(text.splitlines()):
+        if " daemon started" in line:
+            return line.split(" daemon started", 1)[0].strip()
+    row = Store().row("select min(created_at) c from jobs")
+    return str(row["c"] if row and row["c"] else "1970-01-01T00:00:00+00:00")
 
 
 def _is_priority(store: Store, chat_id: str) -> bool:
