@@ -73,7 +73,7 @@ def render_dashboard(store: Store | None = None, *, width: int | None = None, li
     return "\n".join(lines).rstrip() + "\n"
 
 
-def run_dashboard(interval: float = 2.0, limit: int = 12, once: bool = False, alt_screen: bool = True) -> None:
+def run_dashboard(interval: float = 2.0, limit: int = 12, once: bool = False, alt_screen: bool = False) -> None:
     store = Store()
     if not sys.stdout.isatty():
         print(render_dashboard(store, limit=limit), end="")
@@ -86,8 +86,11 @@ def run_dashboard(interval: float = 2.0, limit: int = 12, once: bool = False, al
     try:
         while True:
             text = render_dashboard(store, limit=limit)
-            print("\033[H\033[2J\033[3J", end="")
-            print(text, end="", flush=True)
+            if alt_screen:
+                print("\033[H\033[2J\033[3J", end="")
+                print(text, end="", flush=True)
+            else:
+                print(text, end="\n", flush=True)
             time.sleep(max(0.5, interval))
     except KeyboardInterrupt:
         pass

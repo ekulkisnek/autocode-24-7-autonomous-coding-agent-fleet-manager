@@ -21,16 +21,16 @@ autocode doctor
 autocode daemon start|stop|restart|install
 ```
 
-`autocode dashboard` is the live terminal view. It refreshes in-place and shows current driving jobs, watched priorities, next scheduler candidates, model/effort/speed where detectable, resource/capacity state, recent evidence, and observed provider usage windows.
+`autocode dashboard` is the live terminal view. It prints refresh frames into normal terminal scrollback and shows current driving jobs, watched priorities, next scheduler candidates, model/effort/speed where detectable, resource/capacity state, recent evidence, and observed provider usage windows.
 
 ```bash
-autocode dashboard                  # live ASCII dashboard
+autocode dashboard                  # live scrollable ASCII dashboard
 autocode dashboard --interval 1     # faster refresh
 autocode dashboard --once --limit 8 # one snapshot for logs/Hermes
-autocode dashboard --no-alt-screen  # keep output in normal scrollback
+autocode dashboard --alt-screen     # full-screen in-place dashboard
 ```
 
-Live mode uses the terminal alternate screen by default, so it updates in place instead of appending frames into scrollback. Exact provider quota remaining is only shown when a provider exposes a reliable local endpoint. Otherwise the dashboard reports `not exposed` and shows observed AutoCode usage counts for `1h`, `24h`, and `7d` instead of guessing.
+Live mode uses normal terminal scrollback by default so you can scroll up through previous frames. Use `--alt-screen` when you want a full-screen panel that updates in place. Exact provider quota remaining is only shown when a provider exposes a reliable local endpoint. Otherwise the dashboard reports `not exposed` and shows observed AutoCode usage counts for `1h`, `24h`, and `7d` instead of guessing.
 
 ## Cursor
 
