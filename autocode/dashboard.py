@@ -258,22 +258,127 @@ def chat_model_info(row: Row, meta: dict[str, Any]) -> ModelInfo:
 
 
 def _job_working_text(row: Row, limit: int) -> str:
-    prompt = compact(row["prompt"], limit)
     stdout = read_text(Path(row["stdout_path"]), limit=limit * 4).strip() if row["stdout_path"] else ""
     stderr = read_text(Path(row["stderr_path"]), limit=limit * 4).strip() if row["stderr_path"] else ""
     text = stdout or stderr
     if text:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
-        useful = [
-            line for line in lines
-            if not line.startswith(("diff --git", "index ", "@@ "))
-            and "WARN codex_core_skills::loader" not in line
-            and line not in {"codex", "exec"}
-            and not line.startswith(("- Edit files", "- Do not spend", "- When a background", "- If this is only", "- Output FLEET_DONE", "- If blocked"))
-        ]
+        useful = [line for line in lines if _useful_working_line(line)]
         if useful:
-            return compact(" ".join(useful[-8:]), limit)
-    return prompt
+            build = _build_progress_summary(useful)
+            if build:
+                return compact(build, limit)
+            status = _status_lines(useful)
+            if status:
+                return compact(" ".join(status[-3:]), limit)
+            return compact(" ".join(useful[-4:]), limit)
+    return _prompt_summary(row["prompt"], limit)
+
+
+def _prompt_summary(prompt: str, limit: int) -> str:
+    lines = [line.strip() for line in (prompt or "").splitlines() if line.strip()]
+    for line in lines:
+        if line.lower().startswith(("current known next step:", "autocode instruction:", "latest known context:")):
+            value = line.split(":", 1)[-1].strip()
+            if value:
+                return compact(f"Waiting for first agent output; assigned: {value}", limit)
+    for line in lines:
+        if _useful_prompt_line(line):
+            return compact(f"Waiting for first agent output; assigned: {line}", limit)
+    return "Waiting for first agent output"
+
+
+def _useful_prompt_line(line: str) -> bool:
+    lower = line.lower()
+    if lower.startswith(("operating rule:", "rules:", "hard completion definition:", "do not ", "use the fastest", "if ", "when ", "output ", "- ")):
+        return False
+    if "FLEET_DONE" in line or "FLEET_MILESTONE_COMPLETE" in line:
+        return False
+    return len(line) >= 20
+
+
+def _build_progress_summary(lines: list[str]) -> str:
+    gradle = [line for line in lines if line.startswith("> Task ")]
+    if gradle:
+        task = gradle[-1].replace("> Task ", "").strip()
+        return f"Android/Gradle build running: latest task {task}"
+    tests = [line for line in lines if re.search(r"\b(pass|passed|fail|failed|tests?)\b", line, re.IGNORECASE)]
+    if tests:
+        return tests[-1]
+    return ""
+
+
+def _status_lines(lines: list[str]) -> list[str]:
+    markers = (
+        "FLEET_MILESTONE_COMPLETE",
+        "FLEET_DONE",
+        "current ",
+        "progress",
+        "next action",
+        "next step",
+        "fixed ",
+        "verified",
+        "passed",
+        "failed",
+        "running",
+        "still running",
+        "blocked",
+        "latest evidence",
+        "result:",
+    )
+    return [line for line in lines if any(marker in line.lower() for marker in markers)]
+
+
+def _useful_working_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    noise_prefixes = (
+        "diff --git",
+        "index ",
+        "@@ ",
+        "+++ ",
+        "--- ",
+        "+",
+        "-",
+        "exec",
+        "codex",
+        "tokens used",
+        "set -",
+        "export ",
+        "if ",
+        "fi",
+        "done",
+        "do",
+        "then",
+        "else",
+        "for ",
+        "while ",
+        "elif ",
+        "case ",
+        "esac",
+        "chmod ",
+        "cat ",
+        "echo ",
+        "> Configure project",
+    )
+    if stripped in {"codex", "exec", "```", "```text", "```bash", "```sh"}:
+        return False
+    if stripped.startswith(noise_prefixes):
+        return False
+    if "WARN codex_core_skills::loader" in stripped:
+        return False
+    if stripped.startswith(("/bin/", "./", "docker compose ", "git diff ", "tail ", "TMUX_TMPDIR=")):
+        return False
+    if stripped.startswith("> Task "):
+        return True
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", stripped):
+        return False
+    if re.match(r"^[+\-]\s", stripped):
+        return False
+    if stripped.startswith(("- Edit files", "- Do not spend", "- When a background", "- If this is only", "- Output FLEET_DONE", "- If blocked")):
+        return False
+    return True
 
 
 def _stderr_model(row: Row) -> str:

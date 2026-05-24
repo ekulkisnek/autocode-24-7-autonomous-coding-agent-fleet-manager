@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from autocode.dashboard import model_info, render_dashboard
+from autocode.dashboard import _job_working_text, model_info, render_dashboard
 from autocode.models import Chat
 from autocode.store import Store
 from autocode.util import json_dumps, now_iso
@@ -92,3 +92,133 @@ def test_model_info_reads_effort_and_fast_model(tmp_path: Path):
     assert info.model == "grok-build-fast"
     assert info.effort == "high"
     assert info.speed == "fast"
+
+
+def test_job_working_text_prefers_status_over_shell_trace(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    stdout = tmp_path / "stdout.txt"
+    stderr = tmp_path / "stderr.txt"
+    stdout.write_text("", encoding="utf-8")
+    stderr.write_text(
+        """
++ export PATH="$JAVA_HOME/bin:$PATH"
++ exec "$@"
+diff --git a/package.json b/package.json
+index 31bce59ff..24eb049f1 100644
+--- a/package.json
++++ b/package.json
+JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
+ANDROID_HOME=/Volumes/T705/code/android-commandlinetools
+OpenJDK 64-Bit Server VM Homebrew
+FLEET_MILESTONE_COMPLETE
+Fixed Android build env wrapper and verified Java 17 plus Gradle can run.
+Next action: run the Android BitAssets Detox build using the wrapper.
+tokens used
+""",
+        encoding="utf-8",
+    )
+    with store.connect() as con:
+        con.execute(
+            """
+            insert into jobs(id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,created_at,updated_at)
+            values(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "job-readable",
+                "codex:codex.rollout:redwallet",
+                "codex",
+                "running",
+                0,
+                "/tmp",
+                "[]",
+                "Continue RedWallet.",
+                str(stdout),
+                str(stderr),
+                now_iso(),
+                now_iso(),
+            ),
+        )
+    row = store.row("select * from jobs where id='job-readable'")
+
+    text = _job_working_text(row, 500)
+
+    assert "Fixed Android build env wrapper" in text
+    assert "Next action" in text
+    assert "export PATH" not in text
+    assert "diff --git" not in text
+
+
+def test_job_working_text_summarizes_gradle_progress(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    stdout = tmp_path / "stdout.txt"
+    stderr = tmp_path / "stderr.txt"
+    stdout.write_text("", encoding="utf-8")
+    stderr.write_text(
+        """
+> Task :app:mergeDebugJavaResource UP-TO-DATE
+> Task :app:mergeProjectDexDebug
+> Task :react-native-worklets:configureCMakeDebug
+""",
+        encoding="utf-8",
+    )
+    with store.connect() as con:
+        con.execute(
+            """
+            insert into jobs(id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,created_at,updated_at)
+            values(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "job-gradle",
+                "codex:codex.rollout:redwallet",
+                "codex",
+                "running",
+                0,
+                "/tmp",
+                "[]",
+                "Continue RedWallet.",
+                str(stdout),
+                str(stderr),
+                now_iso(),
+                now_iso(),
+            ),
+        )
+    row = store.row("select * from jobs where id='job-gradle'")
+
+    text = _job_working_text(row, 500)
+
+    assert text == "Android/Gradle build running: latest task :react-native-worklets:configureCMakeDebug"
+
+
+def test_job_working_text_does_not_show_operating_rules_as_work(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    stdout = tmp_path / "stdout.txt"
+    stderr = tmp_path / "stderr.txt"
+    stdout.write_text("", encoding="utf-8")
+    stderr.write_text("", encoding="utf-8")
+    with store.connect() as con:
+        con.execute(
+            """
+            insert into jobs(id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,created_at,updated_at)
+            values(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "job-waiting",
+                "codex:codex.rollout:redwallet",
+                "codex",
+                "running",
+                0,
+                "/tmp",
+                "[]",
+                "Operating rule: work continuously and autonomously.\nCurrent known next step: run the Android build and inspect failures.",
+                str(stdout),
+                str(stderr),
+                now_iso(),
+                now_iso(),
+            ),
+        )
+    row = store.row("select * from jobs where id='job-waiting'")
+
+    text = _job_working_text(row, 500)
+
+    assert text == "Waiting for first agent output; assigned: run the Android build and inspect failures."
+    assert "Operating rule" not in text
