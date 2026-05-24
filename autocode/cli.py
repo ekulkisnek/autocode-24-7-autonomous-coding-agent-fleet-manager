@@ -20,7 +20,7 @@ from .providers import providers
 from .scheduler import Scheduler
 from .store import Store
 from .models import ContinuePlan
-from .util import command_exists, compact, json_loads, load1, memory_free_percent, read_text, rel_time
+from .util import command_exists, compact, json_loads, load1, memory_free_percent, read_text, rel_time, sha
 
 
 def print_status(store: Store, limit: int) -> None:
@@ -632,6 +632,36 @@ def cmd_cursor(args: argparse.Namespace) -> None:
         print(f"activity: {meta.get('activity_status', 'unknown')} | history: {meta.get('history_quality', 'unknown')}")
         print()
         print(compact(row["latest_text"] or row["title"], args.chars))
+        return
+    if args.cursor_cmd == "new":
+        from .models import ContinuePlan
+        from .providers.cursor import CursorProvider
+        workspace = Path(args.workspace).expanduser()
+        cwd = str(workspace if workspace.exists() else Path.home())
+        provider = CursorProvider()
+        plan = ContinuePlan(
+            True,
+            "cursor",
+            cwd,
+            cmd=[
+                "cursor-agent",
+                "--print",
+                "--output-format",
+                "text",
+                "--force",
+                "--trust",
+                "--workspace",
+                cwd,
+                args.goal,
+            ],
+            env=provider.cursor_env(),
+            same_chat=False,
+            reason="Start a new Cursor Agent chat.",
+        )
+        job_id = Scheduler(store).runner.start_aux(f"cursor:new:{sha(cwd + args.goal)[:16]}", cwd, plan, args.goal)
+        print(f"Started Cursor Agent chat job: {job_id}")
+        print(f"workspace: {cwd}")
+        print(f"goal: {args.goal}")
 
 
 def cmd_drive(args: argparse.Namespace) -> None:
@@ -771,6 +801,7 @@ def build_parser() -> argparse.ArgumentParser:
     cust = cusub.add_parser("status"); cust.set_defaults(func=cmd_cursor)
     cuch = cusub.add_parser("chats"); cuch.add_argument("--limit", type=int, default=30); cuch.add_argument("--source", choices=["cursor.cli", "cursor.transcript", "cursor.ide", "cursor.cloud"], default=""); cuch.set_defaults(func=cmd_cursor)
     cuhi = cusub.add_parser("history"); cuhi.add_argument("query"); cuhi.add_argument("--chars", type=int, default=3000); cuhi.set_defaults(func=cmd_cursor)
+    cune = cusub.add_parser("new"); cune.add_argument("--workspace", default=str(Path.home())); cune.add_argument("--goal", required=True); cune.set_defaults(func=cmd_cursor)
     d = sub.add_parser("drive"); d.add_argument("query"); d.add_argument("--goal", required=True); d.add_argument("--no-start", action="store_true"); d.add_argument("--priority", action="store_true"); d.add_argument("--rank", type=int, default=100); d.add_argument("--path", default=""); d.add_argument("--exact", action="store_true"); d.add_argument("--lanes", type=int, default=1); d.set_defaults(func=cmd_drive)
     sq = sub.add_parser("squad")
     sqsub = sq.add_subparsers(dest="squad_cmd", required=True)

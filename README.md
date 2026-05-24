@@ -34,6 +34,7 @@ autocode cursor status
 autocode cursor chats --source cursor.cli --limit 20
 autocode cursor chats --source cursor.cloud --limit 20
 autocode cursor history <query>
+autocode cursor new --workspace <path> --goal "<goal>"
 autocode drive <cursor-query-or-id> --goal "<goal>"
 ```
 
