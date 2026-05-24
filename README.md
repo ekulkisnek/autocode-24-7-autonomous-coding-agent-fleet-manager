@@ -9,6 +9,7 @@ Hermes is only a thin client. AutoCode owns state in SQLite, discovers provider 
 ```bash
 autocode status
 autocode now
+autocode dashboard
 autocode goals
 autocode chats --recent 24h
 autocode drive <query> --goal "<goal>"
@@ -19,6 +20,16 @@ autocode logs
 autocode doctor
 autocode daemon start|stop|restart|install
 ```
+
+`autocode dashboard` is the live terminal view. It refreshes in-place and shows current driving jobs, watched priorities, next scheduler candidates, model/effort/speed where detectable, resource/capacity state, recent evidence, and observed provider usage windows.
+
+```bash
+autocode dashboard                  # live ASCII dashboard
+autocode dashboard --interval 1     # faster refresh
+autocode dashboard --once --limit 8 # one snapshot for logs/Hermes
+```
+
+Exact provider quota remaining is only shown when a provider exposes a reliable local endpoint. Otherwise the dashboard reports `unknown` and shows observed AutoCode usage counts for `1h`, `24h`, and `7d` instead of guessing.
 
 ## Cursor
 

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .config import DB, LOG, PID_FILE, ROOT, ensure_dirs
 from .daemon import Daemon
+from .dashboard import run_dashboard
 from .discovery import discover
 from .launchd import install as launchd_install
 from .launchd import start as launchd_start
@@ -832,11 +833,20 @@ def cmd_daemon(args: argparse.Namespace) -> None:
             print(text[:4000])
 
 
+def cmd_dashboard(args: argparse.Namespace) -> None:
+    run_dashboard(interval=args.interval, limit=args.limit, once=args.once)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="autocode")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("status"); s.add_argument("--limit", type=int, default=10); s.set_defaults(func=cmd_status)
     n = sub.add_parser("now"); n.add_argument("--limit", type=int, default=10); n.set_defaults(func=cmd_now)
+    dash = sub.add_parser("dashboard")
+    dash.add_argument("--interval", type=float, default=2.0, help="refresh interval in seconds")
+    dash.add_argument("--limit", type=int, default=12, help="rows per dashboard section")
+    dash.add_argument("--once", action="store_true", help="render one snapshot and exit")
+    dash.set_defaults(func=cmd_dashboard)
     last = sub.add_parser("last"); last.add_argument("query"); last.set_defaults(func=cmd_last)
     g = sub.add_parser("goals"); g.add_argument("--limit", type=int, default=20); g.set_defaults(func=cmd_goals)
     pr = sub.add_parser("priority")
