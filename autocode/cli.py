@@ -693,6 +693,75 @@ def cmd_cursor(args: argparse.Namespace) -> None:
         print(f"goal: {args.goal}")
 
 
+def cmd_grok(args: argparse.Namespace) -> None:
+    store = Store()
+    if args.grok_cmd == "new":
+        from .models import ContinuePlan
+        workspace = Path(args.workspace).expanduser()
+        cwd = str(workspace if workspace.exists() else Path.home())
+        job_dir = Scheduler(store)._planned_job_dir()
+        plan = ContinuePlan(
+            True,
+            "grok",
+            cwd,
+            cmd=[
+                "grok",
+                "--cwd",
+                cwd,
+                "--prompt-file",
+                str(job_dir / "prompt.txt"),
+                "--no-alt-screen",
+                "--permission-mode",
+                "bypassPermissions",
+            ],
+            prompt_file=True,
+            same_chat=False,
+            reason="Start a new Grok conversation.",
+        )
+        chat_id = f"grok:new:{sha(cwd + args.goal)[:16]}"
+        job_id = Scheduler(store).runner.start_aux(chat_id, cwd, plan, args.goal, job_dir)
+        print(f"Started Grok job: {job_id}")
+        print(f"workspace: {cwd}")
+        print(f"goal: {args.goal}")
+    elif args.grok_cmd == "chats":
+        from .providers.grok import GrokProvider
+        chats = GrokProvider().discover()[: args.limit]
+        if not chats:
+            print("No Grok chats discovered.")
+            return
+        for chat in chats:
+            print(f"- {chat.updated_at} {chat.id} {chat.alias}")
+            print(f"  cwd: {chat.cwd or '(unknown)'}")
+            print(f"  title: {compact(chat.title or chat.latest_text, 180)}")
+
+
+def cmd_antigravity(args: argparse.Namespace) -> None:
+    from .providers.antigravity import AntigravityProvider
+    provider = AntigravityProvider()
+    if args.antigravity_cmd == "status":
+        print(f"agentapi: {'ready' if provider._agentapi_ready() else 'not ready'}")
+        print(f"agentapi path: {provider.agentapi}")
+        if not provider._agentapi_ready():
+            print("same-chat send requires Antigravity running with ANTIGRAVITY_LS_ADDRESS in this environment")
+        print(f"discovered chats: {len(provider.discover())}")
+    elif args.antigravity_cmd == "chats":
+        chats = provider.discover()[: args.limit]
+        if not chats:
+            print("No Antigravity chats discovered.")
+            return
+        for chat in chats:
+            mode = "same-chat" if chat.metadata.get("agentapi_ready") else "codex-takeover"
+            print(f"- {chat.updated_at} {chat.id} {chat.alias} [{mode}]")
+            print(f"  title: {compact(chat.title or chat.latest_text, 180)}")
+    elif args.antigravity_cmd == "new":
+        if not provider._agentapi_ready():
+            raise SystemExit(
+                "Antigravity agentapi is not reachable. Open Antigravity and run this from an environment "
+                "with ANTIGRAVITY_LS_ADDRESS, or drive an existing discovered Antigravity chat for Codex takeover."
+            )
+        raise SystemExit("Antigravity agentapi new-conversation command is not exposed; use an existing Antigravity chat id.")
+
+
 def cursor_models() -> set[str]:
     from .providers.cursor import CursorProvider
     cursor_env = os.environ.copy()
@@ -873,6 +942,15 @@ def build_parser() -> argparse.ArgumentParser:
     cumo = cusub.add_parser("model"); cumo.add_argument("model", nargs="?"); cumo.set_defaults(func=cmd_cursor)
     cumos = cusub.add_parser("models"); cumos.set_defaults(func=cmd_cursor)
     cune = cusub.add_parser("new"); cune.add_argument("--workspace", default=str(Path.home())); cune.add_argument("--goal", required=True); cune.add_argument("--model", default=""); cune.set_defaults(func=cmd_cursor)
+    gr = sub.add_parser("grok")
+    grsub = gr.add_subparsers(dest="grok_cmd", required=True)
+    grnew = grsub.add_parser("new"); grnew.add_argument("--workspace", default=str(Path.home())); grnew.add_argument("--goal", required=True); grnew.set_defaults(func=cmd_grok)
+    grch = grsub.add_parser("chats"); grch.add_argument("--limit", type=int, default=30); grch.set_defaults(func=cmd_grok)
+    ag = sub.add_parser("antigravity")
+    agsub = ag.add_subparsers(dest="antigravity_cmd", required=True)
+    agst = agsub.add_parser("status"); agst.set_defaults(func=cmd_antigravity)
+    agch = agsub.add_parser("chats"); agch.add_argument("--limit", type=int, default=30); agch.set_defaults(func=cmd_antigravity)
+    agnew = agsub.add_parser("new"); agnew.add_argument("--goal", required=True); agnew.set_defaults(func=cmd_antigravity)
     d = sub.add_parser("drive"); d.add_argument("query"); d.add_argument("--goal", required=True); d.add_argument("--no-start", action="store_true"); d.add_argument("--priority", action="store_true"); d.add_argument("--rank", type=int, default=100); d.add_argument("--path", default=""); d.add_argument("--exact", action="store_true"); d.add_argument("--lanes", type=int, default=1); d.add_argument("--model", default="", help="Cursor-only per-send model override, e.g. auto or composer-2.5"); d.set_defaults(func=cmd_drive)
     sq = sub.add_parser("squad")
     sqsub = sq.add_subparsers(dest="squad_cmd", required=True)

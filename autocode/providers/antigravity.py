@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 from ..config import HOME
 from ..models import Chat, ContinuePlan
-from ..util import read_text, sha, slug
+from ..util import iso_from_ts, read_text, sha, slug
 from .base import Provider
 
 
@@ -25,30 +26,56 @@ class AntigravityProvider(Provider):
                 continue
             text = read_text(transcript, limit=24000)
             sid = conv.name
+            title = self._metadata_title(conv) or self._title(text) or sid
             chats.append(Chat(
                 id=f"antigravity:antigravity.brain:{sid}",
                 provider=self.name,
                 source="antigravity.brain",
                 provider_chat_id=sid,
-                title=self._title(text) or sid,
+                title=title,
                 cwd=str(HOME),
-                updated_at=transcript.stat().st_mtime,
+                updated_at=iso_from_ts(transcript.stat().st_mtime),
                 latest_text=text[-6000:],
                 transcript_hash=sha(text),
-                alias=slug(f"antigravity {self._title(text) or sid}", sid),
-                continuation="antigravity agentapi" if self.agentapi.exists() else "fork-to-codex",
-                metadata={"transcript": str(transcript)},
+                alias=slug(f"antigravity {title}", sid),
+                continuation="antigravity agentapi" if self._agentapi_ready() else "fork-to-codex",
+                metadata={"transcript": str(transcript), "agentapi_ready": self._agentapi_ready()},
             ))
         return chats
 
     def _title(self, text: str) -> str:
         for line in text.splitlines()[:60]:
-            if len(line) > 50:
-                return line[:160]
+            content = self._json_content(line)
+            if "<USER_REQUEST>" in content:
+                content = content.split("<USER_REQUEST>", 1)[1].split("</USER_REQUEST>", 1)[0]
+            clean = " ".join(content.split())
+            if len(clean) > 20 and not clean.startswith("# Conversation History"):
+                return clean[:160]
         return ""
 
+    def _metadata_title(self, conv: Path) -> str:
+        for name in ("task.md.metadata.json", "implementation_plan.md.metadata.json", "walkthrough.md.metadata.json"):
+            path = conv / name
+            if not path.exists():
+                continue
+            try:
+                summary = json.loads(read_text(path, limit=4000)).get("summary") or ""
+            except Exception:
+                continue
+            clean = " ".join(str(summary).split())
+            if clean:
+                return clean[:160]
+        return ""
+
+    def _json_content(self, line: str) -> str:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return line
+        return str(obj.get("content") or "")
+
     def continue_plan(self, chat: Chat, prompt: str, job_dir: Path) -> ContinuePlan:
-        if self.agentapi.exists():
+        if self._agentapi_ready():
             return ContinuePlan(
                 True,
                 self.name,
@@ -68,3 +95,5 @@ class AntigravityProvider(Provider):
             same_chat=False,
         )
 
+    def _agentapi_ready(self) -> bool:
+        return self.agentapi.exists() and bool(os.environ.get("ANTIGRAVITY_LS_ADDRESS"))
