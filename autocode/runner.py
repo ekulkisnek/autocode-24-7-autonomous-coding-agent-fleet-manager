@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from sqlite3 import Row
 
-from .config import DEFAULT_JOB_TIMEOUT, JOBS
+from .config import DEFAULT_JOB_TIMEOUT, DEFAULT_STALL_SECONDS, JOBS
 from .config import HOME
 from .models import Chat, ContinuePlan
 from .policy import assess_output_state
@@ -149,6 +149,14 @@ class JobRunner:
         evidence_reason = f"stdout_bytes={out_size}; stderr_bytes={err_size}"
         status = "running" if running else "completed"
         completed = ""
+        if running and not (out_size or err_size):
+            child_activity = self._process_tree_activity(pid)
+            if child_activity:
+                evidence_status = "running_external_activity"
+                evidence_reason = f"{evidence_reason}; {child_activity}"
+            elif age > DEFAULT_STALL_SECONDS:
+                evidence_status = "running_silent"
+                evidence_reason = f"{evidence_reason}; no output or child process activity for {int(age)}s"
         if age > DEFAULT_JOB_TIMEOUT and running:
             self._terminate(pid)
             status = "failed"
@@ -249,6 +257,47 @@ class JobRunner:
                 os.kill(pid, signal.SIGTERM)
             except Exception:
                 pass
+
+    def _process_tree_activity(self, pid: int) -> str:
+        if pid <= 0:
+            return ""
+        try:
+            proc = subprocess.run(
+                ["ps", "-axo", "pid=,ppid=,stat=,%cpu=,command="],
+                text=True,
+                capture_output=True,
+                timeout=3,
+            )
+        except Exception:
+            return ""
+        children: dict[int, list[tuple[int, str, float, str]]] = {}
+        for line in proc.stdout.splitlines():
+            parts = line.strip().split(None, 4)
+            if len(parts) < 5:
+                continue
+            try:
+                child_pid = int(parts[0])
+                parent_pid = int(parts[1])
+                cpu = float(parts[3])
+            except Exception:
+                continue
+            children.setdefault(parent_pid, []).append((child_pid, parts[2], cpu, parts[4]))
+        stack = list(children.get(pid, []))
+        seen: set[int] = set()
+        active: list[tuple[int, str, float, str]] = []
+        while stack:
+            item = stack.pop()
+            child_pid, stat, cpu, command = item
+            if child_pid in seen:
+                continue
+            seen.add(child_pid)
+            active.append(item)
+            stack.extend(children.get(child_pid, []))
+        if not active:
+            return ""
+        busy = sum(1 for _, _, cpu, _ in active if cpu >= 1.0)
+        sample = "; ".join(f"{p}:{cmd[:70]}" for p, _, _, cmd in active[:3])
+        return f"child_processes={len(active)}; busy_children={busy}; child_sample={sample}"
 
     def _meaningful_stderr(self, path: Path) -> bool:
         text = read_text(path, limit=4000).lower()

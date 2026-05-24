@@ -3,7 +3,47 @@ from pathlib import Path
 from autocode.models import Chat
 from autocode.runner import JobRunner
 from autocode.store import Store
-from autocode.util import now_iso
+from autocode.util import now_iso, parse_ts
+
+
+def insert_running_job(
+    store: Store,
+    tmp_path: Path,
+    chat_id: str = "cursor:cursor.cli:quota",
+    job_id: str = "job-running",
+    provider: str = "cursor",
+    pid: int = 12345,
+    created_at: str | None = None,
+):
+    job_dir = tmp_path / job_id
+    job_dir.mkdir()
+    stdout = job_dir / "stdout.txt"
+    stderr = job_dir / "stderr.txt"
+    stdout.write_text("", encoding="utf-8")
+    stderr.write_text("", encoding="utf-8")
+    created = created_at or now_iso()
+    with store.connect() as con:
+        con.execute(
+            """
+            insert into jobs(id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,created_at,updated_at)
+            values(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                job_id,
+                chat_id,
+                provider,
+                "running",
+                pid,
+                str(tmp_path),
+                "[]",
+                "prompt",
+                str(stdout),
+                str(stderr),
+                created,
+                created,
+            ),
+        )
+    return job_id
 
 
 def test_runner_assesses_stdout_completion_without_prompt_stderr_noise(tmp_path: Path):
@@ -72,3 +112,43 @@ def test_runner_assesses_stdout_completion_without_prompt_stderr_noise(tmp_path:
     assert row["done"] == 1
     assert row["state"] == "done"
     assert priority["status"] == "complete"
+
+
+def test_runner_marks_quiet_cursor_job_with_child_processes_as_external_activity(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    job_id = insert_running_job(store, tmp_path)
+    runner = JobRunner(store)
+    monkeypatch.setattr(runner, "_pid_running", lambda pid: True)
+    monkeypatch.setattr(
+        runner,
+        "_process_tree_activity",
+        lambda pid: "child_processes=2; busy_children=1; child_sample=12346:cursor-agent; 12347:codex exec",
+    )
+
+    runner.refresh()
+
+    row = store.row("select * from jobs where id=?", (job_id,))
+    assert row["status"] == "running"
+    assert row["evidence_status"] == "running_external_activity"
+    assert "child_processes=2" in row["evidence_reason"]
+
+
+def test_runner_marks_quiet_job_as_silent_without_killing_before_timeout(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    job_id = insert_running_job(
+        store,
+        tmp_path,
+        job_id="job-silent",
+        created_at="2026-05-24T00:00:00-05:00",
+    )
+    runner = JobRunner(store)
+    monkeypatch.setattr(runner, "_pid_running", lambda pid: True)
+    monkeypatch.setattr(runner, "_process_tree_activity", lambda pid: "")
+    monkeypatch.setattr("autocode.runner.now_ts", lambda: parse_ts("2026-05-24T00:20:00-05:00"))
+
+    runner.refresh()
+
+    row = store.row("select * from jobs where id=?", (job_id,))
+    assert row["status"] == "running"
+    assert row["evidence_status"] == "running_silent"
+    assert "no output or child process activity" in row["evidence_reason"]
