@@ -76,6 +76,7 @@ class JobRunner:
             stdout=out_f,
             stderr=err_f,
             env=env,
+            start_new_session=True,
         )
         if stdin_data is not None and proc.stdin:
             proc.stdin.write(stdin_data.encode("utf-8", errors="replace"))
@@ -242,9 +243,12 @@ class JobRunner:
         if pid <= 0:
             return
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.killpg(pid, signal.SIGTERM)
         except Exception:
-            pass
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
 
     def _meaningful_stderr(self, path: Path) -> bool:
         text = read_text(path, limit=4000).lower()

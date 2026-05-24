@@ -20,6 +20,25 @@ autocode doctor
 autocode daemon start|stop|restart|install
 ```
 
+## Cursor
+
+AutoCode indexes Cursor from four sources:
+
+- `cursor.cli`: local Cursor Agent CLI chat stores in `~/.cursor/chats/**/store.db`; same-chat sends use `cursor-agent --resume`.
+- `cursor.cloud`: Cursor Cloud Agents from `api.cursor.com` plus local Cursor IDE cloud composer references; `bc-*` agents get same-agent follow-ups through the Cursor Cloud API.
+- `cursor.ide`: local Cursor IDE composer metadata from `~/Library/Application Support/Cursor/User/**/state.vscdb`; readable and searchable, with continuation through a new Cursor Agent worker unless Cursor exposes a stable same-chat IDE API.
+- `cursor.transcript`: Cursor project transcript JSONL files in `~/.cursor/projects/**/agent-transcripts`.
+
+```bash
+autocode cursor status
+autocode cursor chats --source cursor.cli --limit 20
+autocode cursor chats --source cursor.cloud --limit 20
+autocode cursor history <query>
+autocode drive <cursor-query-or-id> --goal "<goal>"
+```
+
+Headless Cursor sends load `CURSOR_API_KEY` from the environment, `~/.hermes/.env`, or `~/grok-cursor-bridge/.env` without storing the key in AutoCode state.
+
 ## State
 
 - Source: `$AUTOCODE_HOME` or `~/autocode`

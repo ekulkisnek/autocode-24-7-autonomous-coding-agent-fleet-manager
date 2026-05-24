@@ -145,3 +145,28 @@ def test_priority_only_mode_excludes_general_backlog(tmp_path: Path):
 
     candidates = Scheduler(store).candidates(10)
     assert [row["id"] for row in candidates] == [priority_chat.id]
+
+
+def test_repeated_cursor_cli_failures_stay_on_direct_cursor_lane(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    chat = Chat(
+        id="cursor:cursor.cli:abc",
+        provider="cursor",
+        source="cursor.cli",
+        provider_chat_id="abc",
+        title="Cursor CLI task",
+        cwd=str(tmp_path),
+        updated_at="2026-05-21T00:00:00-05:00",
+        latest_text="fix code",
+        transcript_hash="h",
+        alias="cursor-cli-task",
+        continuation="cursor-agent --resume",
+        metadata={"direct_continue": True},
+    )
+    store.upsert_chat(chat, 5, "active", "fix code")
+    with store.connect() as con:
+        con.execute("update chats set failure_count=2 where id=?", (chat.id,))
+
+    row = store.find_chat("cursor-cli-task")
+
+    assert Scheduler(store)._direct_cursor_lane(row) is True

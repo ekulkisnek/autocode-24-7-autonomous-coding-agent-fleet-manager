@@ -250,7 +250,7 @@ class Scheduler:
             continuation=row["continuation"],
         )
         job_dir = self._planned_job_dir()
-        if int(row["failure_count"] or 0) >= 2 and not self._pinned_priority(row):
+        if int(row["failure_count"] or 0) >= 2 and not self._pinned_priority(row) and not self._direct_cursor_lane(row):
             plan = self.fallback_plan(row, prompt, job_dir)
         else:
             providers = provider_map()
@@ -315,5 +315,11 @@ class Scheduler:
     def _pinned_priority(self, row: Row) -> bool:
         try:
             return bool(row["priority_id"] and row["priority_objective"])
+        except Exception:
+            return False
+
+    def _direct_cursor_lane(self, row: Row) -> bool:
+        try:
+            return row["provider"] == "cursor" and row["source"] in {"cursor.cli", "cursor.cloud"}
         except Exception:
             return False

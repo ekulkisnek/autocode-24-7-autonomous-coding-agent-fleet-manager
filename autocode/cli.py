@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -71,6 +72,10 @@ def print_now(store: Store, limit: int) -> None:
 
 def short(text: str, n: int = 58) -> str:
     return compact(text, n)
+
+
+def mask_contacts(text: str) -> str:
+    return re.sub(r"([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*(@[A-Za-z0-9.-]+)", r"\1***\2", text or "")
 
 
 def priority_label(store: Store, chat_id: str, fallback: str) -> str:
@@ -560,6 +565,75 @@ def cmd_chats(args: argparse.Namespace) -> None:
         print("No chats in that window.")
 
 
+def cmd_cursor(args: argparse.Namespace) -> None:
+    store = Store()
+    Scheduler(store).force_discover()
+    if args.cursor_cmd == "status":
+        rows = store.rows(
+            """
+            select source,count(*) c,
+              sum(case when json_extract(metadata_json,'$.active') then 1 else 0 end) active,
+              sum(case when json_extract(metadata_json,'$.direct_continue') then 1 else 0 end) direct
+            from chats
+            where provider='cursor'
+            group by source
+            order by source
+            """
+        )
+        total = sum(int(r["c"]) for r in rows)
+        print(f"Cursor in AutoCode: {total} chats")
+        for r in rows:
+            print(f"- {r['source']}: {r['c']} seen, {r['active'] or 0} active/recent, {r['direct'] or 0} direct same-chat sends")
+        from .providers.cursor import CursorProvider
+        cursor_provider = CursorProvider()
+        cursor_env = os.environ.copy()
+        cursor_env.update(cursor_provider.cursor_env())
+        auth = subprocess.run(["/usr/bin/env", "bash", "-lc", "cursor-agent status 2>/dev/null | head -n 1"], text=True, capture_output=True, timeout=8, env=cursor_env)
+        line = mask_contacts(auth.stdout.strip() or auth.stderr.strip())
+        print(f"- cursor-agent account: {line or 'unknown'}")
+        print(f"- headless API key: {'configured' if cursor_provider.cursor_env().get('CURSOR_API_KEY') else 'missing'}")
+        print("- direct drive: cursor.cli resumes same chat with cursor-agent --resume")
+        print("- cloud drive: cursor.cloud posts same-agent follow-ups through Cursor Cloud API when the agent id is bc-*")
+        print("- IDE drive: readable now; continued through a new Cursor Agent worker unless Cursor exposes a stable same-chat IDE composer API")
+        return
+    if args.cursor_cmd == "chats":
+        where = "provider='cursor'"
+        vals: list[object] = []
+        if args.source:
+            where += " and source=?"
+            vals.append(args.source)
+        rows = store.rows(
+            f"""
+            select * from chats
+            where {where}
+            order by updated_at desc
+            limit ?
+            """,
+            tuple(vals + [args.limit]),
+        )
+        if not rows:
+            print("No Cursor chats found.")
+            return
+        for r in rows:
+            meta = json_loads(r["metadata_json"], {})
+            direct = "same-chat" if meta.get("direct_continue") else "worker"
+            active = meta.get("activity_status") or ("active" if meta.get("active") else "idle")
+            provider_status = f", status={meta.get('status')}" if meta.get("status") else ""
+            print(f"- {rel_time(r['updated_at'])} {r['source']} {short(r['alias'])} [{active}, {direct}{provider_status}]")
+            print(f"  {compact(r['title'] or r['latest_text'], 180)}")
+        return
+    if args.cursor_cmd == "history":
+        row = store.find_chat(args.query)
+        if not row or row["provider"] != "cursor":
+            raise SystemExit(f"No Cursor chat matched: {args.query}")
+        meta = json_loads(row["metadata_json"], {})
+        print(f"{row['alias']} [{row['source']}]")
+        print(f"updated: {rel_time(row['updated_at'])} | state: {row['state']} | continue: {row['continuation']}")
+        print(f"activity: {meta.get('activity_status', 'unknown')} | history: {meta.get('history_quality', 'unknown')}")
+        print()
+        print(compact(row["latest_text"] or row["title"], args.chars))
+
+
 def cmd_drive(args: argparse.Namespace) -> None:
     store = Store()
     Scheduler(store).force_discover()
@@ -692,6 +766,11 @@ def build_parser() -> argparse.ArgumentParser:
     pra = prsub.add_parser("add"); pra.add_argument("query"); pra.add_argument("--goal", required=True); pra.add_argument("--rank", type=int, default=100); pra.add_argument("--path", default=""); pra.add_argument("--chat-id", default=""); pra.add_argument("--exact", action="store_true"); pra.add_argument("--lanes", type=int, default=1); pra.set_defaults(func=cmd_priority)
     prr = prsub.add_parser("remove"); prr.add_argument("query"); prr.set_defaults(func=cmd_priority)
     c = sub.add_parser("chats"); c.add_argument("--recent", default="24h"); c.add_argument("--limit", type=int, default=20); c.set_defaults(func=cmd_chats)
+    cu = sub.add_parser("cursor")
+    cusub = cu.add_subparsers(dest="cursor_cmd", required=True)
+    cust = cusub.add_parser("status"); cust.set_defaults(func=cmd_cursor)
+    cuch = cusub.add_parser("chats"); cuch.add_argument("--limit", type=int, default=30); cuch.add_argument("--source", choices=["cursor.cli", "cursor.transcript", "cursor.ide", "cursor.cloud"], default=""); cuch.set_defaults(func=cmd_cursor)
+    cuhi = cusub.add_parser("history"); cuhi.add_argument("query"); cuhi.add_argument("--chars", type=int, default=3000); cuhi.set_defaults(func=cmd_cursor)
     d = sub.add_parser("drive"); d.add_argument("query"); d.add_argument("--goal", required=True); d.add_argument("--no-start", action="store_true"); d.add_argument("--priority", action="store_true"); d.add_argument("--rank", type=int, default=100); d.add_argument("--path", default=""); d.add_argument("--exact", action="store_true"); d.add_argument("--lanes", type=int, default=1); d.set_defaults(func=cmd_drive)
     sq = sub.add_parser("squad")
     sqsub = sq.add_subparsers(dest="squad_cmd", required=True)
