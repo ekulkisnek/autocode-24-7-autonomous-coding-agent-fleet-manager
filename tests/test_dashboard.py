@@ -111,6 +111,7 @@ JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
 ANDROID_HOME=/Volumes/T705/code/android-commandlinetools
 OpenJDK 64-Bit Server VM Homebrew
 FLEET_MILESTONE_COMPLETE
+Operating rule: work continuously and autonomously in this exact Codex chat.
 Fixed Android build env wrapper and verified Java 17 plus Gradle can run.
 Next action: run the Android BitAssets Detox build using the wrapper.
 tokens used

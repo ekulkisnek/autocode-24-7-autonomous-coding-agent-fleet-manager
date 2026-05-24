@@ -364,6 +364,8 @@ def _useful_working_line(line: str) -> bool:
     )
     if stripped in {"codex", "exec", "```", "```text", "```bash", "```sh"}:
         return False
+    if stripped.lower().startswith(("operating rule:", "rules:", "hard completion definition:", "current status to assume:")):
+        return False
     if stripped.startswith(noise_prefixes):
         return False
     if "WARN codex_core_skills::loader" in stripped:
