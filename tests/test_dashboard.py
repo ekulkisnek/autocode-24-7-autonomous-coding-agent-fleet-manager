@@ -762,3 +762,78 @@ Next action: run the Android BitAssets Detox build using the wrapper.
     assert "done: Fixed Android build env wrapper" in text
     assert "stdout_bytes=" not in text
     assert "stderr 512B" in text
+
+
+def test_recent_section_skips_empty_current_evidence_headers(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    chat = Chat(
+        id="codex:codex.rollout:redwallet",
+        provider="codex",
+        source="codex.rollout",
+        provider_chat_id="redwallet",
+        alias="redwallet",
+        title="RedWallet",
+        cwd="/tmp/redwallet",
+        updated_at=now_iso(),
+        latest_text="work",
+        continuation="codex continue",
+        metadata={},
+    )
+    store.upsert_chat(chat, coding_score=2, state="active", objective="Drive RedWallet.")
+    stdout = tmp_path / "stdout.txt"
+    stderr = tmp_path / "stderr.txt"
+    stdout.write_text(
+        """
+FLEET_MILESTONE_COMPLETE
+
+Confirmed failure cause from the reset-cache run:
+```text
+BITASSETS_E2E controls were compiled out because Metro was started without BITASSETS_E2E=1.
+```
+
+I restarted the run with `BITASSETS_E2E=1` set for Metro itself:
+
+Current evidence:
+```text
+bitassets.spec.js assigned to iPhone 17 UDID 1040BAF7
+```
+
+Next concrete action: inspect this run.
+""",
+        encoding="utf-8",
+    )
+    stderr.write_text(stdout.read_text(encoding="utf-8"), encoding="utf-8")
+    finished_at = now_iso()
+    with store.connect() as con:
+        con.execute(
+            """
+            insert into jobs(
+                id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,
+                created_at,updated_at,completed_at,evidence_status,evidence_reason
+            )
+            values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "job-evidence",
+                chat.id,
+                "codex",
+                "completed",
+                0,
+                "/tmp/redwallet",
+                "[]",
+                "Continue RedWallet.",
+                str(stdout),
+                str(stderr),
+                finished_at,
+                finished_at,
+                finished_at,
+                "worked",
+                "process exited; stdout_bytes=1024; stderr_bytes=2048",
+            ),
+        )
+
+    text = render_dashboard(store, width=140, limit=5, refresh_jobs=False)
+
+    assert "Confirmed failure cause" in text
+    assert "BITASSETS_E2E=1" in text
+    assert "done: Current evidence: Current evidence" not in text

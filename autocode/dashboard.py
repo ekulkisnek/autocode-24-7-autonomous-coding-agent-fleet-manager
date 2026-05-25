@@ -415,12 +415,25 @@ def _useful_prompt_line(line: str) -> bool:
 
 
 def _job_done_summary(row: Row, limit: int) -> tuple[str, str]:
-    working = _job_working_text(row, limit)
+    working = _job_working_text(row, max(limit * 2, 500))
     if working and not working.startswith("Waiting for first agent output"):
-        summary = working
+        summary = compact(_dedupe_summary(working), limit)
     else:
         summary = _evidence_reason_summary(row["evidence_reason"] or "", limit)
     return summary, _evidence_byte_note(row["evidence_reason"] or "")
+
+
+def _dedupe_summary(text: str) -> str:
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        key = part.lower().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(part)
+    return " ".join(out) or text
 
 
 def _evidence_reason_summary(reason: str, limit: int) -> str:
@@ -472,6 +485,7 @@ def _clean_working_line(line: str) -> str:
     clean = line.strip()
     clean = re.sub(r"^(?:FLEET_MILESTONE_COMPLETE|FLEET_DONE)\b[:\s-]*", "", clean).strip()
     clean = re.split(r"\bCompleted evidence:\s*", clean, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    clean = re.sub(r"^(?:Current evidence|Latest evidence|Current run evidence|Current status|Status commands)\s*:\s*$", "", clean, flags=re.IGNORECASE).strip()
     clean = re.sub(r"^\s*[-*]\s+", "", clean).strip()
     return clean
 
@@ -484,6 +498,13 @@ def _status_lines(lines: list[str]) -> list[str]:
         "progress",
         "next action",
         "next step",
+        "changed ",
+        "patched",
+        "updated ",
+        "added ",
+        "restarted",
+        "confirmed",
+        "failure",
         "fixed ",
         "verified",
         "passed",
@@ -494,7 +515,17 @@ def _status_lines(lines: list[str]) -> list[str]:
         "latest evidence",
         "result:",
     )
-    return [line for line in lines if any(marker in line.lower() for marker in markers)]
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        lower = line.lower()
+        if not any(marker in lower for marker in markers):
+            continue
+        if lower in seen:
+            continue
+        seen.add(lower)
+        out.append(line)
+    return out
 
 
 def _useful_working_line(line: str) -> bool:
