@@ -37,6 +37,9 @@ class Daemon:
                 self.log(f"tick_error {exc!r}")
                 self.store.event("daemon_error", error=str(exc))
             time.sleep(self.interval)
+        killed = self.scheduler.runner.kill_all("daemon_shutdown")
+        if killed:
+            self.log(f"daemon killed_jobs={killed}")
         self.log("daemon stopped")
 
     def _signal(self, signum, frame) -> None:
@@ -46,4 +49,3 @@ class Daemon:
 def os_getpid() -> int:
     import os
     return os.getpid()
-

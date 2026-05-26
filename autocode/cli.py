@@ -290,8 +290,9 @@ def cmd_priority(args: argparse.Namespace) -> None:
             print(f"lanes: {args.lanes}")
         print(f"goal: {args.goal}")
     elif args.priority_cmd == "remove":
+        killed = Scheduler(store).runner.kill_priority_jobs(args.query, "priority_removed")
         count = store.remove_priority(args.query)
-        print(f"Paused {count} priority project(s).")
+        print(f"Paused {count} priority project(s); killed {killed} running job(s).")
 
 
 def squad_lanes(priority) -> list[dict[str, str]]:
@@ -826,8 +827,9 @@ def cmd_pause(args: argparse.Namespace) -> None:
     row = store.find_chat(args.query)
     if not row:
         raise SystemExit(f"No chat matched: {args.query}")
+    killed = Scheduler(store).runner.kill_chat_jobs(row["id"], "chat_paused")
     store.pause_chat(row["id"])
-    print(f"Paused {row['alias']}")
+    print(f"Paused {row['alias']}; killed {killed} running job(s)")
 
 
 def cmd_done(args: argparse.Namespace) -> None:
@@ -881,6 +883,69 @@ def cmd_tick(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def cmd_queue(args: argparse.Namespace) -> None:
+    store = Store()
+    snap = store.row("select * from queue_snapshots order by created_at desc limit 1")
+    if not snap:
+        print("No queue snapshots yet.")
+        return
+    print(f"queue {snap['id']} {snap['created_at']} reason={snap['reason']} capacity={snap['capacity']} active={snap['active_jobs']}")
+    rows = store.rows("select * from queue_items where snapshot_id=? order by position limit ?", (snap["id"], args.limit))
+    for row in rows:
+        flag = "P" if row["priority_id"] else "-"
+        print(f"{row['position']:>2} {flag} {row['provider']:<11} {short(row['chat_id'])} state={row['state']}")
+        print(f"   resource: {compact(row['resource'], 120)}")
+        print(f"   objective: {compact(row['objective'], 160)}")
+
+
+def cmd_audit(args: argparse.Namespace) -> None:
+    from .config import AUDIT_LOG
+    if not AUDIT_LOG.exists():
+        print("No audit log yet.")
+        return
+    lines = AUDIT_LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-args.limit:]
+    for line in lines:
+        if args.raw:
+            print(line)
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            print(line)
+            continue
+        print(f"{event.get('ts')} {event.get('kind')} chat={short(str(event.get('chat_id') or ''), 40)} job={event.get('job_id') or ''}")
+
+
+def cmd_plugins(args: argparse.Namespace) -> None:
+    from .plugins import list_plugins, scaffold_plugin
+    if args.plugins_cmd == "list":
+        plugins = list_plugins()
+        if not plugins:
+            print("No plugins installed.")
+            return
+        for plugin in plugins:
+            print(f"- {plugin.get('id')} {plugin.get('version','')} {plugin.get('path','')}")
+    elif args.plugins_cmd == "create":
+        path = scaffold_plugin(args.id)
+        print(f"created plugin scaffold: {path}")
+
+
+def cmd_reactions(args: argparse.Namespace) -> None:
+    from .reactions import evaluate_reactions
+    print(json.dumps(evaluate_reactions(Store()), indent=2, sort_keys=True))
+
+
+def cmd_workflow(args: argparse.Namespace) -> None:
+    from .workflows import load_workflow
+    workflow = load_workflow(args.path)
+    print(json.dumps(workflow, indent=2, sort_keys=True))
+
+
+def cmd_web(args: argparse.Namespace) -> None:
+    from .web import run_web
+    run_web(args.host, args.port)
+
+
 def cmd_daemon(args: argparse.Namespace) -> None:
     if args.daemon_cmd == "run":
         Daemon(args.interval).run()
@@ -891,9 +956,13 @@ def cmd_daemon(args: argparse.Namespace) -> None:
         code, out, err = launchd_start()
         print((out + err).strip() or f"started ({code})")
     elif args.daemon_cmd == "stop":
+        killed = Scheduler(Store()).runner.kill_all("daemon_stop")
         code, out, err = launchd_stop()
         print((out + err).strip() or f"stopped ({code})")
+        if killed:
+            print(f"killed {killed} running job(s)")
     elif args.daemon_cmd == "restart":
+        Scheduler(Store()).runner.kill_all("daemon_restart")
         launchd_stop()
         code, out, err = launchd_start()
         print((out + err).strip() or f"restarted ({code})")
@@ -992,6 +1061,15 @@ def build_parser() -> argparse.ArgumentParser:
     doc = sub.add_parser("doctor"); doc.set_defaults(func=cmd_doctor)
     disc = sub.add_parser("discover"); disc.set_defaults(func=cmd_discover)
     tick = sub.add_parser("tick"); tick.add_argument("--dry-run", action="store_true"); tick.add_argument("--max-projects", type=int, default=None); tick.set_defaults(func=cmd_tick)
+    q = sub.add_parser("queue"); q.add_argument("--limit", type=int, default=20); q.set_defaults(func=cmd_queue)
+    au = sub.add_parser("audit"); au.add_argument("--limit", type=int, default=40); au.add_argument("--raw", action="store_true"); au.set_defaults(func=cmd_audit)
+    plug = sub.add_parser("plugins")
+    plugsub = plug.add_subparsers(dest="plugins_cmd", required=True)
+    plugl = plugsub.add_parser("list"); plugl.set_defaults(func=cmd_plugins)
+    plugc = plugsub.add_parser("create"); plugc.add_argument("id"); plugc.set_defaults(func=cmd_plugins)
+    react = sub.add_parser("reactions"); react.set_defaults(func=cmd_reactions)
+    wf = sub.add_parser("workflow"); wf.add_argument("path"); wf.set_defaults(func=cmd_workflow)
+    web = sub.add_parser("web"); web.add_argument("--host", default="127.0.0.1"); web.add_argument("--port", type=int, default=8765); web.set_defaults(func=cmd_web)
     dm = sub.add_parser("daemon")
     dsub = dm.add_subparsers(dest="daemon_cmd", required=True)
     run = dsub.add_parser("run"); run.add_argument("--interval", type=int, default=20); run.set_defaults(func=cmd_daemon)

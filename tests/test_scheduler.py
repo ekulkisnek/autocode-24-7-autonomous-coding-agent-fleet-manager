@@ -228,3 +228,32 @@ def test_capacity_is_zero_when_state_disk_is_almost_full(tmp_path: Path, monkeyp
     monkeypatch.setattr("autocode.scheduler.disk_free_gb", lambda path: 0.2)
 
     assert Scheduler(store).capacity() == 0
+
+
+def test_tick_records_persistent_queue_snapshot(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    chat = Chat(
+        id="codex:codex.rollout:queue",
+        provider="codex",
+        source="codex.rollout",
+        provider_chat_id="queue",
+        title="Queue task",
+        cwd=str(tmp_path),
+        updated_at="2026-05-21T00:00:00-05:00",
+        latest_text="fix code",
+        transcript_hash="h",
+        alias="queue-task",
+        continuation="codex exec resume",
+    )
+    store.upsert_chat(chat, 5, "active", "fix code")
+    scheduler = Scheduler(store)
+    monkeypatch.setattr(scheduler.runner, "refresh", lambda: None)
+    monkeypatch.setattr(scheduler, "_maybe_discover", lambda: "test")
+    monkeypatch.setattr(scheduler, "capacity", lambda: 1)
+
+    result = scheduler.tick(dispatch=False)
+
+    assert result["queue_snapshot"].startswith("queue-")
+    items = store.rows("select * from queue_items where snapshot_id=?", (result["queue_snapshot"],))
+    assert len(items) == 1
+    assert items[0]["chat_id"] == chat.id

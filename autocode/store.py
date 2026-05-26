@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import DB, ensure_dirs
+from .audit import append_audit
 from .models import Chat
 from .util import iso_from_ts, json_dumps, json_loads, now_iso, now_ts, parse_ts, sha
 
@@ -108,7 +109,11 @@ class Store:
                   evidence_reason text not null default '',
                   stdout_size integer not null default 0,
                   stderr_size integer not null default 0,
-                  attempt integer not null default 1
+                  attempt integer not null default 1,
+                  marker_kind text not null default '',
+                  marker_json text not null default '',
+                  worktree_path text not null default '',
+                  queue_snapshot_id text not null default ''
                 );
                 create index if not exists idx_jobs_status on jobs(status, updated_at desc);
                 create index if not exists idx_jobs_chat on jobs(chat_id, created_at desc);
@@ -119,6 +124,41 @@ class Store:
                   job_id text not null,
                   expires_at text not null
                 );
+
+                create table if not exists queue_snapshots (
+                  id text primary key,
+                  created_at text not null,
+                  reason text not null,
+                  capacity integer not null default 0,
+                  active_jobs integer not null default 0,
+                  items_json text not null
+                );
+                create index if not exists idx_queue_snapshots_created on queue_snapshots(created_at desc);
+
+                create table if not exists queue_items (
+                  snapshot_id text not null,
+                  position integer not null,
+                  chat_id text not null,
+                  provider text not null,
+                  priority_id text not null default '',
+                  resource text not null default '',
+                  state text not null,
+                  objective text not null,
+                  created_at text not null,
+                  primary key(snapshot_id, position)
+                );
+                create index if not exists idx_queue_items_chat on queue_items(chat_id, created_at desc);
+
+                create table if not exists task_plans (
+                  id text primary key,
+                  chat_id text not null,
+                  goal text not null,
+                  subtasks_json text not null,
+                  status text not null default 'active',
+                  created_at text not null,
+                  updated_at text not null
+                );
+                create index if not exists idx_task_plans_chat on task_plans(chat_id, status, updated_at desc);
 
                 create table if not exists provider_health (
                   provider text primary key,
@@ -152,6 +192,16 @@ class Store:
                 con.execute("alter table project_priorities add column worker_lanes integer not null default 1")
             except sqlite3.OperationalError:
                 pass
+            for ddl in (
+                "alter table jobs add column marker_kind text not null default ''",
+                "alter table jobs add column marker_json text not null default ''",
+                "alter table jobs add column worktree_path text not null default ''",
+                "alter table jobs add column queue_snapshot_id text not null default ''",
+            ):
+                try:
+                    con.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
 
     def set_default(self, key: str, value: str) -> None:
         with self.connect() as con:
@@ -167,6 +217,7 @@ class Store:
             return str(row["value"]) if row else default
 
     def event(self, kind: str, chat_id: str | None = None, job_id: str | None = None, **details: Any) -> None:
+        append_audit(kind, chat_id=chat_id, job_id=job_id, **details)
         with self.connect() as con:
             con.execute(
                 "insert into events(ts,kind,chat_id,job_id,details_json) values(?,?,?,?,?)",
@@ -286,6 +337,7 @@ class Store:
                 """,
                 (gid, chat_id, objective, "active", source, now_iso(), now_iso()),
             )
+        self.ensure_task_plan(chat_id, objective)
 
     def active_priority_for_chat(self, chat_id: str) -> sqlite3.Row | None:
         return self.row(
@@ -366,6 +418,8 @@ class Store:
                 "worker_lanes": worker_lanes,
             },
         )
+        if clean_target:
+            self.ensure_task_plan(clean_target, objective.strip())
         return pid
 
     def remove_priority(self, query_or_id: str) -> int:
@@ -396,9 +450,92 @@ class Store:
         with self.connect() as con:
             con.execute("update chats set paused=1,state='paused' where id=?", (chat_id,))
             con.execute("update goals set status='paused',updated_at=? where chat_id=? and status='active'", (now_iso(), chat_id))
+            con.execute("update task_plans set status='paused',updated_at=? where chat_id=? and status='active'", (now_iso(), chat_id))
+        self.event("chat_paused", chat_id)
 
     def done_chat(self, chat_id: str) -> None:
         with self.connect() as con:
             con.execute("update chats set done=1,state='done' where id=?", (chat_id,))
             con.execute("update goals set status='complete',updated_at=? where chat_id=? and status!='complete'", (now_iso(), chat_id))
             con.execute("update project_priorities set status='complete',updated_at=? where target_chat_id=? and status='active'", (now_iso(), chat_id))
+            con.execute("update task_plans set status='complete',updated_at=? where chat_id=? and status='active'", (now_iso(), chat_id))
+        self.event("chat_done", chat_id)
+
+    def ensure_task_plan(self, chat_id: str, goal: str) -> str:
+        existing = self.row(
+            "select * from task_plans where chat_id=? and goal=? and status='active' order by updated_at desc limit 1",
+            (chat_id, goal),
+        )
+        if existing:
+            return str(existing["id"])
+        pid = "plan-" + sha(chat_id + "\n" + goal)[:16]
+        subtasks = [
+            {"id": "understand", "title": "Understand current state and constraints", "status": "pending"},
+            {"id": "implement", "title": "Implement the smallest production-grade changes", "status": "pending"},
+            {"id": "verify", "title": "Run focused verification and capture evidence", "status": "pending"},
+            {"id": "integrate", "title": "Commit/push or hand off exact blocker", "status": "pending"},
+        ]
+        with self.connect() as con:
+            con.execute(
+                """
+                insert into task_plans(id,chat_id,goal,subtasks_json,status,created_at,updated_at)
+                values(?,?,?,?,?,?,?)
+                on conflict(id) do update set goal=excluded.goal,status='active',updated_at=excluded.updated_at
+                """,
+                (pid, chat_id, goal, json_dumps(subtasks), "active", now_iso(), now_iso()),
+            )
+        self.event("task_plan_created", chat_id, plan_id=pid, subtask_count=len(subtasks))
+        return pid
+
+    def task_plan_summary(self, chat_id: str) -> str:
+        row = self.row(
+            "select * from task_plans where chat_id=? and status='active' order by updated_at desc limit 1",
+            (chat_id,),
+        )
+        if not row:
+            return ""
+        subtasks = json_loads(row["subtasks_json"], [])
+        if not isinstance(subtasks, list):
+            return ""
+        lines = []
+        for item in subtasks[:5]:
+            if isinstance(item, dict):
+                lines.append(f"- {item.get('id')}: {item.get('title')} [{item.get('status','pending')}]")
+        return "\n".join(lines)
+
+    def record_queue_snapshot(self, rows: list[sqlite3.Row], *, reason: str, capacity: int, active_jobs: int, resource_for) -> str:
+        sid = "queue-" + sha(now_iso() + "\n" + reason + "\n" + str(len(rows)))[:16]
+        items = []
+        with self.connect() as con:
+            con.execute(
+                "insert into queue_snapshots(id,created_at,reason,capacity,active_jobs,items_json) values(?,?,?,?,?,?)",
+                (sid, now_iso(), reason, int(capacity), int(active_jobs), json_dumps([])),
+            )
+            for idx, row in enumerate(rows):
+                priority_id = ""
+                try:
+                    if "priority_id" in row.keys():
+                        priority_id = str(row["priority_id"] or "")
+                except Exception:
+                    pass
+                resource = resource_for(row)
+                item = {
+                    "position": idx,
+                    "chat_id": row["id"],
+                    "provider": row["provider"],
+                    "priority_id": priority_id,
+                    "resource": resource,
+                    "state": row["state"],
+                    "objective": row["objective"] or row["title"] or "",
+                }
+                items.append(item)
+                con.execute(
+                    """
+                    insert into queue_items(snapshot_id,position,chat_id,provider,priority_id,resource,state,objective,created_at)
+                    values(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (sid, idx, item["chat_id"], item["provider"], item["priority_id"], resource, item["state"], item["objective"], now_iso()),
+                )
+            con.execute("update queue_snapshots set items_json=? where id=?", (json_dumps(items), sid))
+        self.event("queue_snapshot", snapshot_id=sid, reason=reason, items=len(items), capacity=capacity, active_jobs=active_jobs)
+        return sid

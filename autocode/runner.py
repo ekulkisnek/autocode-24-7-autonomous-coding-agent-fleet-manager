@@ -9,7 +9,8 @@ from pathlib import Path
 from sqlite3 import Row
 
 from .config import DEFAULT_CURSOR_JOB_TIMEOUT, DEFAULT_JOB_TIMEOUT, DEFAULT_STALL_SECONDS, JOBS
-from .config import HOME
+from .config import HOME, WORKTREES
+from .markers import parse_fleet_marker
 from .models import Chat, ContinuePlan
 from .policy import assess_output_state
 from .store import Store
@@ -50,7 +51,7 @@ class JobRunner:
     def __init__(self, store: Store):
         self.store = store
 
-    def start(self, row: Row, plan: ContinuePlan, prompt: str, job_dir: Path | None = None) -> str:
+    def start(self, row: Row, plan: ContinuePlan, prompt: str, job_dir: Path | None = None, queue_snapshot_id: str = "") -> str:
         return self._start(
             chat_id=row["id"],
             cwd=row["cwd"] or str(HOME),
@@ -58,6 +59,7 @@ class JobRunner:
             prompt=prompt,
             job_dir=job_dir,
             lease_resource=self.resource_for(row),
+            queue_snapshot_id=queue_snapshot_id,
         )
 
     def start_aux(
@@ -68,6 +70,7 @@ class JobRunner:
         prompt: str,
         job_dir: Path | None = None,
         lease_resource: str = "",
+        queue_snapshot_id: str = "",
     ) -> str:
         return self._start(
             chat_id=chat_id,
@@ -100,6 +103,12 @@ class JobRunner:
         env = os.environ.copy()
         env.update(plan.env or {})
         cwd = plan.cwd if plan.cwd and Path(plan.cwd).exists() else (cwd if cwd and Path(cwd).exists() else str(HOME))
+        worktree_path = ""
+        if self._use_worktree(lease_resource, cwd):
+            wt = self._prepare_worktree(cwd, job_id)
+            if wt:
+                cwd = str(wt)
+                worktree_path = str(wt)
         proc = subprocess.Popen(
             plan.cmd,
             cwd=cwd or None,
@@ -117,16 +126,56 @@ class JobRunner:
         with self.store.connect() as con:
             con.execute(
                 """
-                insert into jobs(id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,created_at,updated_at)
-                values(?,?,?,?,?,?,?,?,?,?,?,?)
+                insert into jobs(id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,created_at,updated_at,worktree_path,queue_snapshot_id)
+                values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
-                (job_id, chat_id, plan.provider, "running", proc.pid, cwd, json_dumps(plan.cmd), prompt, str(stdout), str(stderr), now_iso(), now_iso()),
+                (job_id, chat_id, plan.provider, "running", proc.pid, cwd, json_dumps(plan.cmd), prompt, str(stdout), str(stderr), now_iso(), now_iso(), worktree_path, queue_snapshot_id),
             )
             if lease_resource:
                 con.execute("insert or replace into leases(resource,chat_id,job_id,expires_at) values(?,?,?,?)", (lease_resource, chat_id, job_id, now_iso()))
             con.execute("update chats set state='running',last_drive_at=? where id=?", (now_iso(), chat_id))
         self.store.event("job_started", chat_id, job_id, provider=plan.provider, pid=proc.pid, same_chat=plan.same_chat)
         return job_id
+
+    def kill_chat_jobs(self, chat_id: str, reason: str = "stopped") -> int:
+        jobs = self.store.rows("select * from jobs where chat_id=? and status='running'", (chat_id,))
+        return self.kill_jobs(jobs, reason)
+
+    def kill_priority_jobs(self, priority_query_or_id: str, reason: str = "priority_paused") -> int:
+        q = f"%{priority_query_or_id.lower()}%"
+        jobs = self.store.rows(
+            """
+            select j.* from jobs j
+            left join project_priorities p on p.target_chat_id=j.chat_id
+            where j.status='running'
+              and (p.id=? or lower(p.query) like ? or lower(p.objective) like ?)
+            """,
+            (priority_query_or_id, q, q),
+        )
+        return self.kill_jobs(jobs, reason)
+
+    def kill_all(self, reason: str = "daemon_stop") -> int:
+        return self.kill_jobs(self.store.rows("select * from jobs where status='running'"), reason)
+
+    def kill_jobs(self, jobs: list[Row], reason: str) -> int:
+        killed = 0
+        with self.store.connect() as con:
+            for job in jobs:
+                pid = int(job["pid"] or 0)
+                self._terminate(pid)
+                con.execute(
+                    """
+                    update jobs set status='killed',updated_at=?,completed_at=?,
+                      evidence_status='killed',evidence_reason=? where id=?
+                    """,
+                    (now_iso(), now_iso(), reason, job["id"]),
+                )
+                con.execute("delete from leases where job_id=?", (job["id"],))
+                con.execute("update chats set state='paused' where id=? and state='running'", (job["chat_id"],))
+                killed += 1
+        for job in jobs:
+            self.store.event("job_killed", job["chat_id"], job["id"], reason=reason)
+        return killed
 
     def resource_for(self, row: Row) -> str:
         priority_resource = self._row_value(row, "priority_resource_path")
@@ -223,6 +272,12 @@ class JobRunner:
                 # judged from assistant output first, otherwise our own prompt text can
                 # keep a finished priority artificially active.
                 assessment_text = stdout_text if stdout_text.strip() else stderr_text
+                marker = parse_fleet_marker(assessment_text)
+                if marker:
+                    con.execute(
+                        "update jobs set marker_kind=?,marker_json=? where id=?",
+                        (marker.kind, json_dumps(marker.payload), job["id"]),
+                    )
                 if evidence_status == "worked":
                     priority = con.execute(
                         """
@@ -289,6 +344,37 @@ class JobRunner:
                 os.kill(pid, signal.SIGTERM)
             except Exception:
                 pass
+
+    def _use_worktree(self, lease_resource: str, cwd: str) -> bool:
+        value = self.store.get_config("use_worktrees", "off").lower()
+        return value in {"1", "true", "yes", "on"} and bool(lease_resource) and Path(cwd).exists()
+
+    def _prepare_worktree(self, cwd: str, job_id: str) -> Path | None:
+        try:
+            root = subprocess.run(
+                ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+            if root.returncode != 0 or not root.stdout.strip():
+                return None
+            repo = Path(root.stdout.strip()).resolve()
+            target = WORKTREES / job_id
+            if target.exists():
+                return target
+            subprocess.run(
+                ["git", "-C", str(repo), "worktree", "add", "--detach", str(target), "HEAD"],
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=True,
+            )
+            self.store.event("worktree_created", job_id=job_id, repo=str(repo), worktree=str(target))
+            return target
+        except Exception as exc:
+            self.store.event("worktree_create_failed", job_id=job_id, cwd=cwd, error=str(exc))
+            return None
 
     def _process_tree_activity(self, pid: int) -> str:
         return self._process_tree_snapshot(pid).summary()

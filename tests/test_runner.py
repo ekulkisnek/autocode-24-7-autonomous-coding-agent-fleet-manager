@@ -211,3 +211,24 @@ def test_runner_uses_longer_cursor_timeout(tmp_path: Path, monkeypatch):
     row = store.row("select * from jobs where id=?", (job_id,))
     assert row["status"] == "running"
     assert row["evidence_status"] == "running_silent"
+
+
+def test_runner_kill_chat_jobs_releases_lease(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    job_id = insert_running_job(store, tmp_path, chat_id="codex:codex.rollout:kill", pid=2222)
+    with store.connect() as con:
+        con.execute(
+            "insert into leases(resource,chat_id,job_id,expires_at) values(?,?,?,?)",
+            (str(tmp_path), "codex:codex.rollout:kill", job_id, now_iso()),
+        )
+    runner = JobRunner(store)
+    killed: list[int] = []
+    monkeypatch.setattr(runner, "_terminate", lambda pid: killed.append(pid))
+
+    count = runner.kill_chat_jobs("codex:codex.rollout:kill", "test")
+
+    row = store.row("select * from jobs where id=?", (job_id,))
+    assert count == 1
+    assert killed == [2222]
+    assert row["status"] == "killed"
+    assert store.rows("select * from leases") == []

@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 from sqlite3 import Row
 
-from .config import DEFAULT_DISCOVERY_INTERVAL, DEFAULT_MAX_ACTIVE, HOME
+from .config import DEFAULT_ACTIVE_DISCOVERY_INTERVAL, DEFAULT_IDLE_DISCOVERY_INTERVAL, DEFAULT_MAX_ACTIVE, HOME
 from .discovery import discover
 from .models import Chat
 from .models import ContinuePlan
@@ -13,6 +13,7 @@ from .providers import provider_map
 from .runner import JobRunner
 from .store import Store
 from .util import disk_free_gb, load1, memory_free_percent, now_iso, parse_ts
+from .watchers import watch_signature
 
 
 class Scheduler:
@@ -23,19 +24,27 @@ class Scheduler:
     def tick(self, dispatch: bool = True, max_projects: int | None = None) -> dict:
         self.runner.refresh()
         stale_leases = self.cleanup_stale_leases()
-        self._maybe_discover()
+        discovery_reason = self._maybe_discover()
         self.enforce_priority_invariants()
         active = self.active_job_count()
         cap = self.capacity()
         limit = max(0, min(max_projects or cap, cap) - active)
         sent: list[str] = []
+        queued = self.candidates(limit * 3 if limit else 50)
+        snapshot_id = self.store.record_queue_snapshot(
+            queued,
+            reason=discovery_reason or "tick",
+            capacity=cap,
+            active_jobs=active,
+            resource_for=self.runner.resource_for,
+        )
         if dispatch and limit > 0:
-            for row in self.candidates(limit * 3):
+            for row in queued:
                 if len(sent) >= limit:
                     break
                 if self.has_active_job(row["id"]) or self.has_active_lease(row):
                     continue
-                job_id = self.dispatch(row)
+                job_id = self.dispatch(row, queue_snapshot_id=snapshot_id)
                 if job_id:
                     sent.append(job_id)
         return {
@@ -43,16 +52,30 @@ class Scheduler:
             "jobs": sent,
             "active_jobs": self.active_job_count(),
             "capacity": cap,
-            "candidates": len(self.candidates(50)),
+            "candidates": len(queued),
+            "queue_snapshot": snapshot_id,
             "stale_leases": stale_leases,
         }
 
-    def _maybe_discover(self) -> None:
+    def _maybe_discover(self) -> str:
         last = self.store.get_config("last_discovery_ts", "0")
-        if time.time() - float(last or 0) > DEFAULT_DISCOVERY_INTERVAL:
+        sig = watch_signature()
+        old_sig = self.store.get_config("last_watch_signature", "")
+        active = self.active_job_count()
+        interval = DEFAULT_ACTIVE_DISCOVERY_INTERVAL if active else DEFAULT_IDLE_DISCOVERY_INTERVAL
+        if sig and sig != old_sig:
             stats = discover(self.store)
             self.store.set_config("last_discovery_ts", str(time.time()))
-            self.store.event("discovery_refresh", **stats)
+            self.store.set_config("last_watch_signature", sig)
+            self.store.event("discovery_refresh", reason="watch", **stats)
+            return "watch"
+        if time.time() - float(last or 0) > interval:
+            stats = discover(self.store)
+            self.store.set_config("last_discovery_ts", str(time.time()))
+            self.store.set_config("last_watch_signature", sig)
+            self.store.event("discovery_refresh", reason="poll", interval=interval, **stats)
+            return "poll"
+        return "none"
 
     def force_discover(self) -> dict[str, int]:
         stats = discover(self.store)
@@ -266,11 +289,11 @@ class Scheduler:
         self.store.event("stale_leases_removed", count=len(stale))
         return len(stale)
 
-    def dispatch(self, row: Row) -> str | None:
-        prompt = build_prompt(row, recovery=row["state"] == "stalled")
-        return self.dispatch_with_prompt(row, prompt)
+    def dispatch(self, row: Row, queue_snapshot_id: str = "") -> str | None:
+        prompt = build_prompt(self._row_with_plan(row), recovery=row["state"] == "stalled")
+        return self.dispatch_with_prompt(row, prompt, queue_snapshot_id=queue_snapshot_id)
 
-    def dispatch_with_prompt(self, row: Row, prompt: str) -> str | None:
+    def dispatch_with_prompt(self, row: Row, prompt: str, queue_snapshot_id: str = "") -> str | None:
         chat = Chat(
             id=row["id"],
             provider=row["provider"],
@@ -297,9 +320,22 @@ class Scheduler:
         if not plan.supported:
             self.store.event("dispatch_unsupported", row["id"], provider=row["provider"], reason=plan.reason)
             return None
-        job_id = self.runner.start(row, plan, prompt, job_dir)
+        job_id = self.runner.start(row, plan, prompt, job_dir, queue_snapshot_id=queue_snapshot_id)
         self.store.event("dispatch", row["id"], job_id, provider=plan.provider)
         return job_id
+
+    def _row_with_plan(self, row: Row):
+        plan = self.store.task_plan_summary(row["id"])
+        if not plan:
+            return row
+        data = {key: row[key] for key in row.keys()}
+        data["task_plan"] = plan
+
+        class PromptRow(dict):
+            def keys(self):
+                return super().keys()
+
+        return PromptRow(data)
 
     def fallback_plan(self, row: Row, prompt: str, job_dir) -> ContinuePlan:
         raw_cwd = row["cwd"] or str(HOME)
