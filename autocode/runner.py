@@ -274,10 +274,39 @@ class JobRunner:
                 assessment_text = stdout_text if stdout_text.strip() else stderr_text
                 marker = parse_fleet_marker(assessment_text)
                 if marker:
+                    usage = marker.payload.get("usage") if isinstance(marker.payload, dict) else {}
+                    if not isinstance(usage, dict):
+                        usage = {}
+                    token_input = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+                    token_output = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+                    cost_estimate = float(usage.get("cost_usd") or usage.get("cost") or 0)
                     con.execute(
-                        "update jobs set marker_kind=?,marker_json=? where id=?",
-                        (marker.kind, json_dumps(marker.payload), job["id"]),
+                        """
+                        update jobs set marker_kind=?,marker_json=?,
+                          token_input=?,token_output=?,cost_estimate=?
+                        where id=?
+                        """,
+                        (marker.kind, json_dumps(marker.payload), token_input, token_output, cost_estimate, job["id"]),
                     )
+                    if marker.kind == "FLEET_PLAN":
+                        subtasks = marker.payload.get("subtasks") or marker.payload.get("tasks") or []
+                        if isinstance(subtasks, list) and subtasks:
+                            con.execute(
+                                """
+                                insert into task_plans(id,chat_id,goal,subtasks_json,status,created_at,updated_at)
+                                values(?,?,?,?,?,?,?)
+                                on conflict(id) do update set subtasks_json=excluded.subtasks_json,status='active',updated_at=excluded.updated_at
+                                """,
+                                (
+                                    "plan-" + job["chat_id"].replace(":", "-")[:48],
+                                    job["chat_id"],
+                                    str(marker.payload.get("goal") or ""),
+                                    json_dumps(subtasks),
+                                    "active",
+                                    now_iso(),
+                                    now_iso(),
+                                ),
+                            )
                 if evidence_status == "worked":
                     priority = con.execute(
                         """

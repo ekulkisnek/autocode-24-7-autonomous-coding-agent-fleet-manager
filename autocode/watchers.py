@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import dataclass
 
 from .config import HOME
 
@@ -34,3 +35,14 @@ def latest_mtime(path: Path) -> float:
 
 def watch_signature() -> str:
     return "|".join(f"{path}:{latest_mtime(path):.6f}" for path in provider_watch_paths())
+
+
+@dataclass
+class WatchState:
+    signature: str = ""
+
+    def poll(self) -> tuple[bool, str]:
+        current = watch_signature()
+        changed = bool(current and current != self.signature)
+        self.signature = current
+        return changed, current

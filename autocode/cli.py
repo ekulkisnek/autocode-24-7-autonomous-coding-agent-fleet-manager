@@ -899,9 +899,13 @@ def cmd_queue(args: argparse.Namespace) -> None:
 
 
 def cmd_audit(args: argparse.Namespace) -> None:
+    from .audit import replay_summary
     from .config import AUDIT_LOG
     if not AUDIT_LOG.exists():
         print("No audit log yet.")
+        return
+    if args.replay:
+        print(json.dumps(replay_summary(AUDIT_LOG), indent=2, sort_keys=True))
         return
     lines = AUDIT_LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-args.limit:]
     for line in lines:
@@ -917,14 +921,16 @@ def cmd_audit(args: argparse.Namespace) -> None:
 
 
 def cmd_plugins(args: argparse.Namespace) -> None:
-    from .plugins import list_plugins, scaffold_plugin
+    from .plugins import list_plugins, scaffold_plugin, validate_plugin
     if args.plugins_cmd == "list":
         plugins = list_plugins()
         if not plugins:
             print("No plugins installed.")
             return
         for plugin in plugins:
-            print(f"- {plugin.get('id')} {plugin.get('version','')} {plugin.get('path','')}")
+            errors = validate_plugin(plugin)
+            suffix = f" errors={','.join(errors)}" if errors else ""
+            print(f"- {plugin.get('id')} {plugin.get('version','')} {plugin.get('path','')}{suffix}")
     elif args.plugins_cmd == "create":
         path = scaffold_plugin(args.id)
         print(f"created plugin scaffold: {path}")
@@ -935,10 +941,34 @@ def cmd_reactions(args: argparse.Namespace) -> None:
     print(json.dumps(evaluate_reactions(Store()), indent=2, sort_keys=True))
 
 
+def cmd_ledger(args: argparse.Namespace) -> None:
+    store = Store()
+    rows = store.rows(
+        """
+        select provider,count(*) jobs,sum(token_input) input_tokens,
+          sum(token_output) output_tokens,sum(cost_estimate) cost_usd
+        from jobs
+        group by provider
+        order by cost_usd desc, jobs desc, provider
+        """
+    )
+    total_cost = 0.0
+    print("provider     jobs  input_tokens  output_tokens  cost_usd")
+    for row in rows:
+        cost = float(row["cost_usd"] or 0)
+        total_cost += cost
+        print(f"{row['provider']:<12} {row['jobs']:>4} {int(row['input_tokens'] or 0):>13} {int(row['output_tokens'] or 0):>14} {cost:>8.4f}")
+    print(f"total_cost_usd={total_cost:.4f}")
+
+
 def cmd_workflow(args: argparse.Namespace) -> None:
-    from .workflows import load_workflow
+    from .workflows import apply_workflow, load_workflow
     workflow = load_workflow(args.path)
-    print(json.dumps(workflow, indent=2, sort_keys=True))
+    if args.apply:
+        created = apply_workflow(Store(), workflow)
+        print(json.dumps({"created_priorities": created}, indent=2, sort_keys=True))
+    else:
+        print(json.dumps(workflow, indent=2, sort_keys=True))
 
 
 def cmd_web(args: argparse.Namespace) -> None:
@@ -1062,17 +1092,18 @@ def build_parser() -> argparse.ArgumentParser:
     disc = sub.add_parser("discover"); disc.set_defaults(func=cmd_discover)
     tick = sub.add_parser("tick"); tick.add_argument("--dry-run", action="store_true"); tick.add_argument("--max-projects", type=int, default=None); tick.set_defaults(func=cmd_tick)
     q = sub.add_parser("queue"); q.add_argument("--limit", type=int, default=20); q.set_defaults(func=cmd_queue)
-    au = sub.add_parser("audit"); au.add_argument("--limit", type=int, default=40); au.add_argument("--raw", action="store_true"); au.set_defaults(func=cmd_audit)
+    au = sub.add_parser("audit"); au.add_argument("--limit", type=int, default=40); au.add_argument("--raw", action="store_true"); au.add_argument("--replay", action="store_true"); au.set_defaults(func=cmd_audit)
     plug = sub.add_parser("plugins")
     plugsub = plug.add_subparsers(dest="plugins_cmd", required=True)
     plugl = plugsub.add_parser("list"); plugl.set_defaults(func=cmd_plugins)
     plugc = plugsub.add_parser("create"); plugc.add_argument("id"); plugc.set_defaults(func=cmd_plugins)
     react = sub.add_parser("reactions"); react.set_defaults(func=cmd_reactions)
-    wf = sub.add_parser("workflow"); wf.add_argument("path"); wf.set_defaults(func=cmd_workflow)
+    ledger = sub.add_parser("ledger"); ledger.set_defaults(func=cmd_ledger)
+    wf = sub.add_parser("workflow"); wf.add_argument("path"); wf.add_argument("--apply", action="store_true"); wf.set_defaults(func=cmd_workflow)
     web = sub.add_parser("web"); web.add_argument("--host", default="127.0.0.1"); web.add_argument("--port", type=int, default=8765); web.set_defaults(func=cmd_web)
     dm = sub.add_parser("daemon")
     dsub = dm.add_subparsers(dest="daemon_cmd", required=True)
-    run = dsub.add_parser("run"); run.add_argument("--interval", type=int, default=20); run.set_defaults(func=cmd_daemon)
+    run = dsub.add_parser("run"); run.add_argument("--interval", type=int, default=2); run.set_defaults(func=cmd_daemon)
     for name in ("install", "start", "stop", "restart"):
         x = dsub.add_parser(name); x.set_defaults(func=cmd_daemon)
     st = dsub.add_parser("status"); st.add_argument("--verbose", action="store_true"); st.set_defaults(func=cmd_daemon)

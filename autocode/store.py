@@ -15,6 +15,7 @@ class Store:
     def __init__(self, path: Path = DB):
         ensure_dirs()
         self.path = path
+        self.audit_path = self.path.parent / "audit.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.init()
 
@@ -113,7 +114,10 @@ class Store:
                   marker_kind text not null default '',
                   marker_json text not null default '',
                   worktree_path text not null default '',
-                  queue_snapshot_id text not null default ''
+                  queue_snapshot_id text not null default '',
+                  token_input integer not null default 0,
+                  token_output integer not null default 0,
+                  cost_estimate real not null default 0
                 );
                 create index if not exists idx_jobs_status on jobs(status, updated_at desc);
                 create index if not exists idx_jobs_chat on jobs(chat_id, created_at desc);
@@ -197,6 +201,9 @@ class Store:
                 "alter table jobs add column marker_json text not null default ''",
                 "alter table jobs add column worktree_path text not null default ''",
                 "alter table jobs add column queue_snapshot_id text not null default ''",
+                "alter table jobs add column token_input integer not null default 0",
+                "alter table jobs add column token_output integer not null default 0",
+                "alter table jobs add column cost_estimate real not null default 0",
             ):
                 try:
                     con.execute(ddl)
@@ -217,7 +224,7 @@ class Store:
             return str(row["value"]) if row else default
 
     def event(self, kind: str, chat_id: str | None = None, job_id: str | None = None, **details: Any) -> None:
-        append_audit(kind, chat_id=chat_id, job_id=job_id, **details)
+        append_audit(kind, chat_id=chat_id, job_id=job_id, path=self.audit_path, **details)
         with self.connect() as con:
             con.execute(
                 "insert into events(ts,kind,chat_id,job_id,details_json) values(?,?,?,?,?)",
@@ -450,7 +457,7 @@ class Store:
         with self.connect() as con:
             con.execute("update chats set paused=1,state='paused' where id=?", (chat_id,))
             con.execute("update goals set status='paused',updated_at=? where chat_id=? and status='active'", (now_iso(), chat_id))
-            con.execute("update task_plans set status='paused',updated_at=? where chat_id=? and status='active'", (now_iso(), chat_id))
+            con.execute("update task_plans set status='paused',updated_at=? where chat_id=? and status in ('active','needs_decomposition')", (now_iso(), chat_id))
         self.event("chat_paused", chat_id)
 
     def done_chat(self, chat_id: str) -> None:
@@ -458,38 +465,33 @@ class Store:
             con.execute("update chats set done=1,state='done' where id=?", (chat_id,))
             con.execute("update goals set status='complete',updated_at=? where chat_id=? and status!='complete'", (now_iso(), chat_id))
             con.execute("update project_priorities set status='complete',updated_at=? where target_chat_id=? and status='active'", (now_iso(), chat_id))
-            con.execute("update task_plans set status='complete',updated_at=? where chat_id=? and status='active'", (now_iso(), chat_id))
+            con.execute("update task_plans set status='complete',updated_at=? where chat_id=? and status in ('active','needs_decomposition')", (now_iso(), chat_id))
         self.event("chat_done", chat_id)
 
     def ensure_task_plan(self, chat_id: str, goal: str) -> str:
         existing = self.row(
-            "select * from task_plans where chat_id=? and goal=? and status='active' order by updated_at desc limit 1",
+            "select * from task_plans where chat_id=? and goal=? and status in ('active','needs_decomposition') order by updated_at desc limit 1",
             (chat_id, goal),
         )
         if existing:
             return str(existing["id"])
         pid = "plan-" + sha(chat_id + "\n" + goal)[:16]
-        subtasks = [
-            {"id": "understand", "title": "Understand current state and constraints", "status": "pending"},
-            {"id": "implement", "title": "Implement the smallest production-grade changes", "status": "pending"},
-            {"id": "verify", "title": "Run focused verification and capture evidence", "status": "pending"},
-            {"id": "integrate", "title": "Commit/push or hand off exact blocker", "status": "pending"},
-        ]
+        subtasks: list[dict[str, str]] = []
         with self.connect() as con:
             con.execute(
                 """
                 insert into task_plans(id,chat_id,goal,subtasks_json,status,created_at,updated_at)
                 values(?,?,?,?,?,?,?)
-                on conflict(id) do update set goal=excluded.goal,status='active',updated_at=excluded.updated_at
+                on conflict(id) do update set goal=excluded.goal,status='needs_decomposition',updated_at=excluded.updated_at
                 """,
-                (pid, chat_id, goal, json_dumps(subtasks), "active", now_iso(), now_iso()),
+                (pid, chat_id, goal, json_dumps(subtasks), "needs_decomposition", now_iso(), now_iso()),
             )
         self.event("task_plan_created", chat_id, plan_id=pid, subtask_count=len(subtasks))
         return pid
 
     def task_plan_summary(self, chat_id: str) -> str:
         row = self.row(
-            "select * from task_plans where chat_id=? and status='active' order by updated_at desc limit 1",
+            "select * from task_plans where chat_id=? and status in ('active','needs_decomposition') order by updated_at desc limit 1",
             (chat_id,),
         )
         if not row:
@@ -497,6 +499,8 @@ class Store:
         subtasks = json_loads(row["subtasks_json"], [])
         if not isinstance(subtasks, list):
             return ""
+        if not subtasks:
+            return "No decomposition captured yet. First response should include FLEET_PLAN JSON with 3-5 subtasks, then proceed with the first useful action."
         lines = []
         for item in subtasks[:5]:
             if isinstance(item, dict):

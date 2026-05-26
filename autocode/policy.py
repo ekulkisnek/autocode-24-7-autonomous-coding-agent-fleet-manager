@@ -230,6 +230,7 @@ def build_prompt(row: Row, recovery: bool = False) -> str:
         "- When a background test/process is already running, inspect its current log/process state and either fix/continue from new evidence or report that it is still running; do not sleep longer than 30 seconds inside the agent turn.\n"
         "- If this is only a milestone, output FLEET_MILESTONE_COMPLETE and continueable next steps.\n"
         "- Always end your response with exactly one structured marker line.\n"
+        "- If no decomposition is captured yet, first include `FLEET_PLAN: {\"goal\":\"...\",\"subtasks\":[{\"id\":\"...\",\"title\":\"...\",\"status\":\"pending\"}]}` with 3-5 logical subtasks, then continue useful work in the same turn if possible.\n"
         "- Use `FLEET_MILESTONE: {\"status\":\"active|blocked|needs_input\",\"summary\":\"...\",\"evidence\":[\"...\"],\"blockers\":[\"...\"],\"next_action\":\"...\"}` for partial progress.\n"
         "- Use `FLEET_DONE: {\"status\":\"done\",\"summary\":\"...\",\"evidence\":[\"tests/logs/commits\"],\"next_action\":\"none\"}` only when the whole goal is complete and verified.\n"
         "- If blocked, state the exact blocker and the best automatic fallback.\n\n"

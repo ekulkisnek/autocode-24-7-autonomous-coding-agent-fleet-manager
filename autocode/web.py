@@ -45,6 +45,11 @@ def status_payload(store: Store) -> dict:
     }
 
 
+def sse_payload(store: Store) -> str:
+    payload = {"dashboard": render_dashboard(store, limit=12), "status": status_payload(store)}
+    return f"data: {json.dumps(payload, default=str)}\n\n"
+
+
 class Handler(BaseHTTPRequestHandler):
     store = Store()
 
@@ -101,8 +106,7 @@ es.onerror=()=>{out.textContent+='\\n[event stream disconnected]'};
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         for _ in range(3600):
-            payload = {"dashboard": render_dashboard(self.store, limit=12), "status": status_payload(self.store)}
-            self.wfile.write(f"data: {json.dumps(payload, default=str)}\n\n".encode("utf-8"))
+            self.wfile.write(sse_payload(self.store).encode("utf-8"))
             self.wfile.flush()
             time.sleep(1)
 

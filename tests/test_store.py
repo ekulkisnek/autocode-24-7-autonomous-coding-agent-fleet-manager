@@ -199,3 +199,13 @@ def test_only_one_active_goal_per_chat(tmp_path: Path):
     assert len(rows) == 1
     assert rows[0]["objective"] == "goal three"
     assert rows[0]["source"] == "priority"
+
+
+def test_task_plan_starts_as_decomposition_request_not_hardcoded_list(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    plan_id = store.ensure_task_plan("chat-1", "Build the thing")
+
+    row = store.row("select * from task_plans where id=?", (plan_id,))
+    assert row["status"] == "needs_decomposition"
+    assert row["subtasks_json"] == "[]"
+    assert "FLEET_PLAN" in store.task_plan_summary("chat-1")

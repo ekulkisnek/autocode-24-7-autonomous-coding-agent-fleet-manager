@@ -23,6 +23,16 @@ def list_plugins() -> list[dict]:
     return plugins
 
 
+def validate_plugin(manifest: dict) -> list[str]:
+    errors: list[str] = []
+    if not manifest.get("id"):
+        errors.append("missing id")
+    for key in ("providers", "reactions", "workflows"):
+        if key in manifest and not isinstance(manifest[key], list):
+            errors.append(f"{key} must be a list")
+    return errors
+
+
 def scaffold_plugin(plugin_id: str) -> Path:
     safe = "".join(ch for ch in plugin_id if ch.isalnum() or ch in {"-", "_"}).strip("-_")
     if not safe:

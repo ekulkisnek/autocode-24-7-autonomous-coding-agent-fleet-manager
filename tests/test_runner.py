@@ -232,3 +232,71 @@ def test_runner_kill_chat_jobs_releases_lease(tmp_path: Path, monkeypatch):
     assert killed == [2222]
     assert row["status"] == "killed"
     assert store.rows("select * from leases") == []
+
+
+def test_runner_records_marker_usage_and_plan(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    chat = Chat(
+        id="codex:codex.rollout:plan",
+        provider="codex",
+        source="codex.rollout",
+        provider_chat_id="plan",
+        title="Plan task",
+        cwd=str(tmp_path),
+        updated_at="2026-05-21T00:00:00-05:00",
+        latest_text="work",
+        transcript_hash="h1",
+        alias="plan",
+        continuation="codex exec resume",
+    )
+    store.upsert_chat(chat, 5, "active", "finish plan")
+    job_dir = tmp_path / "job-plan"
+    job_dir.mkdir()
+    stdout = job_dir / "stdout.txt"
+    stderr = job_dir / "stderr.txt"
+    stdout.write_text(
+        'FLEET_PLAN: {"goal":"finish plan","subtasks":[{"id":"a","title":"A","status":"pending"}],"usage":{"input_tokens":10,"output_tokens":5,"cost_usd":0.01}}\n',
+        encoding="utf-8",
+    )
+    stderr.write_text("", encoding="utf-8")
+    with store.connect() as con:
+        con.execute(
+            """
+            insert into jobs(id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,created_at,updated_at)
+            values(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            ("job-plan", chat.id, "codex", "running", 0, str(tmp_path), "[]", "prompt", str(stdout), str(stderr), now_iso(), now_iso()),
+        )
+
+    JobRunner(store).refresh()
+
+    job = store.row("select * from jobs where id='job-plan'")
+    assert job["marker_kind"] == "FLEET_PLAN"
+    assert job["token_input"] == 10
+    assert job["token_output"] == 5
+    assert job["cost_estimate"] == 0.01
+    assert "A" in store.task_plan_summary(chat.id)
+
+
+def test_runner_prepares_worktree_when_enabled(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    store.set_config("use_worktrees", "on")
+    runner = JobRunner(store)
+    calls: list[list[str]] = []
+
+    class Result:
+        returncode = 0
+        stdout = str(tmp_path) + "\n"
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return Result()
+
+    monkeypatch.setattr("autocode.runner.subprocess.run", fake_run)
+
+    wt = runner._prepare_worktree(str(tmp_path), "job-wt")
+
+    assert wt is not None
+    assert wt.name == "job-wt"
+    assert any(cmd[:4] == ["git", "-C", str(tmp_path), "worktree"] for cmd in calls)

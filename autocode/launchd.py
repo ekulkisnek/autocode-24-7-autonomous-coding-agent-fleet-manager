@@ -16,6 +16,8 @@ def plist() -> dict:
             "autocode.cli",
             "daemon",
             "run",
+            "--interval",
+            "2",
         ],
         "WorkingDirectory": str(ROOT),
         "EnvironmentVariables": {
@@ -59,4 +61,3 @@ def stop() -> tuple[int, str, str]:
 def status() -> tuple[bool, str]:
     p = subprocess.run(["launchctl", "print", _target()], capture_output=True, text=True)
     return p.returncode == 0, (p.stdout or p.stderr)
-
