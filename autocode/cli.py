@@ -18,6 +18,7 @@ from .launchd import start as launchd_start
 from .launchd import status as launchd_status
 from .launchd import stop as launchd_stop
 from .providers import providers
+from .preprint_release import write_kit
 from .scheduler import Scheduler
 from .store import Store
 from .models import ContinuePlan
@@ -913,6 +914,26 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_preprint_kit(args: argparse.Namespace) -> None:
+    paths = write_kit(
+        Path(args.output).expanduser(),
+        title=args.title,
+        pseudonym=args.pseudonym,
+        technique=args.technique,
+        pdf=Path(args.pdf).expanduser() if args.pdf else None,
+    )
+    print(f"preprint kit: {Path(args.output).expanduser()}")
+    for key, value in paths.items():
+        if key.endswith("_result"):
+            continue
+        print(f"{key}: {value}")
+    audit = paths.get("pdf_audit_result")
+    if audit:
+        print(f"pdf audit: {'review-ok' if audit.ok_to_review else 'needs-review'}")
+        for finding in audit.findings:
+            print(f"- {finding}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="autocode")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -926,6 +947,13 @@ def build_parser() -> argparse.ArgumentParser:
     dash.add_argument("--alt-screen", action="store_true", help="use the terminal alternate screen")
     dash.add_argument("--no-alt-screen", action="store_true", help=argparse.SUPPRESS)
     dash.set_defaults(func=cmd_dashboard)
+    pk = sub.add_parser("preprint-kit", help="create an anonymous preprint release checklist and metadata kit")
+    pk.add_argument("--output", default=str(ROOT / "state" / "preprint-anonymity-kit"))
+    pk.add_argument("--title", default="Untitled anonymized preprint")
+    pk.add_argument("--pseudonym", default="SN Org")
+    pk.add_argument("--technique", default="Trace elemental analysis")
+    pk.add_argument("--pdf", default="", help="optional PDF path to scan for common identity leaks")
+    pk.set_defaults(func=cmd_preprint_kit)
     last = sub.add_parser("last"); last.add_argument("query"); last.set_defaults(func=cmd_last)
     g = sub.add_parser("goals"); g.add_argument("--limit", type=int, default=20); g.set_defaults(func=cmd_goals)
     pr = sub.add_parser("priority")
