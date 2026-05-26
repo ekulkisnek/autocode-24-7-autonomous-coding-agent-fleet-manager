@@ -69,6 +69,31 @@ def test_antigravity_discovery_uses_iso_timestamp_and_fallback_when_agentapi_una
     assert "Continue this Antigravity conversation" in (plan.stdin or "")
 
 
+def test_antigravity_discovers_conversation_storage_without_brain_transcript(tmp_path: Path, monkeypatch):
+    root = tmp_path / ".gemini" / "antigravity"
+    conv = root / "conversations" / "conv-2.db-wal"
+    conv.parent.mkdir(parents=True)
+    conv.write_bytes(
+        b"\x00\x01"
+        b"1. find the redwallet project and improve the UI for the bitassets wallet send and receive actions\n"
+        b"2. make wallet creation distinct for BitAssets sidechain vs main chain\n"
+    )
+    monkeypatch.delenv("ANTIGRAVITY_LS_ADDRESS", raising=False)
+    provider = AntigravityProvider()
+    provider.root = root
+    provider.brain = root / "brain"
+    provider.conversations = root / "conversations"
+    provider.agentapi = root / "bin" / "agentapi"
+
+    chats = provider.discover()
+
+    assert len(chats) == 1
+    assert chats[0].id == "antigravity:antigravity.conversation:conv-2"
+    assert chats[0].source == "antigravity.conversation"
+    assert "bitassets" in chats[0].title.lower()
+    assert chats[0].metadata["conversation_storage"] is True
+
+
 def test_antigravity_continue_uses_agentapi_when_ready(tmp_path: Path, monkeypatch):
     agentapi = tmp_path / "agentapi"
     agentapi.write_text("#!/bin/sh\n", encoding="utf-8")

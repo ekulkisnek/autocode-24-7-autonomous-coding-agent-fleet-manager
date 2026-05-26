@@ -557,7 +557,7 @@ def cmd_chats(args: argparse.Namespace) -> None:
         shown += 1
         state = "running" if job else r["state"]
         label = priority_label(store, r["id"], r["alias"])
-        print(f"- {rel_time(display_at)} {r['provider']} {short(label)} state={state} score={r['coding_score']}")
+        print(f"- last_used={rel_time(display_at)} {r['provider']} {short(label)} state={state} score={r['coding_score']}")
         if job:
             print(f"  job {job['id']} {job['evidence_status']}: {job_tail(job, 220)}")
         else:
@@ -732,7 +732,7 @@ def cmd_grok(args: argparse.Namespace) -> None:
             print("No Grok chats discovered.")
             return
         for chat in chats:
-            print(f"- {chat.updated_at} {chat.id} {chat.alias}")
+            print(f"- last_used={rel_time(chat.updated_at)} updated_at={chat.updated_at} {chat.id} {chat.alias}")
             print(f"  cwd: {chat.cwd or '(unknown)'}")
             print(f"  title: {compact(chat.title or chat.latest_text, 180)}")
 
@@ -753,7 +753,7 @@ def cmd_antigravity(args: argparse.Namespace) -> None:
             return
         for chat in chats:
             mode = "same-chat" if chat.metadata.get("agentapi_ready") else "codex-takeover"
-            print(f"- {chat.updated_at} {chat.id} {chat.alias} [{mode}]")
+            print(f"- last_used={rel_time(chat.updated_at)} updated_at={chat.updated_at} {chat.id} {chat.alias} [{mode}]")
             print(f"  title: {compact(chat.title or chat.latest_text, 180)}")
     elif args.antigravity_cmd == "new":
         if not provider._agentapi_ready():
