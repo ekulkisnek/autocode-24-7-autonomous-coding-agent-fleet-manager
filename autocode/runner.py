@@ -89,6 +89,7 @@ class JobRunner:
         prompt: str,
         job_dir: Path | None = None,
         lease_resource: str = "",
+        queue_snapshot_id: str = "",
     ) -> str:
         job_id = job_dir.name if job_dir else "job-" + uuid.uuid4().hex[:12]
         job_dir = job_dir or JOBS / job_id

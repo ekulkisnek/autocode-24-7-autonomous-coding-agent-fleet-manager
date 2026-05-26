@@ -712,6 +712,8 @@ def cmd_grok(args: argparse.Namespace) -> None:
                 cwd,
                 "--prompt-file",
                 str(job_dir / "prompt.txt"),
+                "--max-turns",
+                str(args.grok_message_ceiling),
                 "--no-alt-screen",
                 "--permission-mode",
                 "bypassPermissions",
@@ -1071,7 +1073,7 @@ def build_parser() -> argparse.ArgumentParser:
     cune = cusub.add_parser("new"); cune.add_argument("--workspace", default=str(Path.home())); cune.add_argument("--goal", required=True); cune.add_argument("--model", default=""); cune.set_defaults(func=cmd_cursor)
     gr = sub.add_parser("grok")
     grsub = gr.add_subparsers(dest="grok_cmd", required=True)
-    grnew = grsub.add_parser("new"); grnew.add_argument("--workspace", default=str(Path.home())); grnew.add_argument("--goal", required=True); grnew.set_defaults(func=cmd_grok)
+    grnew = grsub.add_parser("new"); grnew.add_argument("--workspace", default=str(Path.home())); grnew.add_argument("--goal", required=True); grnew.add_argument("--grok-message-ceiling", type=int, default=60, help="Internal Grok CLI message ceiling; AutoCode turns are interventions, not provider messages."); grnew.set_defaults(func=cmd_grok)
     grch = grsub.add_parser("chats"); grch.add_argument("--limit", type=int, default=30); grch.set_defaults(func=cmd_grok)
     ag = sub.add_parser("antigravity")
     agsub = ag.add_subparsers(dest="antigravity_cmd", required=True)

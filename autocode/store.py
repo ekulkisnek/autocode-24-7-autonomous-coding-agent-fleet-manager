@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -508,7 +509,7 @@ class Store:
         return "\n".join(lines)
 
     def record_queue_snapshot(self, rows: list[sqlite3.Row], *, reason: str, capacity: int, active_jobs: int, resource_for) -> str:
-        sid = "queue-" + sha(now_iso() + "\n" + reason + "\n" + str(len(rows)))[:16]
+        sid = "queue-" + uuid.uuid4().hex[:16]
         items = []
         with self.connect() as con:
             con.execute(
