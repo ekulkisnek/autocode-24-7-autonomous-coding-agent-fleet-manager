@@ -324,8 +324,53 @@ class Store:
                 "insert into queue(chat_id, position, created_at) values(?,?,?) on conflict(chat_id) do update set position=excluded.position",
                 (chat_id, position, now_iso()),
             )
-            con.execute("update chats set adopted=1, paused=0 where id=? and done=0", (chat_id,))
+            con.execute(
+                "update chats set adopted=1, paused=0, state='active' where id=? and done=0",
+                (chat_id,),
+            )
         self.event("queue_add", chat_id, position=position)
+
+    def record_job_turn_context(
+        self,
+        chat_id: str,
+        *,
+        job_id: str,
+        evidence_status: str,
+        summary: str,
+        reason: str = "",
+    ) -> None:
+        """Persist the last finished job summary for the next autonomous drive turn."""
+        from .recovery import chat_metadata
+
+        row = self.row("select metadata_json from chats where id=?", (chat_id,))
+        meta = chat_metadata(row)
+        meta["last_job_id"] = job_id
+        meta["last_job_evidence"] = evidence_status
+        meta["last_job_reason"] = (reason or "")[:500]
+        meta["last_job_summary"] = summary[:6000]
+        meta["last_job_at"] = now_iso()
+        with self.connect() as con:
+            con.execute("update chats set metadata_json=? where id=?", (json_dumps(meta), chat_id))
+
+    def last_job_turn_context(self, chat_id: str) -> str:
+        from .recovery import chat_metadata
+
+        row = self.row("select metadata_json from chats where id=?", (chat_id,))
+        meta = chat_metadata(row)
+        summary = str(meta.get("last_job_summary") or "").strip()
+        if not summary:
+            return ""
+        job_id = str(meta.get("last_job_id") or "")
+        evidence = str(meta.get("last_job_evidence") or "")
+        reason = str(meta.get("last_job_reason") or "")
+        when = str(meta.get("last_job_at") or "")
+        header = f"Prior AutoCode job {job_id} ({evidence or 'finished'}"
+        if when:
+            header += f" at {when}"
+        header += ")"
+        if reason:
+            header += f": {reason}"
+        return f"{header}:\n{summary}"
 
     def queue_remove(self, chat_id: str) -> bool:
         with self.connect() as con:
@@ -402,6 +447,13 @@ class Store:
             select q.chat_id
             from queue q join chats c on c.id=q.chat_id
             where c.done=1
+              and not exists (
+                select 1 from goals g where g.chat_id=c.id and g.status='active'
+              )
+              and not exists (
+                select 1 from project_priorities p
+                where p.target_chat_id=c.id and p.status='active'
+              )
             """
         )
         archived: list[str] = []
@@ -409,6 +461,21 @@ class Store:
             if self.queue_archive(row["chat_id"], reason="done"):
                 archived.append(str(row["chat_id"]))
         return archived
+
+    def queue_reopen(self, chat_id: str) -> bool:
+        """Move a chat from queue_finished back onto the active queue."""
+        row = self.row("select position from queue_finished where chat_id=?", (chat_id,))
+        if not row:
+            if self.row("select 1 from queue where chat_id=?", (chat_id,)):
+                return False
+            self.queue_add(chat_id)
+            return True
+        position = float(row["position"] or 0) or None
+        with self.connect() as con:
+            con.execute("delete from queue_finished where chat_id=?", (chat_id,))
+        self.queue_add(chat_id, position)
+        self.event("queue_reopen", chat_id)
+        return True
 
     def queue_move(self, chat_id: str, new_position: float) -> bool:
         with self.connect() as con:

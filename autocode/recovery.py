@@ -5,11 +5,13 @@ from typing import Any
 
 from .config import (
     DEFAULT_MAX_FAILURE_COUNT,
+    DEFAULT_MAX_GOAL_RETRIES,
     DEFAULT_PRIORITY_MAX_FAILURE_COUNT,
     DEFAULT_RETRY_BACKOFF_BASE,
     DEFAULT_RETRY_BACKOFF_MAX,
     DEFAULT_STALL_SECONDS,
 )
+from . import goals
 from .store import Store
 from .util import json_dumps, json_loads, now_iso, now_ts, parse_ts
 
@@ -21,6 +23,11 @@ FAILURE_KINDS = frozenset(
         "killed",
         "timed_out_with_work",
         "running_silent",
+        "goal_incomplete",
+        "false_complete",
+        "failed",
+        "completed",
+        "chat_paused",
     }
 )
 
@@ -38,6 +45,9 @@ def chat_metadata(row: Row | None) -> dict[str, Any]:
 
 
 def max_failure_count(store: Store, chat_id: str) -> int:
+    in_queue = store.row("select 1 from queue where chat_id=?", (chat_id,))
+    if in_queue and goals.chat_has_active_goal(store, chat_id):
+        return DEFAULT_MAX_GOAL_RETRIES
     if store.active_priority_for_chat(chat_id):
         return DEFAULT_PRIORITY_MAX_FAILURE_COUNT
     return DEFAULT_MAX_FAILURE_COUNT
@@ -46,6 +56,8 @@ def max_failure_count(store: Store, chat_id: str) -> int:
 def failure_kind(evidence_status: str, evidence_reason: str, job: Row | None = None) -> str:
     status = (evidence_status or "").strip()
     reason = (evidence_reason or "").strip().lower()
+    if status in {"goal_incomplete", "false_complete"}:
+        return status
     if status == "killed" or "chat_paused" in reason:
         return "killed"
     if status in {"silent_failed", "running_silent"}:
@@ -54,6 +66,12 @@ def failure_kind(evidence_status: str, evidence_reason: str, job: Row | None = N
         return "provider_error"
     if status == "timed_out_with_work":
         return "timed_out_with_work"
+    if status == "worked" and ("goal incomplete" in reason or "require_fleet_done" in reason or "too minimal" in reason):
+        return "goal_incomplete"
+    if status == "completed" and "fleet_done" not in reason:
+        return "goal_incomplete"
+    if status == "failed":
+        return "failed"
     return status or "unknown"
 
 
@@ -66,6 +84,8 @@ def backoff_seconds(kind: str, failure_count: int) -> int:
         base = max(base, 60)
     elif kind == "killed":
         base = max(base, 15)
+    elif kind in {"goal_incomplete", "false_complete", "completed"}:
+        base = max(base, 20)
     delay = min(DEFAULT_RETRY_BACKOFF_MAX, int(base * (2 ** min(count - 1, 6))))
     return max(base, delay)
 
@@ -136,12 +156,13 @@ def schedule_retry(
     evidence_status: str,
     evidence_reason: str,
     job_id: str = "",
+    immediate: bool = False,
 ) -> bool:
     row = store.row("select * from chats where id=?", (chat_id,))
     if not row or not should_retry_chat(store, row, kind):
         return False
     failures = int(row["failure_count"] or 0)
-    delay = backoff_seconds(kind, failures)
+    delay = 0 if immediate else backoff_seconds(kind, failures)
     retry_at = now_ts() + delay
     meta = chat_metadata(row)
     meta["last_failure_kind"] = kind
@@ -218,6 +239,26 @@ def handle_job_failure(
     )
 
 
+def schedule_goal_incomplete(
+    store: Store,
+    chat_id: str,
+    *,
+    reason: str,
+    job_id: str = "",
+    immediate: bool = True,
+) -> bool:
+    store.event("completion_rejected", chat_id, job_id, reason=reason[:500])
+    return schedule_retry(
+        store,
+        chat_id,
+        kind="goal_incomplete",
+        evidence_status="goal_incomplete",
+        evidence_reason=reason,
+        job_id=job_id,
+        immediate=immediate,
+    )
+
+
 def reconcile_killed_chats(store: Store) -> int:
     """Unstick chats whose jobs were killed but remain queued with goals open."""
     rows = store.rows(
@@ -244,6 +285,8 @@ def reconcile_killed_chats(store: Store) -> int:
         reason = str(last["evidence_reason"] or "").lower()
         status = str(last["evidence_status"] or "")
         if status != "killed" and "chat_paused" not in reason:
+            continue
+        if int(row["paused"] or 0):
             continue
         if int(row["failure_count"] or 0) >= max_failure_count(store, row["id"]):
             continue

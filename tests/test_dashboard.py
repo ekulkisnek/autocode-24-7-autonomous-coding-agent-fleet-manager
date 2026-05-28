@@ -758,7 +758,7 @@ Next action: run the Android BitAssets Detox build using the wrapper.
 
     text = render_dashboard(store, width=120, limit=5, refresh_jobs=False)
 
-    assert "Recent Evidence" in text
+    assert "Recent Jobs" in text
     assert "done: Fixed Android build env wrapper" in text
     assert "stdout_bytes=" not in text
     assert "stderr 512B" in text

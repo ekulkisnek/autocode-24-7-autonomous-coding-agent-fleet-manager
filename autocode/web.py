@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -46,7 +47,10 @@ def status_payload(store: Store) -> dict:
 
 
 def sse_payload(store: Store) -> str:
-    payload = {"dashboard": render_dashboard(store, limit=12), "status": status_payload(store)}
+    payload = {
+        "dashboard": render_dashboard(store, limit=12, refresh_jobs=False, refresh_quota=False),
+        "status": status_payload(store),
+    }
     return f"data: {json.dumps(payload, default=str)}\n\n"
 
 
@@ -62,7 +66,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/queue":
             self._send_json(latest_queue(self.store))
         elif path == "/api/dashboard":
-            self._send_text(render_dashboard(self.store, limit=12))
+            self._send_text(render_dashboard(self.store, limit=12, refresh_jobs=False, refresh_quota=False))
         elif path == "/events":
             self._send_events()
         else:
@@ -105,10 +109,13 @@ es.onerror=()=>{out.textContent+='\\n[event stream disconnected]'};
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        for _ in range(3600):
-            self.wfile.write(sse_payload(self.store).encode("utf-8"))
-            self.wfile.flush()
-            time.sleep(1)
+        try:
+            for _ in range(3600):
+                self.wfile.write(sse_payload(self.store).encode("utf-8"))
+                self.wfile.flush()
+                time.sleep(1)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            return
 
 
 def run_web(host: str = "127.0.0.1", port: int = 8765) -> None:

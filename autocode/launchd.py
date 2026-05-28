@@ -24,6 +24,10 @@ def plist() -> dict:
             "PYTHONPATH": str(ROOT),
             "AUTOCODE_HOME": str(ROOT),
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/lukekensik/.grok/bin:/Users/lukekensik/.local/bin:/Applications/Codex.app/Contents/Resources",
+            # Kill non-cursor jobs after 10 min silent; detect stalls after 3 min
+            "AUTOCODE_JOB_TIMEOUT": "600",
+            "AUTOCODE_STALL_SECONDS": "180",
+            "AUTOCODE_CURSOR_IDLE_SECONDS": "600",
         },
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -45,11 +49,15 @@ def _target() -> str:
 
 def start() -> tuple[int, str, str]:
     install()
+    loaded, _ = status()
+    if loaded:
+        p = subprocess.run(["launchctl", "kickstart", _target()], capture_output=True, text=True)
+        return p.returncode, p.stdout, p.stderr
     subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(PLIST)], capture_output=True, text=True)
     p = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(PLIST)], capture_output=True, text=True)
     if p.returncode != 0 and "already bootstrapped" not in (p.stderr or ""):
         return p.returncode, p.stdout, p.stderr
-    k = subprocess.run(["launchctl", "kickstart", "-k", _target()], capture_output=True, text=True)
+    k = subprocess.run(["launchctl", "kickstart", _target()], capture_output=True, text=True)
     return k.returncode, k.stdout, k.stderr
 
 

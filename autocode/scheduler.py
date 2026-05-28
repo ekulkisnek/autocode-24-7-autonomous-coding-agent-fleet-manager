@@ -11,12 +11,14 @@ from .config import (
     DEFAULT_MAX_FAILURE_COUNT,
     HOME,
 )
+from . import goals
 from . import recovery
 from .discovery import discover
 from .models import Chat
 from .models import ContinuePlan
 from .policy import build_prompt
 from .providers import provider_map
+from . import grok_watchdog
 from .runner import JobRunner
 from .store import Store
 from .util import disk_free_gb, load1, memory_free_percent
@@ -30,6 +32,9 @@ class Scheduler:
 
     def tick(self, dispatch: bool = True, max_projects: int | None = None) -> dict:
         self.runner.refresh()
+        from . import goals
+
+        reopened = goals.reconcile_false_done_chats(self.store)
         self.store.queue_archive_done()
         unstuck = recovery.reconcile_killed_chats(self.store)
         stale_leases = self.cleanup_stale_leases()
@@ -52,9 +57,11 @@ class Scheduler:
                     break
                 if self.has_active_job(row["id"]) or self.has_active_lease(row):
                     continue
+                grok_watchdog.request("prompt_due")
                 job_id = self.dispatch(row, queue_snapshot_id=snapshot_id)
                 if job_id:
                     sent.append(job_id)
+                    grok_watchdog.request("dispatch")
         return {
             "sent": len(sent),
             "jobs": sent,
@@ -64,6 +71,7 @@ class Scheduler:
             "queue_snapshot": snapshot_id,
             "stale_leases": stale_leases,
             "recovery_unstuck": unstuck,
+            "goal_reopened": reopened,
         }
 
     def _maybe_discover(self) -> str:
@@ -93,46 +101,91 @@ class Scheduler:
 
     def capacity(self) -> int:
         configured = int(self.store.get_config("max_active", str(DEFAULT_MAX_ACTIVE)) or DEFAULT_MAX_ACTIVE)
+        yolo = self.store.get_config("yolo", "off").lower() in {"1", "true", "yes", "on"}
         disk_free = disk_free_gb(self.store.path.parent)
         if disk_free is not None and disk_free < 0.75:
-            return 0
-        l1 = load1()
-        mem_free = memory_free_percent()
-        if mem_free is not None and mem_free < 12:
-            return 0
-        if mem_free is not None and mem_free < 20:
-            configured = min(configured, 1)
-        elif mem_free is not None and mem_free < 30:
-            configured = min(configured, 2)
-        if l1 >= 10:
-            return min(configured, 1)
-        if l1 >= 7:
-            return min(configured, 2)
-        if l1 >= 5:
-            return min(configured, 3)
-        return configured
+            cap = 0
+        else:
+            cap = configured
+            l1 = load1()
+            mem_free = memory_free_percent()
+            if mem_free is not None and mem_free < 12:
+                cap = 0
+            elif mem_free is not None and mem_free < 20:
+                cap = min(cap, 1)
+            elif mem_free is not None and mem_free < 30:
+                cap = min(cap, 2)
+            if l1 >= 10:
+                cap = min(cap, 1)
+            elif l1 >= 7:
+                cap = min(cap, 2)
+            elif l1 >= 5:
+                cap = min(cap, 3)
+        if yolo and cap == 0 and configured > 0:
+            queued = self.store.row(
+                """
+                select count(*) c from queue q
+                join chats c on c.id=q.chat_id
+                where c.paused=0 and c.done=0
+                """
+            )
+            if queued and int(queued["c"] or 0) > 0:
+                cap = min(configured, 1)
+        return cap
 
     def active_job_count(self) -> int:
         row = self.store.row("select count(*) c from jobs where status='running'")
         return int(row["c"] if row else 0)
 
     def candidates(self, limit: int) -> list[Row]:
+        cap = DEFAULT_MAX_FAILURE_COUNT + 4
         rows = self.store.rows(
             """
             select c.*, q.position as queue_position
             from queue q join chats c on c.id=q.chat_id
             where c.paused=0 and c.done=0 and c.failure_count < ?
-              and (
-                c.last_drive_at is not null
-                or c.last_seen_at < datetime('now', '-60 seconds')
-              )
             order by q.position asc
             limit ?
             """,
-            (DEFAULT_MAX_FAILURE_COUNT + 4, limit * 4),
+            (cap, limit * 4),
         )
+        if len(rows) < limit:
+            healed = self.store.rows(
+                """
+                select c.*, q.position as queue_position
+                from queue q join chats c on c.id=q.chat_id
+                where c.paused=0 and c.done=1 and c.failure_count < ?
+                  and (
+                    exists (select 1 from goals g where g.chat_id=c.id and g.status='active')
+                    or exists (
+                      select 1 from project_priorities p
+                      where p.target_chat_id=c.id and p.status='active'
+                    )
+                  )
+                order by q.position asc
+                limit ?
+                """,
+                (cap, limit),
+            )
+            seen = {str(row["id"]) for row in rows}
+            for row in healed:
+                if str(row["id"]) not in seen:
+                    rows.append(row)
+                    seen.add(str(row["id"]))
         ready: list[Row] = []
         for row in rows:
+            if int(row["done"] or 0) and goals.chat_has_active_goal(self.store, str(row["id"])):
+                goals.reopen_chat_for_goal(self.store, str(row["id"]), reason="candidate_self_heal")
+                refreshed = self.store.row(
+                    """
+                    select c.*, q.position as queue_position
+                    from queue q join chats c on c.id=q.chat_id
+                    where c.id=?
+                    """,
+                    (row["id"],),
+                )
+                if refreshed:
+                    row = refreshed
             cap = recovery.max_failure_count(self.store, row["id"])
             if int(row["failure_count"] or 0) >= cap:
                 continue
@@ -220,17 +273,19 @@ class Scheduler:
         return job_id
 
     def _row_with_plan(self, row: Row):
-        plan = self.store.task_plan_summary(row["id"])
-        if not plan:
-            return row
         data = {key: row[key] for key in row.keys()}
-        data["task_plan"] = plan
+        plan = self.store.task_plan_summary(row["id"])
+        if plan:
+            data["task_plan"] = plan
+        prior = self.store.last_job_turn_context(str(row["id"]))
+        if prior:
+            data["prior_job_context"] = prior
 
         class PromptRow(dict):
             def keys(self):
                 return super().keys()
 
-        return PromptRow(data)
+        return PromptRow(data) if plan or prior else row
 
     def fallback_plan(self, row: Row, prompt: str, job_dir) -> ContinuePlan:
         raw_cwd = row["cwd"] or str(HOME)

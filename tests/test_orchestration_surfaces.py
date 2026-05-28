@@ -83,3 +83,19 @@ def test_web_payloads_include_queue_and_sse(tmp_path: Path):
     assert queue["id"] == sid
     assert status["queue"]["id"] == sid
     assert sse.startswith("data: ")
+
+
+def test_web_sse_uses_cached_dashboard_render(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    calls = []
+
+    def fake_render_dashboard(store_arg, **kwargs):
+        calls.append(kwargs)
+        return "dashboard snapshot"
+
+    monkeypatch.setattr("autocode.web.render_dashboard", fake_render_dashboard)
+
+    sse = sse_payload(store)
+
+    assert "dashboard snapshot" in sse
+    assert calls == [{"limit": 12, "refresh_jobs": False, "refresh_quota": False}]

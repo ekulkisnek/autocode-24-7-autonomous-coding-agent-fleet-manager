@@ -10,11 +10,12 @@ from pathlib import Path
 from sqlite3 import Row
 
 from .config import DEFAULT_CURSOR_JOB_TIMEOUT, DEFAULT_JOB_TIMEOUT, JOBS
+from . import grok_watchdog
 from . import recovery
 from .config import HOME, WORKTREES
 from .markers import parse_fleet_marker
 from .models import Chat, ContinuePlan
-from .policy import assess_output_state
+from . import goals
 from .store import Store
 from .util import json_dumps, now_iso, now_ts, read_text
 
@@ -229,6 +230,7 @@ class JobRunner:
                 killed += 1
         for job in jobs:
             self.store.event("job_killed", job["chat_id"], job["id"], reason=reason)
+            grok_watchdog.request("job_killed")
             if reason not in {"daemon_shutdown", "daemon_stop", "daemon_restart", "chat_paused"}:
                 recovery.handle_job_failure(
                     self.store,
@@ -316,13 +318,14 @@ class JobRunner:
         err = Path(job["stderr_path"])
         out_size = out.stat().st_size if out.exists() else 0
         err_size = err.stat().st_size if err.exists() else 0
-        age = now_ts() - self._ts(job["created_at"])
+        age = self._job_activity_age(job, out, err)
         stall_seconds = self._stall_seconds_for(job)
         evidence_status = "running_working" if out_size or err_size else "running"
         evidence_reason = f"stdout_bytes={out_size}; stderr_bytes={err_size}"
         status = "running" if running else "completed"
         completed = ""
         archive_chat_id: str | None = None
+        pending_goal_retry: tuple[str, str, str] | None = None
         if running and not (out_size or err_size):
             activity = self._process_tree_snapshot(pid)
             if activity.has_activity():
@@ -340,15 +343,22 @@ class JobRunner:
             evidence_reason = f"timed out after {int(age)}s; {evidence_reason}"
         elif not running:
             completed = now_iso()
+            stdout_preview = read_text(out, limit=12000) if out_size else ""
             if self._fatal_stderr(err) and not out_size:
                 evidence_status = "provider_error"
                 status = "failed"
             elif out_size or self._meaningful_stderr(err):
-                evidence_status = "worked"
+                if goals.output_too_minimal(self.store, stdout_preview):
+                    evidence_status = "goal_incomplete"
+                    status = "failed"
+                    evidence_reason = f"process exited; minimal output; {evidence_reason}"
+                else:
+                    evidence_status = "worked"
             else:
                 evidence_status = "silent_failed"
                 status = "failed"
-            evidence_reason = f"process exited; {evidence_reason}"
+            if evidence_status != "goal_incomplete":
+                evidence_reason = f"process exited; {evidence_reason}"
         with self.store.connect() as con:
             con.execute(
                 """
@@ -412,8 +422,9 @@ class JobRunner:
                         (job["chat_id"],),
                     ).fetchone()
                     objective = str(priority["objective"] if priority else (chat["objective"] if chat else ""))
-                    assessment = assess_output_state(objective, assessment_text)
-                    if assessment.complete:
+                    assessment = goals.assess_for_completion(self.store, objective, assessment_text)
+                    verified, verify_reason = goals.verify_goal_complete(self.store, objective, assessment_text)
+                    if verified:
                         con.execute("update chats set done=1,state='done',last_evidence_at=? where id=?", (now_iso(), job["chat_id"]))
                         con.execute("update goals set status='complete',updated_at=? where chat_id=? and status='active'", (now_iso(), job["chat_id"]))
                         con.execute("update project_priorities set status='complete',updated_at=? where status='active' and target_chat_id=?", (now_iso(), job["chat_id"]))
@@ -430,23 +441,61 @@ class JobRunner:
                                 "completion_assessed",
                                 job["chat_id"],
                                 job["id"],
-                                json_dumps({"state": assessment.state, "complete": assessment.complete, "reason": assessment.reason, "missing": list(assessment.missing)}),
+                                json_dumps(
+                                    {
+                                        "state": assessment.state,
+                                        "complete": False,
+                                        "reason": verify_reason or assessment.reason,
+                                        "missing": list(assessment.missing),
+                                    }
+                                ),
                             ),
                         )
+                        pending_goal_retry = (verify_reason or assessment.reason, str(job["chat_id"]), str(job["id"]))
                 else:
                     con.execute("update chats set state='stalled',failure_count=failure_count+1 where id=?", (job["chat_id"],))
         if status != "running":
+            out_path = Path(job["stdout_path"])
+            err_path = Path(job["stderr_path"])
+            turn_text = read_text(out_path, limit=12000) if out_path.exists() else ""
+            if not turn_text.strip() and err_path.exists():
+                turn_text = read_text(err_path, limit=4000)
+            if turn_text.strip():
+                self.store.record_job_turn_context(
+                    str(job["chat_id"]),
+                    job_id=str(job["id"]),
+                    evidence_status=evidence_status,
+                    summary=turn_text,
+                    reason=evidence_reason,
+                )
             self.store.event("job_finished", job["chat_id"], job["id"], status=status, evidence_status=evidence_status, reason=evidence_reason)
-            if evidence_status != "worked":
+            grok_watchdog.request(f"job_{status}")
+            if evidence_status == "goal_incomplete":
+                recovery.schedule_goal_incomplete(
+                    self.store,
+                    str(job["chat_id"]),
+                    reason=evidence_reason,
+                    job_id=str(job["id"]),
+                )
+            elif evidence_status == "worked":
+                recovery.clear_retry_state(self.store, str(job["chat_id"]))
+                self.store.clear_provider_health(str(job["provider"] or ""))
+            else:
                 recovery.handle_job_failure(
                     self.store,
                     job,
                     evidence_status=evidence_status,
                     evidence_reason=evidence_reason,
                 )
-            else:
-                recovery.clear_retry_state(self.store, str(job["chat_id"]))
-                self.store.clear_provider_health(str(job["provider"] or ""))
+        if pending_goal_retry:
+            reason, chat_id, job_id = pending_goal_retry
+            recovery.schedule_goal_incomplete(
+                self.store,
+                chat_id,
+                reason=reason,
+                job_id=job_id,
+                immediate=True,
+            )
         if archive_chat_id:
             self.store.queue_archive(archive_chat_id, reason="completed")
 
@@ -617,3 +666,17 @@ class JobRunner:
     def _ts(self, value: str) -> float:
         from .util import parse_ts
         return parse_ts(value)
+
+    def _job_activity_age(self, job: Row, stdout: Path, stderr: Path) -> float:
+        """Seconds since last observable job activity (start or stream output)."""
+        now = now_ts()
+        last = self._ts(job["created_at"])
+        for path in (stdout, stderr):
+            try:
+                if path.exists():
+                    st = path.stat()
+                    if st.st_size > 0:
+                        last = max(last, min(st.st_mtime, now))
+            except OSError:
+                pass
+        return max(0.0, now - last)

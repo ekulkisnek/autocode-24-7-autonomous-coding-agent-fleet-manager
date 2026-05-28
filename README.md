@@ -65,23 +65,78 @@ The default Cursor model is stored as AutoCode config key `cursor_model` and def
 - Jobs: `$AUTOCODE_HOME/state/jobs`
 - Logs: `$AUTOCODE_HOME/logs/autocode.log`
 
-## Reliability / recovery
+## Drive until goal
 
-Queued chats that stall or fail are retried automatically until the goal completes or retry limits are hit. Job assessment records `silent_failed`, `provider_error`, and `killed` outcomes; the scheduler applies exponential backoff, bumps stall detection for silent timeouts, and can switch providers after repeated failures.
+AutoCode keeps assigned chats on the queue and dispatches new turns until a goal is **verified** complete—not when a provider merely exits or claims success.
+
+Completion requires a structured `FLEET_DONE` marker (default) or assessor-verified criteria with substantive output. Milestones (`FLEET_MILESTONE`), minimal/empty stdout, and premature `done=1` flags are rejected; the daemon re-opens false completes on the next tick and schedules `goal_incomplete` retries. Stall detection uses stdout/stderr heartbeats (file mtimes reset the clock); e2e-style goals get longer stall windows.
+
+Terminal job outcomes (`silent_failed`, `provider_error`, `killed`, `chat_paused` without `paused=1`, false `completed`) schedule exponential backoff retries up to the goal retry cap. `autocode pause` is intentional: `paused=1` blocks recovery and dispatch.
+
+## Reliability / recovery
 
 Environment variables:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `AUTOCODE_STALL_SECONDS` | `600` | No-output stall window before timeout (e2e goals use at least `1800`) |
-| `AUTOCODE_MAX_FAILURE_RETRIES` | `8` | Max failure streak per queued chat |
+| `AUTOCODE_REQUIRE_FLEET_DONE` | `1` | Require `FLEET_DONE` before marking goals complete |
+| `AUTOCODE_MIN_OUTPUT_CHARS` | `48` | Reject “worked” completion below this output size |
+| `AUTOCODE_MAX_GOAL_RETRIES` | `20` | Max retries per queued chat with an active goal |
+| `AUTOCODE_STALL_SECONDS` | `600` | No-output stall window (e2e goals use at least `1800`) |
+| `AUTOCODE_MAX_FAILURE_RETRIES` | `8` | Max failure streak for non-goal chats |
 | `AUTOCODE_PRIORITY_MAX_FAILURE_RETRIES` | `12` | Higher limit for chats with an active priority pin |
 | `AUTOCODE_RETRY_BACKOFF_BASE` | `30` | Initial retry delay (seconds) |
 | `AUTOCODE_RETRY_BACKOFF_MAX` | `900` | Cap on retry backoff (seconds) |
+| `AUTOCODE_MAX_GOAL_RETRIES` | `20` | Max retries for queued chats with an active goal |
+| `AUTOCODE_MIN_OUTPUT_CHARS` | `48` | Minimum output size before a turn counts as progress |
+| `AUTOCODE_REQUIRE_FLEET_DONE` | `1` | Require `FLEET_DONE` before goal completion |
 | `AUTOCODE_JOB_TIMEOUT` | `1800` | Non-Cursor job wall clock |
 | `AUTOCODE_CURSOR_JOB_TIMEOUT` | `14400` | Cursor job wall clock |
+| `AUTOCODE_TICK_INTERVAL` | `2` | Daemon tick interval (seconds) |
+| `AUTOCODE_MAX_ACTIVE` | `5` | Max concurrent jobs |
 
 Explicit `autocode pause` sets `paused=1` and stops auto-recovery for that chat until you resume it.
+
+## Autonomous multi-turn operation
+
+AutoCode is designed to keep driving queued chats across many agent turns without manual `autocode drive` or opening chats in the IDE.
+
+**What Luke needs**
+
+1. Daemon running: `autocode daemon install` (launchd) or `autocode daemon start`
+2. YOLO on (default in fresh DB): `autocode yolo on`
+3. Queue a chat with a goal: `autocode drive <query> --goal "<goal>"` (or `autocode queue add <query>` after setting a goal)
+
+After that, each finished job is assessed. If the goal is incomplete (including partial `FLEET_MILESTONE` progress), the scheduler schedules the next turn on the same chat, bumps it toward the front of the queue, and injects the prior job summary into the next prompt. No resume click in Cursor/Grok/Codex is required.
+
+**Daemon / launchd**
+
+```bash
+autocode daemon install   # writes ~/Library/LaunchAgents/com.lukekensik.autocode.plist
+autocode daemon restart   # after code changes
+autocode daemon status
+tail -f ~/autocode/logs/autocode.log
+```
+
+The launchd plist sets `AUTOCODE_HOME`, tick interval, and stall/timeouts. Keep the daemon alive (`KeepAlive`); AutoCode re-dispatches when capacity frees up.
+
+**Environment**
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AUTOCODE_YOLO` | (config `yolo=on`) | When on, keeps at least one dispatch slot while the queue has work even under memory pressure |
+| `AUTOCODE_MAX_GOAL_RETRIES` | `20` | Max failure streak for queued chats with an active goal |
+| `AUTOCODE_REQUIRE_FLEET_DONE` | `1` | Require `FLEET_DONE` marker before marking a goal complete |
+| `AUTOCODE_MIN_OUTPUT_CHARS` | `48` | Treat shorter output as incomplete (next turn scheduled) |
+| `AUTOCODE_TICK_INTERVAL` | `2` | Daemon scheduler period (seconds) |
+| `AUTOCODE_MAX_ACTIVE` | `5` | Concurrent jobs |
+
+**Human-only blockers**
+
+- Explicit `autocode pause` on a chat
+- Provider auth / quota errors until credentials recover
+- `needs_input` when the agent reports user-gated work
+- Retry limits exhausted (`AUTOCODE_MAX_GOAL_RETRIES` or priority limits)
 
 ## Newer Control Surfaces
 

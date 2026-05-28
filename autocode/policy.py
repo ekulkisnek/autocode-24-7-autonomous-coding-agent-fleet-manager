@@ -217,11 +217,19 @@ def build_prompt(row: Row, recovery: bool = False) -> str:
             plan = str(row["task_plan"] or "")
     except Exception:
         plan = ""
+    prior = ""
+    try:
+        if "prior_job_context" in row.keys():
+            prior = str(row["prior_job_context"] or "")
+    except Exception:
+        prior = ""
     prefix = "RECOVERY: previous work stalled or lacked evidence.\n\n" if recovery else ""
+    prior_block = f"Prior AutoCode turn (continue from this, do not repeat):\n{prior}\n\n" if prior else ""
     return (
         f"{prefix}"
         "AutoCode is driving this project in Maximum YOLO mode.\n\n"
         f"Goal:\n{objective}\n\n"
+        f"{prior_block}"
         "Rules:\n"
         "- Take the fastest safe path to complete the goal.\n"
         "- Do not wait for Luke/Hermes if a safe next action exists.\n"

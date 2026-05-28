@@ -37,7 +37,14 @@ class ModelInfo:
         return "/".join(parts)
 
 
-def render_dashboard(store: Store | None = None, *, width: int | None = None, limit: int = 12, refresh_jobs: bool = True) -> str:
+def render_dashboard(
+    store: Store | None = None,
+    *,
+    width: int | None = None,
+    limit: int = 12,
+    refresh_jobs: bool = True,
+    refresh_quota: bool = True,
+) -> str:
     store = store or Store()
     if refresh_jobs:
         Scheduler(store).runner.refresh()
@@ -46,26 +53,34 @@ def render_dashboard(store: Store | None = None, *, width: int | None = None, li
     daemon_ok, _ = launchd_status()
     active_jobs = _count(store, "select count(*) c from jobs where status='running'")
     cap = Scheduler(store).capacity()
-    active_chats = _count(store, "select count(*) c from chats where adopted=1 and done=0 and paused=0 and coding_score>0")
+    queue_size = _count(
+        store,
+        "select count(*) c from queue q join chats c on c.id=q.chat_id where c.done=0",
+    )
+    finished_size = _count(store, "select count(*) c from queue_finished")
     total_chats = _count(store, "select count(*) c from chats")
     yolo = store.get_config("yolo", "off")
-    priority_only = store.get_config("priority_only", "off")
     resources = system_resource()
+
+    working_banner = f"  *** WORKING: {active_jobs}/{cap} slots active ***" if active_jobs > 0 else "  -- IDLE (no jobs running) --"
 
     lines: list[str] = []
     lines.append(_bar("AutoCode Dashboard", width))
+    lines.append(working_banner)
     lines.append(
         f"{now_iso()} | daemon={'on' if daemon_ok else 'off'} | yolo={yolo} | "
-        f"priority_only={priority_only} | jobs={active_jobs}/{cap} | {format_system_resource(resources)}"
+        f"jobs={active_jobs}/{cap} | queue={queue_size} | finished={finished_size} | {format_system_resource(resources)}"
     )
-    lines.append(f"db={DB} | chats={total_chats} total, {active_chats} active/adopted")
+    lines.append(f"db={DB} | chats={total_chats} discovered")
     lines.extend(_session_summary(store, width))
     lines.append("")
     lines.extend(_running_section(store, width, limit))
     lines.append("")
     lines.extend(_queue_section(store, width, limit))
     lines.append("")
-    lines.extend(_usage_section(store, width))
+    lines.extend(_all_chats_section(store, width, min(limit, 20)))
+    lines.append("")
+    lines.extend(_usage_section(store, width, refresh_quota=refresh_quota))
     lines.append("")
     lines.extend(_recent_section(store, width, min(limit, 8)))
     lines.append("")
@@ -209,43 +224,24 @@ def _running_section(store: Store, width: int, limit: int) -> list[str]:
 def _queue_section(store: Store, width: int, limit: int) -> list[str]:
     scheduler = Scheduler(store)
     rows = scheduler.candidates(limit)
-    priorities = store.rows(
-        """
-        select * from project_priorities
-        where status='active'
-        order by priority desc, updated_at desc
-        limit ?
-        """,
-        (limit,),
-    )
-    lines = [_title("Watched / Next Up", width)]
-    if priorities:
-        lines.append("  priority projects:")
-        for p in priorities[: min(5, limit)]:
-            target = f" -> {_fit(p['target_chat_id'], 34)}" if p["target_chat_id"] else ""
-            lines.append(f"    p{p['priority']} {_fit(p['query'], 32)}{target} lanes={p['worker_lanes']}")
-            lines.append(f"      goal: {_fit(_objective_summary(p['objective']), width - 14)}")
+    lines = [_title("Queue / Next Up", width)]
     if not rows:
-        if not priorities and store.get_config("priority_only", "off").lower() in {"1", "true", "yes", "on"}:
-            lines.append("  no schedulable chats right now because priority_only=on and no active priority projects exist")
-            lines.append("  add one with: autocode drive <chat-query> --goal \"...\" --priority --exact")
-        else:
-            lines.append("  no schedulable chats right now")
+        lines.append("  queue is empty — add with: autocode queue add <chat-query> [--position N]")
         return lines
-    lines.append("  next scheduler candidates:")
     for row in rows[:limit]:
         meta = json_loads(row["metadata_json"], {})
         model = chat_model_info(row, meta).label()
         title = row["alias"] or row["title"] or row["provider_chat_id"]
         state = row["state"]
-        flag = "P" if _is_priority(store, row["id"]) else "-"
+        pos = row["queue_position"]
+        pos_str = f"#{int(pos)}" if pos == int(pos) else f"#{pos}"
         objective = _objective_summary(row["objective"] or row["title"] or row["latest_text"])
         counts = _chat_drive_counts(store, row["id"])
         lines.append(
-            f"    {flag} {rel_time(row['updated_at']):>4} {row['provider']:<11} {model:<22} "
+            f"  {pos_str:<5} {rel_time(row['updated_at']):>4} {row['provider']:<11} {model:<22} "
             f"{state:<11} prompts={counts[0]}/{counts[1]} {_fit(title, 34)}"
         )
-        lines.append(f"      next: {_fit(objective, width - 12)}")
+        lines.append(f"      goal: {_fit(objective, width - 12)}")
     return lines
 
 
@@ -266,10 +262,10 @@ def _session_summary(store: Store, width: int) -> list[str]:
     return [f"session prompts: {total} since {rel_time(start)} ({_fit(split, width - 38)})"]
 
 
-def _usage_section(store: Store, width: int) -> list[str]:
+def _usage_section(store: Store, width: int, *, refresh_quota: bool = True) -> list[str]:
     now = time.time()
     jobs = store.rows("select provider,status,created_at,updated_at,evidence_status from jobs")
-    quota = _quota_results()
+    quota = _quota_results() if refresh_quota else {}
     lines = [_title("Provider Usage / Health", width)]
     lines.append("  provider     health        running  1h   24h  7d   fail24  default/model")
     for provider in PROVIDERS:
@@ -285,7 +281,10 @@ def _usage_section(store: Store, width: int) -> list[str]:
             f"  {provider:<12} {health:<13} {running:>7} {one_h:>4} {day:>5} {week:>4} "
             f"{fail24:>7}  {_fit(default, 18):<18}"
         )
-        lines.append(f"      quota: {_quota_remaining(provider, quota, width=width)}")
+        if refresh_quota:
+            lines.append(f"      quota: {_quota_remaining(provider, quota, width=width)}")
+        else:
+            lines.append("      quota: skipped for fast web refresh")
     return lines
 
 
@@ -318,7 +317,7 @@ def _recent_section(store: Store, width: int, limit: int) -> list[str]:
         """,
         (limit,),
     )
-    lines = [_title("Recent Evidence", width)]
+    lines = [_title("Recent Jobs", width)]
     if not rows:
         lines.append("  no recent finished jobs")
         return lines
@@ -333,6 +332,33 @@ def _recent_section(store: Store, width: int, limit: int) -> list[str]:
             lines.append(f"        done: {_fit(summary, width - 15)}")
         if byte_note:
             lines.append(f"             {_fit(byte_note, width - 14)}")
+    return lines
+
+
+def _all_chats_section(store: Store, width: int, limit: int) -> list[str]:
+    rows = store.rows(
+        """
+        select c.*, q.position as queue_position
+        from chats c left join queue q on q.chat_id=c.id
+        where c.updated_at!=''
+        order by c.updated_at desc
+        limit ?
+        """,
+        (limit,),
+    )
+    lines = [_title("All Chats (recent)", width)]
+    if not rows:
+        lines.append("  no chats discovered yet")
+        return lines
+    for row in rows:
+        title = row["alias"] or row["title"] or row["provider_chat_id"]
+        in_queue = row["queue_position"] is not None
+        pos = row["queue_position"]
+        pos_str = f"#{int(pos)}" if pos is not None and pos == int(pos) else (f"#{pos}" if pos is not None else "    ")
+        flag = f"Q{pos_str}" if in_queue else "    "
+        lines.append(
+            f"  {rel_time(row['updated_at']):>5}  {flag:<7} {row['provider']:<11} {row['state']:<13} {_fit(title, width - 44)}"
+        )
     return lines
 
 
@@ -752,14 +778,6 @@ def _session_started_at() -> str:
             return line.split(" daemon started", 1)[0].strip()
     row = Store().row("select min(created_at) c from jobs")
     return str(row["c"] if row and row["c"] else "1970-01-01T00:00:00+00:00")
-
-
-def _is_priority(store: Store, chat_id: str) -> bool:
-    row = store.row(
-        "select count(*) c from project_priorities where status='active' and target_chat_id=?",
-        (chat_id,),
-    )
-    return int(row["c"] if row else 0) > 0
 
 
 def _row_has(row: Row, key: str) -> bool:

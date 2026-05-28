@@ -71,10 +71,10 @@ def test_scheduler_skips_repeatedly_failed_non_priority(tmp_path: Path):
         alias="noisy",
         continuation="fork-to-codex",
     )
-    store.upsert_chat(chat, 5, "active", "fix code")
+    store.upsert_chat(chat, 5, "active", "")
     store.queue_add(chat.id, 1.0)
     with store.connect() as con:
-        con.execute("update chats set failure_count=8 where id=?", (chat.id,))
+        con.execute("update chats set failure_count=8,objective='' where id=?", (chat.id,))
 
     assert Scheduler(store).candidates(10) == []
 

@@ -9,7 +9,8 @@ import sys
 import time
 from pathlib import Path
 
-from .config import DB, LOG, PID_FILE, ROOT, ensure_dirs
+from .config import DB, DEFAULT_PRESERVE_JOBS_ON_SHUTDOWN, LOG, PID_FILE, ROOT, ensure_dirs
+from . import grok_watchdog
 from .daemon import Daemon
 from .dashboard import run_dashboard
 from .discovery import discover
@@ -28,28 +29,33 @@ from .util import command_exists, compact, json_loads, load1, memory_free_percen
 def print_status(store: Store, limit: int) -> None:
     Scheduler(store).runner.refresh()
     chats = store.rows("select count(*) c from chats")
-    active = store.rows("select count(*) c from chats where adopted=1 and done=0 and paused=0 and coding_score>0")
+    queue_rows = store.queue_list()
+    finished_rows = store.queue_finished_list(limit)
     running = store.rows("select * from jobs where status='running' order by created_at desc limit ?", (limit,))
-    goals = store.rows("select g.*,c.alias,c.provider from goals g join chats c on c.id=g.chat_id where g.status='active' order by g.updated_at desc limit ?", (limit,))
-    priorities = store.rows("select * from project_priorities where status='active' order by priority desc, updated_at desc limit ?", (limit,))
     recent = store.rows("select * from jobs where status!='running' order by updated_at desc limit ?", (limit,))
     daemon_ok, _ = launchd_status()
-    print("AutoCode")
+    working = f"WORKING ({len(running)} running)" if running else "IDLE"
+    print(f"AutoCode | {working}")
     print(f"daemon: {'on' if daemon_ok else 'off'} | yolo={store.get_config('yolo','off')} | load={load1():.2f}")
     print(f"db: {DB}")
-    print(f"chats: {int(chats[0]['c']) if chats else 0} total, {int(active[0]['c']) if active else 0} active/adopted")
-    print(f"running: {len(running)}")
+    print(f"chats: {int(chats[0]['c']) if chats else 0} discovered, {len(queue_rows)} in queue", end="")
+    if finished_rows:
+        print(f", {len(finished_rows)} finished (show: autocode queue finished)")
+    else:
+        print()
     if running:
+        print(f"running ({len(running)}):")
         for j in running:
             print(f"- {rel_time(j['created_at'])} {j['provider']} {short(j['chat_id'])} {j['id']} {j['evidence_status']}")
-    print(f"goals: {len(goals)}")
-    for g in goals[:limit]:
-        print(f"- {g['provider']} {short(g['alias'])}: {compact(g['objective'], 180)}")
-    print(f"priority projects: {len(priorities)}")
-    for p in priorities[:limit]:
-        print(f"- p{p['priority']} {short(p['query'])}: {compact(p['objective'], 160)}")
+    else:
+        print("running: none")
+    print(f"queue ({len(queue_rows)}):")
+    for r in queue_rows[:limit]:
+        pos = r["position"]
+        pos_str = f"#{int(pos)}" if pos == int(pos) else f"#{pos:.1f}"
+        print(f"- {pos_str} {r['provider']} {short(r['alias'] or r['title'])} {rel_time(r['updated_at'])}")
     if recent:
-        print("recent:")
+        print("recent jobs:")
         for j in recent[:limit]:
             print(f"- {rel_time(j['updated_at'])} {j['evidence_status']} {short(j['chat_id'])}")
             if j["evidence_reason"]:
@@ -61,14 +67,16 @@ def print_now(store: Store, limit: int) -> None:
     running = store.rows("select * from jobs where status='running' order by created_at desc limit ?", (limit,))
     candidates = Scheduler(store).candidates(limit)
     if running:
-        print("Running now:")
+        print(f"Running now ({len(running)}):")
         for j in running:
             print(f"- {rel_time(j['created_at'])} {j['provider']} {short(j['chat_id'])} {j['id']} {j['evidence_status']}")
     else:
-        print("Running now: none")
-    print("Next up:")
+        print("Running now: none (IDLE)")
+    print(f"Queue ({len(candidates)} items):")
     for c in candidates:
-        print(f"- {rel_time(c['updated_at'])} {c['provider']} {short(c['alias'])} state={c['state']}")
+        pos = c["queue_position"]
+        pos_str = f"#{int(pos)}" if pos == int(pos) else f"#{pos:.1f}"
+        print(f"- {pos_str} {rel_time(c['updated_at'])} {c['provider']} {short(c['alias'])} state={c['state']}")
         print(f"  {compact(c['objective'], 180)}")
 
 
@@ -546,8 +554,27 @@ def cmd_chats(args: argparse.Namespace) -> None:
     store = Store()
     Scheduler(store).force_discover()
     cutoff = time.time() - parse_recent(args.recent)
-    rows = store.rows("select * from chats where updated_at!='' order by updated_at desc limit ?", (args.limit * 8,))
+    # Prefer non-transcript sources when a provider_chat_id has multiple entries
+    rows = store.rows(
+        """
+        select c.* from chats c
+        where c.updated_at != ''
+          and (
+            c.source not like '%.transcript'
+            or not exists (
+              select 1 from chats c2
+              where c2.provider = c.provider
+                and c2.provider_chat_id = c.provider_chat_id
+                and c2.source not like '%.transcript'
+            )
+          )
+        order by c.updated_at desc
+        limit ?
+        """,
+        (args.limit * 8,),
+    )
     shown = 0
+    in_queue = {r["chat_id"] for r in store.rows("select chat_id from queue")}
     for r in rows:
         from .util import parse_ts
         job = active_job_for(store, r["id"])
@@ -556,12 +583,11 @@ def cmd_chats(args: argparse.Namespace) -> None:
             continue
         shown += 1
         state = "running" if job else r["state"]
-        label = priority_label(store, r["id"], r["alias"])
-        print(f"- last_used={rel_time(display_at)} {r['provider']} {short(label)} state={state} score={r['coding_score']}")
+        queued = " [Q]" if r["id"] in in_queue else ""
+        title = r["title"] or r["latest_text"] or r["provider_chat_id"]
+        print(f"- {rel_time(display_at):>5}  {r['provider']:<11} {state:<13} {short(title)}{queued}")
         if job:
-            print(f"  job {job['id']} {job['evidence_status']}: {job_tail(job, 220)}")
-        else:
-            print(f"  {compact(r['title'] or r['latest_text'], 180)}")
+            print(f"        job {job['id']} {job['evidence_status']}: {job_tail(job, 200)}")
         if shown >= args.limit:
             break
     if shown == 0:
@@ -696,37 +722,68 @@ def cmd_cursor(args: argparse.Namespace) -> None:
 
 
 def cmd_grok(args: argparse.Namespace) -> None:
+    import tempfile
+    import urllib.parse
     store = Store()
     if args.grok_cmd == "new":
-        from .models import ContinuePlan
         workspace = Path(args.workspace).expanduser()
         cwd = str(workspace if workspace.exists() else Path.home())
-        job_dir = Scheduler(store)._planned_job_dir()
-        plan = ContinuePlan(
-            True,
-            "grok",
-            cwd,
-            cmd=[
-                "grok",
-                "--cwd",
-                cwd,
-                "--prompt-file",
-                str(job_dir / "prompt.txt"),
-                "--max-turns",
-                str(args.grok_message_ceiling),
-                "--no-alt-screen",
-                "--permission-mode",
-                "bypassPermissions",
-            ],
-            prompt_file=True,
-            same_chat=False,
-            reason="Start a new Grok conversation.",
-        )
-        chat_id = f"grok:new:{sha(cwd + args.goal)[:16]}"
-        job_id = Scheduler(store).runner.start_aux(chat_id, cwd, plan, args.goal, job_dir)
-        print(f"Started Grok job: {job_id}")
+
+        grok_home = Path.home() / ".grok"
+        grok_bin = grok_home / "bin" / "grok"
+        encoded_cwd = urllib.parse.quote(cwd, safe="")
+        sessions_dir = grok_home / "sessions" / encoded_cwd
+
+        existing: set[str] = set()
+        if sessions_dir.exists():
+            existing = {d.name for d in sessions_dir.iterdir() if d.is_dir() and len(d.name) > 10}
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(args.goal)
+            prompt_path = f.name
+
+        try:
+            subprocess.run(
+                [str(grok_bin), "--cwd", cwd, "--no-alt-screen",
+                 "--output-format", "plain", "--permission-mode", "bypassPermissions",
+                 "--max-turns", str(args.grok_message_ceiling),
+                 "--prompt-file", prompt_path],
+                timeout=300,
+            )
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            pass
+        finally:
+            Path(prompt_path).unlink(missing_ok=True)
+
+        new_session_id = None
+        if sessions_dir.exists():
+            new_dirs = [d for d in sessions_dir.iterdir()
+                        if d.is_dir() and d.name not in existing and len(d.name) > 10]
+            if new_dirs:
+                newest = max(new_dirs, key=lambda d: d.stat().st_mtime)
+                new_session_id = newest.name
+
+        if not new_session_id:
+            print("Warning: could not detect new Grok session — check ~/.grok/sessions/")
+            return
+
+        chat_id = f"grok:grok.sqlite:{new_session_id}"
+        Scheduler(store).force_discover()
+
+        print(f"chat_id: {chat_id}")
         print(f"workspace: {cwd}")
         print(f"goal: {args.goal}")
+
+        if getattr(args, "queue", False):
+            row = store.find_chat(new_session_id)
+            position = float(args.position) if getattr(args, "position", None) is not None else None
+            if row:
+                store.queue_add(row["id"], position)
+                store.set_goal(row["id"], args.goal, "user")
+                pos = store.row("select position from queue where chat_id=?", (row["id"],))
+                print(f"Added to queue at position {pos['position'] if pos else '?'}")
+            else:
+                print(f"Warning: use: autocode queue add {new_session_id} --goal ...")
     elif args.grok_cmd == "chats":
         from .providers.grok import GrokProvider
         chats = GrokProvider().discover()[: args.limit]
@@ -786,12 +843,11 @@ def cmd_drive(args: argparse.Namespace) -> None:
     if not row:
         raise SystemExit(f"No chat matched: {args.query}")
     store.set_goal(row["id"], args.goal, "user")
-    if args.priority:
-        store.add_priority(args.query, args.goal, args.rank, args.path, row["id"] if args.exact else "", args.lanes)
+    store.queue_add(row["id"])
     row = store.row("select * from chats where id=?", (row["id"],))
     job_id = None
     if args.no_start:
-        print(f"Goal attached: {row['alias']}")
+        print(f"Goal attached and queued: {row['alias']}")
         return
     sched = Scheduler(store)
     if not sched.has_active_job(row["id"]) and not sched.has_active_lease(row):
@@ -807,14 +863,6 @@ def cmd_drive(args: argparse.Namespace) -> None:
     print(f"goal: {args.goal}")
     if args.model and row["provider"] == "cursor":
         print(f"model: {args.model}")
-    if args.priority:
-        print(f"priority: p{args.rank}")
-        if args.path:
-            print(f"priority path: {args.path}")
-        if args.exact:
-            print(f"priority target: {row['id']}")
-        if args.lanes > 1:
-            print(f"priority lanes: {args.lanes}")
     print(f"job: {job_id or 'queued'}")
 
 
@@ -882,22 +930,99 @@ def cmd_discover(args: argparse.Namespace) -> None:
 
 def cmd_tick(args: argparse.Namespace) -> None:
     result = Scheduler(Store()).tick(dispatch=not args.dry_run, max_projects=args.max_projects)
+    if not args.dry_run:
+        grok_watchdog.request("tick_cli")
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def cmd_queue(args: argparse.Namespace) -> None:
     store = Store()
-    snap = store.row("select * from queue_snapshots order by created_at desc limit 1")
-    if not snap:
-        print("No queue snapshots yet.")
-        return
-    print(f"queue {snap['id']} {snap['created_at']} reason={snap['reason']} capacity={snap['capacity']} active={snap['active_jobs']}")
-    rows = store.rows("select * from queue_items where snapshot_id=? order by position limit ?", (snap["id"], args.limit))
-    for row in rows:
-        flag = "P" if row["priority_id"] else "-"
-        print(f"{row['position']:>2} {flag} {row['provider']:<11} {short(row['chat_id'])} state={row['state']}")
-        print(f"   resource: {compact(row['resource'], 120)}")
-        print(f"   objective: {compact(row['objective'], 160)}")
+    if args.queue_cmd == "list":
+        rows = store.queue_list()
+        stale = store.rows(
+            """
+            select q.position, q.chat_id, c.alias, c.title, c.provider, c.state, c.updated_at, c.objective
+            from queue q join chats c on c.id=q.chat_id
+            where c.done=1
+            order by q.position asc
+            """
+        )
+        if not rows and not stale:
+            print("Queue is empty.")
+            print("Add with: autocode queue add <chat-query> [--position N]")
+            return
+        active = store.rows("select chat_id from jobs where status='running'")
+        running_ids = {r["chat_id"] for r in active}
+        print(f"Active queue ({len(rows)} items):")
+        for r in rows:
+            pos = r["position"]
+            pos_str = f"#{int(pos)}" if pos == int(pos) else f"#{pos:.1f}"
+            state = r["state"]
+            is_running = r["chat_id"] in running_ids
+            flag = " [RUNNING]" if is_running else ""
+            title = r["alias"] or r["title"] or r["chat_id"]
+            print(f"  {pos_str:<6} {rel_time(r['updated_at']):>5}  {r['provider']:<11} {state:<13} {short(title)}{flag}")
+            if r["objective"]:
+                print(f"         goal: {compact(r['objective'], 160)}")
+        if stale:
+            print(f"\nDone but still in queue ({len(stale)} — run: autocode queue archive --all-done):")
+            for r in stale:
+                title = r["alias"] or r["title"] or r["chat_id"]
+                print(f"  - {r['provider']:<11} {short(title)}")
+    elif args.queue_cmd == "finished":
+        rows = store.queue_finished_list(args.limit)
+        if not rows:
+            print("Finished pile is empty.")
+            return
+        print(f"Finished ({len(rows)} items):")
+        for r in rows:
+            title = r["alias"] or r["chat_id"]
+            print(f"  {rel_time(r['archived_at']):>5}  {r['provider']:<11} {short(title)}  ({r['reason']})")
+            if r["objective"]:
+                print(f"         goal: {compact(r['objective'], 160)}")
+    elif args.queue_cmd == "archive":
+        if args.all_done:
+            archived = store.queue_archive_done()
+            if not archived:
+                print("No done chats left in the active queue.")
+                return
+            print(f"Archived {len(archived)} done chat(s) to the finished pile.")
+            return
+        row = store.find_chat(args.query)
+        if not row:
+            raise SystemExit(f"No chat matched: {args.query}")
+        if store.queue_archive(row["id"], reason=args.reason):
+            print(f"Archived to finished pile: {row['alias']}")
+        else:
+            print(f"Not in active queue: {row['alias']}")
+    elif args.queue_cmd == "add":
+        Scheduler(store).force_discover()
+        row = store.find_chat(args.query)
+        if not row:
+            raise SystemExit(f"No chat matched: {args.query}")
+        store.queue_add(row["id"], float(args.position) if args.position is not None else None)
+        if args.goal:
+            store.set_goal(row["id"], args.goal, "user")
+        pos = store.row("select position from queue where chat_id=?", (row["id"],))
+        print(f"Added to queue: {row['alias']}")
+        print(f"position: {pos['position'] if pos else '?'}")
+        if args.goal:
+            print(f"goal: {args.goal}")
+    elif args.queue_cmd == "remove":
+        row = store.find_chat(args.query)
+        if not row:
+            raise SystemExit(f"No chat matched: {args.query}")
+        removed = store.queue_remove(row["id"])
+        print(f"{'Removed from queue' if removed else 'Not in queue'}: {row['alias']}")
+    elif args.queue_cmd == "move":
+        row = store.find_chat(args.query)
+        if not row:
+            raise SystemExit(f"No chat matched: {args.query}")
+        moved = store.queue_move(row["id"], float(args.position))
+        if moved:
+            print(f"Moved {row['alias']} to position {args.position}")
+        else:
+            print(f"Not in queue: {row['alias']}")
 
 
 def cmd_audit(args: argparse.Namespace) -> None:
@@ -978,6 +1103,21 @@ def cmd_web(args: argparse.Namespace) -> None:
     run_web(args.host, args.port)
 
 
+def _shutdown_job_action(store: Store, reason: str) -> tuple[str, int]:
+    preserve = store.get_config("preserve_jobs_on_shutdown", "on" if DEFAULT_PRESERVE_JOBS_ON_SHUTDOWN else "off").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    runner = Scheduler(store).runner
+    if preserve:
+        count = runner.detach_all(reason)
+        return "detached", count
+    count = runner.kill_all(reason)
+    return "killed", count
+
+
 def cmd_daemon(args: argparse.Namespace) -> None:
     if args.daemon_cmd == "run":
         Daemon(args.interval).run()
@@ -988,16 +1128,18 @@ def cmd_daemon(args: argparse.Namespace) -> None:
         code, out, err = launchd_start()
         print((out + err).strip() or f"started ({code})")
     elif args.daemon_cmd == "stop":
-        killed = Scheduler(Store()).runner.kill_all("daemon_stop")
+        action, count = _shutdown_job_action(Store(), "daemon_stop")
         code, out, err = launchd_stop()
         print((out + err).strip() or f"stopped ({code})")
-        if killed:
-            print(f"killed {killed} running job(s)")
+        if count:
+            print(f"{action} {count} running job(s)")
     elif args.daemon_cmd == "restart":
-        Scheduler(Store()).runner.kill_all("daemon_restart")
+        action, count = _shutdown_job_action(Store(), "daemon_restart")
         launchd_stop()
         code, out, err = launchd_start()
         print((out + err).strip() or f"restarted ({code})")
+        if count:
+            print(f"{action} {count} running job(s)")
     elif args.daemon_cmd == "status":
         ok, text = launchd_status()
         print("loaded" if ok else "not loaded")
@@ -1062,7 +1204,7 @@ def build_parser() -> argparse.ArgumentParser:
     prl = prsub.add_parser("list"); prl.add_argument("--limit", type=int, default=20); prl.set_defaults(func=cmd_priority)
     pra = prsub.add_parser("add"); pra.add_argument("query"); pra.add_argument("--goal", required=True); pra.add_argument("--rank", type=int, default=100); pra.add_argument("--path", default=""); pra.add_argument("--chat-id", default=""); pra.add_argument("--exact", action="store_true"); pra.add_argument("--lanes", type=int, default=1); pra.set_defaults(func=cmd_priority)
     prr = prsub.add_parser("remove"); prr.add_argument("query"); prr.set_defaults(func=cmd_priority)
-    c = sub.add_parser("chats"); c.add_argument("--recent", default="24h"); c.add_argument("--limit", type=int, default=20); c.set_defaults(func=cmd_chats)
+    c = sub.add_parser("chats"); c.add_argument("--recent", default="30d"); c.add_argument("--limit", type=int, default=50); c.set_defaults(func=cmd_chats)
     cu = sub.add_parser("cursor")
     cusub = cu.add_subparsers(dest="cursor_cmd", required=True)
     cust = cusub.add_parser("status"); cust.set_defaults(func=cmd_cursor)
@@ -1073,14 +1215,14 @@ def build_parser() -> argparse.ArgumentParser:
     cune = cusub.add_parser("new"); cune.add_argument("--workspace", default=str(Path.home())); cune.add_argument("--goal", required=True); cune.add_argument("--model", default=""); cune.set_defaults(func=cmd_cursor)
     gr = sub.add_parser("grok")
     grsub = gr.add_subparsers(dest="grok_cmd", required=True)
-    grnew = grsub.add_parser("new"); grnew.add_argument("--workspace", default=str(Path.home())); grnew.add_argument("--goal", required=True); grnew.add_argument("--grok-message-ceiling", type=int, default=60, help="Internal Grok CLI message ceiling; AutoCode turns are interventions, not provider messages."); grnew.set_defaults(func=cmd_grok)
+    grnew = grsub.add_parser("new"); grnew.add_argument("--workspace", default=str(Path.home())); grnew.add_argument("--goal", required=True); grnew.add_argument("--grok-message-ceiling", type=int, default=60, help="Internal Grok CLI message ceiling; AutoCode turns are interventions, not provider messages."); grnew.add_argument("--queue", action="store_true", help="Add to autocode queue after creation"); grnew.add_argument("--position", type=float, default=None, help="Queue position (lower = higher priority)"); grnew.set_defaults(func=cmd_grok)
     grch = grsub.add_parser("chats"); grch.add_argument("--limit", type=int, default=30); grch.set_defaults(func=cmd_grok)
     ag = sub.add_parser("antigravity")
     agsub = ag.add_subparsers(dest="antigravity_cmd", required=True)
     agst = agsub.add_parser("status"); agst.set_defaults(func=cmd_antigravity)
     agch = agsub.add_parser("chats"); agch.add_argument("--limit", type=int, default=30); agch.set_defaults(func=cmd_antigravity)
     agnew = agsub.add_parser("new"); agnew.add_argument("--goal", required=True); agnew.set_defaults(func=cmd_antigravity)
-    d = sub.add_parser("drive"); d.add_argument("query"); d.add_argument("--goal", required=True); d.add_argument("--no-start", action="store_true"); d.add_argument("--priority", action="store_true"); d.add_argument("--rank", type=int, default=100); d.add_argument("--path", default=""); d.add_argument("--exact", action="store_true"); d.add_argument("--lanes", type=int, default=1); d.add_argument("--model", default="", help="Cursor-only per-send model override, e.g. auto or composer-2.5"); d.set_defaults(func=cmd_drive)
+    d = sub.add_parser("drive"); d.add_argument("query"); d.add_argument("--goal", required=True); d.add_argument("--no-start", action="store_true"); d.add_argument("--model", default="", help="Cursor-only per-send model override, e.g. auto or composer-2.5"); d.set_defaults(func=cmd_drive)
     sq = sub.add_parser("squad")
     sqsub = sq.add_subparsers(dest="squad_cmd", required=True)
     sqp = sqsub.add_parser("plan"); sqp.add_argument("query"); sqp.set_defaults(func=cmd_squad)
@@ -1093,7 +1235,14 @@ def build_parser() -> argparse.ArgumentParser:
     doc = sub.add_parser("doctor"); doc.set_defaults(func=cmd_doctor)
     disc = sub.add_parser("discover"); disc.set_defaults(func=cmd_discover)
     tick = sub.add_parser("tick"); tick.add_argument("--dry-run", action="store_true"); tick.add_argument("--max-projects", type=int, default=None); tick.set_defaults(func=cmd_tick)
-    q = sub.add_parser("queue"); q.add_argument("--limit", type=int, default=20); q.set_defaults(func=cmd_queue)
+    q = sub.add_parser("queue")
+    qsub = q.add_subparsers(dest="queue_cmd", required=True)
+    ql = qsub.add_parser("list"); ql.set_defaults(func=cmd_queue)
+    qf = qsub.add_parser("finished"); qf.add_argument("--limit", type=int, default=30); qf.set_defaults(func=cmd_queue)
+    qarch = qsub.add_parser("archive"); qarch.add_argument("query", nargs="?", default=""); qarch.add_argument("--all-done", action="store_true", help="archive every done chat still in the active queue"); qarch.add_argument("--reason", default="done"); qarch.set_defaults(func=cmd_queue)
+    qa = qsub.add_parser("add"); qa.add_argument("query"); qa.add_argument("--position", type=float, default=None, help="queue position (float; lower = higher priority)"); qa.add_argument("--goal", default="", help="optional goal to attach"); qa.set_defaults(func=cmd_queue)
+    qr = qsub.add_parser("remove"); qr.add_argument("query"); qr.set_defaults(func=cmd_queue)
+    qm = qsub.add_parser("move"); qm.add_argument("query"); qm.add_argument("position", type=float); qm.set_defaults(func=cmd_queue)
     au = sub.add_parser("audit"); au.add_argument("--limit", type=int, default=40); au.add_argument("--raw", action="store_true"); au.add_argument("--replay", action="store_true"); au.set_defaults(func=cmd_audit)
     plug = sub.add_parser("plugins")
     plugsub = plug.add_subparsers(dest="plugins_cmd", required=True)

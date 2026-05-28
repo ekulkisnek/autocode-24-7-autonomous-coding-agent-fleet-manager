@@ -20,8 +20,10 @@ class ClaudeProvider(Provider):
         chats: list[Chat] = []
         files = sorted(self.root.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
         for path in files:
-            text = read_text(path, limit=24000)
-            first, latest = self._summarize(text)
+            head = self._read_head(path, 32000)
+            tail = read_text(path, limit=24000)
+            first = self._first_user_msg(head)
+            latest = self._latest_text(tail)
             workspace = self._workspace(path.parent.name)
             sid = path.stem
             chats.append(Chat(
@@ -33,19 +35,66 @@ class ClaudeProvider(Provider):
                 cwd=workspace,
                 updated_at=iso_from_ts(path.stat().st_mtime),
                 latest_text=latest[-6000:],
-                transcript_hash=sha(text),
+                transcript_hash=sha(tail),
                 alias=slug(f"{Path(workspace).name} {first or sid}", sid),
                 continuation="claude --resume",
                 metadata={"file": str(path)},
             ))
         return chats
 
+    def _read_head(self, path: Path, limit: int) -> str:
+        try:
+            with path.open("rb") as f:
+                return f.read(limit).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
     def _workspace(self, encoded: str) -> str:
         return "/" + encoded[1:].replace("-", "/") if encoded.startswith("-") else encoded.replace("-", "/")
 
-    def _summarize(self, text: str) -> tuple[str, str]:
-        first = ""
-        latest = []
+    def _first_user_msg(self, text: str) -> str:
+        skip_prefixes = (
+            "<local-command-caveat>",
+            "<system-reminder>",
+        )
+        continuation_prefix = "This session is being continued"
+        continuation_title = ""
+        for line in text.splitlines():
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get("type") != "user":
+                continue
+            msg = obj.get("message") or {}
+            raw = msg.get("content") or ""
+            content = self._extract_text(raw)
+            if not content:
+                continue
+            if any(content.startswith(p) for p in skip_prefixes):
+                continue
+            if content.startswith(continuation_prefix):
+                if not continuation_title:
+                    continuation_title = self._title_from_summary(content)
+                continue
+            return content
+        return continuation_title
+
+    def _title_from_summary(self, continuation_text: str) -> str:
+        # Try "Explicit requests this session:" bullets first — most specific
+        for marker in ("Explicit requests this session:", "Primary Request and Intent:", "Summary:"):
+            idx = continuation_text.find(marker)
+            if idx == -1:
+                continue
+            snippet = continuation_text[idx + len(marker):]
+            for line in snippet.splitlines():
+                stripped = line.strip().lstrip("- •").strip()
+                if stripped and not stripped.startswith("("):
+                    return stripped[:140]
+        return ""
+
+    def _latest_text(self, text: str) -> str:
+        parts: list[str] = []
         for line in text.splitlines():
             try:
                 obj = json.loads(line)
@@ -53,14 +102,17 @@ class ClaudeProvider(Provider):
                 continue
             typ = obj.get("type")
             msg = obj.get("message") or {}
-            content = msg.get("content") or obj.get("content") or ""
-            if isinstance(content, list):
-                content = " ".join(str(x.get("text") if isinstance(x, dict) else x) for x in content)
-            if typ == "user" and not first and content:
-                first = str(content)
-            if content:
-                latest.append(str(content))
-        return first, "\n".join(latest[-12:])
+            raw = msg.get("content") or obj.get("content") or ""
+            content = self._extract_text(raw)
+            if typ in {"user", "assistant"} and content:
+                parts.append(content)
+        return "\n".join(parts[-12:])
+
+    def _extract_text(self, raw) -> str:
+        if isinstance(raw, list):
+            parts = [x["text"] for x in raw if isinstance(x, dict) and x.get("type") == "text" and x.get("text")]
+            return " ".join(parts)
+        return str(raw) if raw else ""
 
     def continue_plan(self, chat: Chat, prompt: str, job_dir: Path) -> ContinuePlan:
         cwd = chat.cwd if chat.cwd and Path(chat.cwd).exists() else str(HOME)

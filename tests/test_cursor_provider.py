@@ -107,6 +107,7 @@ def test_cursor_provider_reads_ide_and_cloud_composers(tmp_path: Path):
 def test_cursor_cli_continue_uses_cursor_agent_resume(tmp_path: Path):
     provider = CursorProvider()
     provider._cursor_api_key = lambda: "secret"
+    provider.cursor_model = lambda: "auto"
     chat = Chat(
         id="cursor:cursor.cli:agent-123",
         provider="cursor",
@@ -131,6 +132,7 @@ def test_cursor_cli_continue_uses_cursor_agent_resume(tmp_path: Path):
 def test_cursor_cloud_continue_uses_api_followup(tmp_path: Path):
     provider = CursorProvider()
     provider._cursor_api_key = lambda: "secret"
+    provider.cursor_model = lambda: "auto"
     chat = Chat(
         id="cursor:cursor.cloud:bc-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         provider="cursor",

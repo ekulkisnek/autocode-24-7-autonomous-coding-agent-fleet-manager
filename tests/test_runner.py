@@ -114,6 +114,82 @@ def test_runner_assesses_stdout_completion_without_prompt_stderr_noise(tmp_path:
     assert priority["status"] == "complete"
 
 
+def test_runner_resets_failure_count_after_worked_turn(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    chat = Chat(
+        id="codex:codex.rollout:redwallet",
+        provider="codex",
+        source="codex.rollout",
+        provider_chat_id="redwallet",
+        title="Implement wallet persistence",
+        cwd="/tmp/redwallet",
+        updated_at="2026-05-21T00:00:00-05:00",
+        latest_text="work",
+        transcript_hash="h1",
+        alias="redwallet",
+        continuation="codex exec resume",
+    )
+    store.upsert_chat(chat, 5, "active", "Keep driving until production ready.")
+    with store.connect() as con:
+        con.execute("update chats set failure_count=6 where id=?", (chat.id,))
+
+    job_dir = tmp_path / "job-worked"
+    job_dir.mkdir()
+    stdout = job_dir / "stdout.txt"
+    stderr = job_dir / "stderr.txt"
+    stdout.write_text("FLEET_MILESTONE: {\"status\":\"active\",\"summary\":\"still working\",\"next_action\":\"continue\"}\n", encoding="utf-8")
+    stderr.write_text("", encoding="utf-8")
+    with store.connect() as con:
+        con.execute(
+            """
+            insert into jobs(id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,created_at,updated_at)
+            values(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "job-worked",
+                chat.id,
+                "codex",
+                "running",
+                0,
+                "/tmp/redwallet",
+                "[]",
+                "prompt",
+                str(stdout),
+                str(stderr),
+                now_iso(),
+                now_iso(),
+            ),
+        )
+
+    JobRunner(store).refresh()
+
+    row = store.row("select * from chats where id=?", (chat.id,))
+    assert row["failure_count"] == 0
+    assert row["state"] == "active"
+    assert row["done"] == 0
+
+
+def test_runner_reconciles_idle_running_chat_without_job(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    chat = Chat(
+        id="codex:codex.rollout:redwallet",
+        provider="codex",
+        source="codex.rollout",
+        provider_chat_id="redwallet",
+        title="Implement wallet persistence",
+        cwd="/tmp/redwallet",
+        updated_at="2026-05-21T00:00:00-05:00",
+        latest_text="work",
+        transcript_hash="h1",
+        alias="redwallet",
+        continuation="codex exec resume",
+    )
+    store.upsert_chat(chat, 5, "running", "Keep driving.")
+    JobRunner(store).refresh()
+    row = store.row("select * from chats where id=?", (chat.id,))
+    assert row["state"] == "active"
+
+
 def test_runner_marks_quiet_cursor_job_with_child_processes_as_external_activity(tmp_path: Path, monkeypatch):
     store = Store(tmp_path / "autocode.sqlite")
     job_id = insert_running_job(store, tmp_path)
@@ -276,6 +352,37 @@ def test_runner_records_marker_usage_and_plan(tmp_path: Path):
     assert job["token_output"] == 5
     assert job["cost_estimate"] == 0.01
     assert "A" in store.task_plan_summary(chat.id)
+
+
+def test_runner_detach_all_leaves_processes_running(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    runner = JobRunner(store)
+    job_id = insert_running_job(store, tmp_path, pid=4242)
+    terminated: list[int] = []
+    monkeypatch.setattr(runner, "_terminate", lambda pid: terminated.append(pid))
+
+    count = runner.detach_all("daemon_shutdown")
+    row = store.row("select * from jobs where id=?", (job_id,))
+
+    assert count == 1
+    assert terminated == []
+    assert row["status"] == "detached"
+    assert row["evidence_reason"] == "daemon_shutdown"
+
+
+def test_runner_reattach_detached_running_job(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    runner = JobRunner(store)
+    job_id = insert_running_job(store, tmp_path, pid=5151)
+    runner.detach_all("daemon_shutdown")
+    monkeypatch.setattr(runner, "_pid_running", lambda pid: pid == 5151)
+
+    count = runner.reattach_detached()
+    row = store.row("select * from jobs where id=?", (job_id,))
+
+    assert count == 1
+    assert row["status"] == "running"
+    assert "reattached_after_daemon_restart" in row["evidence_reason"]
 
 
 def test_runner_prepares_worktree_when_enabled(tmp_path: Path, monkeypatch):
