@@ -1,14 +1,30 @@
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
+from pathlib import Path
 from sqlite3 import Row
 
-from .config import DEFAULT_MIN_OUTPUT_CHARS, DEFAULT_REQUIRE_FLEET_DONE
+from .config import (
+    DEFAULT_GOAL_OVERDELIVERY_COUNT,
+    DEFAULT_MIN_OUTPUT_CHARS,
+    DEFAULT_OVERDELIVERY_WINDOW_SECONDS,
+    DEFAULT_REQUIRE_FLEET_DONE,
+)
 from .markers import parse_fleet_marker
 from .policy import FLEET_DONE_MARKER, OutputAssessment, assess_output_state
-from pathlib import Path
-
 from .store import Store
-from .util import now_iso, read_text
+from .util import now_iso, now_ts, read_text
+
+TXID_EVIDENCE = re.compile(
+    r"\b(?:txid|tx=)\s*[:=]?\s*([0-9a-f]{64})\b",
+    re.I,
+)
+DEPLOYMENT_ACTIVE = re.compile(
+    r"\b(?:simplicity|deployment)\b.{0,80}\b(?:active\s*=\s*true|status\s*=\s*active)\b",
+    re.I,
+)
+MINED_IN_BLOCK = re.compile(r"\b(?:in_block\s*=\s*true|mined\s+(?:height|in\s+block)|confirmations?\s*=\s*[1-9])\b", re.I)
 
 
 def require_fleet_done(store: Store) -> bool:
@@ -95,7 +111,8 @@ def should_reopen_done_chat(store: Store, chat_id: str) -> bool:
     if not objective:
         return False
     if store.row("select 1 from queue where chat_id=?", (chat_id,)):
-        return True
+        verified, _ = verify_goal_complete(store, objective, last_job_output(store, chat_id))
+        return not verified
     if store.row("select 1 from queue_finished where chat_id=?", (chat_id,)):
         verified, _ = verify_goal_complete(store, objective, last_job_output(store, chat_id))
         return not verified
@@ -126,6 +143,203 @@ def reopen_chat_for_goal(store: Store, chat_id: str, *, reason: str) -> bool:
     store.event("goal_reopened", chat_id, reason=reason)
     store.queue_bump_front(chat_id)
     return True
+
+
+@dataclass(frozen=True)
+class OverdeliveryResult:
+    chat_id: str
+    reason: str
+    evidence_keys: tuple[str, ...]
+
+
+def goal_evidence_keys(objective: str, output: str) -> frozenset[str]:
+    """Stable evidence fingerprints for repeated-success / churn detection."""
+    text = output or ""
+    keys: set[str] = set()
+    marker = parse_fleet_marker(text)
+    if marker and marker.kind == "FLEET_DONE":
+        keys.add("fleet_done")
+    elif FLEET_DONE_MARKER.search(text):
+        keys.add("fleet_done")
+    for match in TXID_EVIDENCE.finditer(text):
+        keys.add(f"txid:{match.group(1).lower()}")
+    if DEPLOYMENT_ACTIVE.search(text):
+        keys.add("deployment_active")
+    if MINED_IN_BLOCK.search(text):
+        keys.add("mined_confirmed")
+    goal = (objective or "").lower()
+    if "0xbe" in goal or "simplicity" in goal:
+        if re.search(r"\b0xbe\b|tapsimplicity", text, re.I):
+            keys.add("simplicity_0xbe")
+    if "authentication" in goal or "cursor" in goal and "sync" in goal:
+        if re.search(r"\bhandoff\b|\bper-chat\b|\bmanual\b", text, re.I):
+            keys.add("cursor_handoff_doc")
+    return frozenset(keys)
+
+
+def detect_overdelivery(store: Store, chat_id: str) -> OverdeliveryResult | None:
+    """Detect goals already satisfied but still looping (repeated proof, worked churn)."""
+    chat = store.row("select * from chats where id=?", (chat_id,))
+    if not chat or int(chat["done"] or 0) or int(chat["paused"] or 0):
+        return None
+    objective = str(chat["objective"] or "").strip()
+    if not objective:
+        return None
+
+    window_sec = DEFAULT_OVERDELIVERY_WINDOW_SECONDS
+    since = now_ts() - window_sec
+    jobs = store.rows(
+        """
+        select id,evidence_status,marker_kind,stdout_path,stderr_path,created_at,updated_at
+        from jobs
+        where chat_id=? and status in ('completed','failed','killed')
+          and evidence_status='worked'
+        order by updated_at desc
+        limit 50
+        """,
+        (chat_id,),
+    )
+    if len(jobs) < DEFAULT_GOAL_OVERDELIVERY_COUNT:
+        return None
+
+    recent_in_window = [j for j in jobs if _job_ts(j) >= since]
+    if len(recent_in_window) < DEFAULT_GOAL_OVERDELIVERY_COUNT:
+        return None
+
+    proofs: list[frozenset[str]] = []
+    verified_outputs: list[str] = []
+    for job in recent_in_window:
+        text = _job_output_text(job)
+        if not text.strip():
+            continue
+        keys = goal_evidence_keys(objective, text)
+        if keys:
+            proofs.append(keys)
+        ok, _ = verify_goal_complete(store, objective, text)
+        if ok:
+            verified_outputs.append(text)
+
+    if len(verified_outputs) >= DEFAULT_GOAL_OVERDELIVERY_COUNT:
+        keys = goal_evidence_keys(objective, verified_outputs[0])
+        return OverdeliveryResult(
+            chat_id,
+            f"{len(verified_outputs)} verified completions in {window_sec // 60}m",
+            tuple(sorted(keys)),
+        )
+
+    if len(recent_in_window) >= 5 and proofs:
+        stable = proofs[0]
+        if all(p & stable for p in proofs[:DEFAULT_GOAL_OVERDELIVERY_COUNT]):
+            if stable & {"fleet_done", "txid"} or stable & {"fleet_done", "deployment_active"}:
+                return OverdeliveryResult(
+                    chat_id,
+                    f"worked churn ({len(recent_in_window)} jobs) with stable evidence {sorted(stable)[:3]}",
+                    tuple(sorted(stable)),
+                )
+    return None
+
+
+def _job_ts(job: Row) -> float:
+    from .util import parse_ts
+
+    return max(parse_ts(job["updated_at"]), parse_ts(job["created_at"]))
+
+
+def _job_output_text(job: Row) -> str:
+    out = Path(str(job["stdout_path"] or ""))
+    err = Path(str(job["stderr_path"] or ""))
+    text = read_text(out, limit=12000) if out.exists() else ""
+    if not text.strip() and err.exists():
+        text = read_text(err, limit=4000)
+    return text
+
+
+def mark_goal_complete(
+    store: Store,
+    chat_id: str,
+    reason: str,
+    *,
+    kill_running: bool = True,
+    archive: bool = True,
+) -> bool:
+    """Mark chat goal complete, optionally kill redundant loop job and archive queue."""
+    row = store.row("select * from chats where id=?", (chat_id,))
+    if not row:
+        return False
+    if int(row["done"] or 0) and not store.row("select 1 from queue where chat_id=?", (chat_id,)):
+        return False
+    if kill_running:
+        from .runner import JobRunner
+
+        JobRunner(store).kill_chat_jobs(chat_id, "goal_overdelivery")
+    with store.connect() as con:
+        con.execute(
+            "update chats set done=1,state='done',failure_count=0,last_evidence_at=? where id=?",
+            (now_iso(), chat_id),
+        )
+        con.execute(
+            "update goals set status='complete',updated_at=? where chat_id=? and status!='complete'",
+            (now_iso(), chat_id),
+        )
+        con.execute(
+            "update project_priorities set status='complete',updated_at=? where target_chat_id=? and status='active'",
+            (now_iso(), chat_id),
+        )
+    if archive:
+        store.queue_archive(chat_id, reason="overdelivery")
+    store.event("goal_auto_complete", chat_id, reason=reason[:500])
+    return True
+
+
+def auto_complete_overdelivery(store: Store) -> list[str]:
+    """Scan active queue chats and complete those that over-delivered."""
+    completed: list[str] = []
+    rows = store.rows(
+        """
+        select c.id from chats c
+        join queue q on q.chat_id=c.id
+        where c.done=0 and c.paused=0
+        """
+    )
+    for row in rows:
+        chat_id = str(row["id"])
+        hit = detect_overdelivery(store, chat_id)
+        if not hit:
+            continue
+        if mark_goal_complete(store, chat_id, hit.reason):
+            completed.append(chat_id)
+    return completed
+
+
+def reconcile_done_still_in_queue(store: Store) -> list[str]:
+    """Archive done chats still on the active queue when last job verifies the goal."""
+    rows = store.rows(
+        """
+        select c.id, c.objective from chats c
+        join queue q on q.chat_id=c.id
+        where c.done=1 and c.paused=0
+        """
+    )
+    archived: list[str] = []
+    for row in rows:
+        chat_id = str(row["id"])
+        if store.row("select 1 from goals where chat_id=? and status='active'", (chat_id,)):
+            continue
+        if store.row(
+            "select 1 from project_priorities where target_chat_id=? and status='active'",
+            (chat_id,),
+        ):
+            continue
+        objective = str(row["objective"] or "").strip()
+        output = last_job_output(store, chat_id)
+        if objective and output:
+            ok, _ = verify_goal_complete(store, objective, output)
+            if not ok:
+                continue
+        if store.queue_archive(chat_id, reason="done_verified"):
+            archived.append(chat_id)
+            store.event("queue_auto_archive", chat_id, reason="done_verified")
+    return archived
 
 
 def reconcile_false_done_chats(store: Store) -> int:

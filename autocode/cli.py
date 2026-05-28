@@ -922,6 +922,27 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     else:
         print("- launchd not loaded; run `autocode daemon install` then `autocode daemon start`")
 
+    if getattr(args, "auto_fix", False):
+        from . import goals
+        from . import remediation
+        from .fleet_report import needs_luke_summary
+
+        Scheduler(store).runner.refresh()
+        archived = goals.reconcile_done_still_in_queue(store)
+        archived.extend(store.queue_archive_done())
+        result = remediation.remediation_pass(store)
+        result["queue_archived"] = archived
+        print("- auto-fix pass:")
+        for key in ("overdelivery_completed", "queue_archived", "remediated", "decomposed"):
+            items = result.get(key) or []
+            if items:
+                print(f"  {key}: {len(items)}")
+                for chat_id in items[:5]:
+                    row = store.row("select alias from chats where id=?", (chat_id,))
+                    print(f"    - {row['alias'] if row else chat_id}")
+        needs = needs_luke_summary(store)
+        print(f"- needs Luke after auto-fix: {needs}")
+
 
 def cmd_discover(args: argparse.Namespace) -> None:
     stats = Scheduler(Store()).force_discover()
@@ -1232,7 +1253,9 @@ def build_parser() -> argparse.ArgumentParser:
     pa = sub.add_parser("pause"); pa.add_argument("query"); pa.set_defaults(func=cmd_pause)
     dn = sub.add_parser("done"); dn.add_argument("query"); dn.set_defaults(func=cmd_done)
     l = sub.add_parser("logs"); l.add_argument("--lines", type=int, default=80); l.set_defaults(func=cmd_logs)
-    doc = sub.add_parser("doctor"); doc.set_defaults(func=cmd_doctor)
+    doc = sub.add_parser("doctor")
+    doc.add_argument("--auto-fix", action="store_true", help="run remediation pass on live DB")
+    doc.set_defaults(func=cmd_doctor)
     disc = sub.add_parser("discover"); disc.set_defaults(func=cmd_discover)
     tick = sub.add_parser("tick"); tick.add_argument("--dry-run", action="store_true"); tick.add_argument("--max-projects", type=int, default=None); tick.set_defaults(func=cmd_tick)
     q = sub.add_parser("queue")

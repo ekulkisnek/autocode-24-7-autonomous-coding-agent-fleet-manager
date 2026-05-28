@@ -13,6 +13,7 @@ from .config import (
 )
 from . import goals
 from . import recovery
+from . import remediation
 from .discovery import discover
 from .models import Chat
 from .models import ContinuePlan
@@ -37,8 +38,11 @@ class Scheduler:
         self.runner.refresh()
         from . import goals
 
+        queue_archived = goals.reconcile_done_still_in_queue(self.store)
         reopened = goals.reconcile_false_done_chats(self.store)
-        self.store.queue_archive_done()
+        auto_fix = remediation.remediation_pass(self.store)
+        queue_archived.extend(self.store.queue_archive_done())
+        auto_fix["queue_archived"] = queue_archived
         unstuck = recovery.reconcile_killed_chats(self.store)
         stale_leases = self.cleanup_stale_leases()
         discovery_reason = self._maybe_discover()
@@ -75,6 +79,7 @@ class Scheduler:
             "stale_leases": stale_leases,
             "recovery_unstuck": unstuck,
             "goal_reopened": reopened,
+            "auto_fix": auto_fix,
         }
 
     def _maybe_discover(self) -> str:
@@ -299,6 +304,21 @@ class Scheduler:
         prior = self.store.last_job_turn_context(str(row["id"]))
         if prior:
             data["prior_job_context"] = prior
+        from .util import json_loads
+
+        meta = json_loads(str(data.get("metadata_json") or ""), {})
+        if isinstance(meta, dict):
+            prefix = meta.get("remediation_prompt_prefix")
+            if prefix:
+                data["prior_job_context"] = str(prefix) + (data.get("prior_job_context") or "")
+                meta.pop("remediation_prompt_prefix", None)
+                from .util import json_dumps
+
+                with self.store.connect() as con:
+                    con.execute(
+                        "update chats set metadata_json=? where id=?",
+                        (json_dumps(meta), row["id"]),
+                    )
 
         class PromptRow(dict):
             def keys(self):
