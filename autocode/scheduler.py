@@ -174,7 +174,7 @@ class Scheduler:
                     seen.add(str(row["id"]))
         ready: list[Row] = []
         for row in rows:
-            if int(row["done"] or 0) and goals.chat_has_active_goal(self.store, str(row["id"])):
+            if int(row["done"] or 0) and goals.should_reopen_done_chat(self.store, str(row["id"])):
                 goals.reopen_chat_for_goal(self.store, str(row["id"]), reason="candidate_self_heal")
                 refreshed = self.store.row(
                     """
