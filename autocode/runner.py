@@ -61,7 +61,8 @@ class JobRunner:
             plan=plan,
             prompt=prompt,
             job_dir=job_dir,
-            lease_resource=self.resource_for(row),
+            repo_resource=self.resource_for(row),
+            lease_resource=self.lease_resource_for(row),
             queue_snapshot_id=queue_snapshot_id,
         )
 
@@ -91,6 +92,7 @@ class JobRunner:
         plan: ContinuePlan,
         prompt: str,
         job_dir: Path | None = None,
+        repo_resource: str = "",
         lease_resource: str = "",
         queue_snapshot_id: str = "",
     ) -> str:
@@ -108,7 +110,7 @@ class JobRunner:
         env.update(plan.env or {})
         cwd = plan.cwd if plan.cwd and Path(plan.cwd).exists() else (cwd if cwd and Path(cwd).exists() else str(HOME))
         worktree_path = ""
-        if self._use_worktree(lease_resource, cwd):
+        if self._use_worktree(repo_resource or lease_resource, cwd):
             wt = self._prepare_worktree(cwd, job_id)
             if wt:
                 cwd = str(wt)
@@ -254,6 +256,14 @@ class JobRunner:
             return self._resource_from_path(priority_resource)
         return self._resource_from_path(row["cwd"] or "") or row["id"]
 
+    def lease_resource_for(self, row: Row) -> str:
+        """Per-chat lease key so distinct queued chats on one repo can run in parallel."""
+        base = self.resource_for(row)
+        chat_id = str(row["id"] or "")
+        if base and chat_id:
+            return f"{base}::{chat_id}"
+        return chat_id or base
+
     def _resource_from_path(self, value: str) -> str:
         if not value:
             return ""
@@ -326,11 +336,14 @@ class JobRunner:
         completed = ""
         archive_chat_id: str | None = None
         pending_goal_retry: tuple[str, str, str] | None = None
+        release_lease = False
         if running and not (out_size or err_size):
             activity = self._process_tree_snapshot(pid)
             if activity.has_activity():
                 evidence_status = "running_external_activity" if activity.is_recent_or_busy(stall_seconds) else "running_external_idle"
                 evidence_reason = f"{evidence_reason}; {activity.summary()}"
+                if evidence_status == "running_external_idle":
+                    release_lease = True
             elif age > stall_seconds:
                 evidence_status = "running_silent"
                 evidence_reason = f"{evidence_reason}; no output or child process activity for {int(age)}s"
@@ -367,6 +380,8 @@ class JobRunner:
                 """,
                 (status, now_iso(), completed, completed, evidence_status, evidence_reason, out_size, err_size, job["id"]),
             )
+            if release_lease:
+                con.execute("delete from leases where job_id=?", (job["id"],))
             if status != "running":
                 con.execute("delete from leases where job_id=?", (job["id"],))
                 chat = con.execute("select * from chats where id=?", (job["chat_id"],)).fetchone()

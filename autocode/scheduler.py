@@ -24,6 +24,9 @@ from .store import Store
 from .util import disk_free_gb, load1, memory_free_percent
 from .watchers import watch_signature
 
+# Jobs waiting on an external desktop agent should not consume dispatch slots or repo leases.
+DISPATCH_SLOT_EXCLUDED_EVIDENCE = frozenset({"running_external_idle"})
+
 
 class Scheduler:
     def __init__(self, store: Store):
@@ -39,7 +42,7 @@ class Scheduler:
         unstuck = recovery.reconcile_killed_chats(self.store)
         stale_leases = self.cleanup_stale_leases()
         discovery_reason = self._maybe_discover()
-        active = self.active_job_count()
+        active = self.dispatch_active_job_count()
         cap = self.capacity()
         limit = max(0, min(max_projects or cap, cap) - active)
         sent: list[str] = []
@@ -137,6 +140,19 @@ class Scheduler:
         row = self.store.row("select count(*) c from jobs where status='running'")
         return int(row["c"] if row else 0)
 
+    def dispatch_active_job_count(self) -> int:
+        """Running jobs that occupy a worker slot for new dispatches."""
+        placeholders = ",".join("?" * len(DISPATCH_SLOT_EXCLUDED_EVIDENCE))
+        row = self.store.row(
+            f"""
+            select count(*) c from jobs
+            where status='running'
+              and coalesce(evidence_status, '') not in ({placeholders})
+            """,
+            tuple(DISPATCH_SLOT_EXCLUDED_EVIDENCE),
+        )
+        return int(row["c"] if row else 0)
+
     def candidates(self, limit: int) -> list[Row]:
         cap = DEFAULT_MAX_FAILURE_COUNT + 4
         rows = self.store.rows(
@@ -203,10 +219,10 @@ class Scheduler:
         return int(row["c"] if row else 0) > 0
 
     def has_active_lease(self, row: Row) -> bool:
-        resource = self.runner.resource_for(row)
+        resource = self.runner.lease_resource_for(row)
         lease = self.store.row(
             """
-            select l.*,j.status job_status,j.pid job_pid
+            select l.*,j.status job_status,j.pid job_pid,j.evidence_status
             from leases l left join jobs j on j.id=l.job_id
             where l.resource=?
             """,
@@ -215,6 +231,9 @@ class Scheduler:
         if not lease:
             return False
         if lease["job_status"] == "running":
+            evidence = str(lease["evidence_status"] or "")
+            if evidence in DISPATCH_SLOT_EXCLUDED_EVIDENCE:
+                return False
             return True
         with self.store.connect() as con:
             con.execute("delete from leases where resource=?", (resource,))
