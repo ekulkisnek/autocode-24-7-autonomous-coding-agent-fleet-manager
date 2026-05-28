@@ -4,7 +4,14 @@ import time
 from pathlib import Path
 from sqlite3 import Row
 
-from .config import DEFAULT_ACTIVE_DISCOVERY_INTERVAL, DEFAULT_IDLE_DISCOVERY_INTERVAL, DEFAULT_MAX_ACTIVE, HOME
+from .config import (
+    DEFAULT_ACTIVE_DISCOVERY_INTERVAL,
+    DEFAULT_IDLE_DISCOVERY_INTERVAL,
+    DEFAULT_MAX_ACTIVE,
+    DEFAULT_MAX_FAILURE_COUNT,
+    HOME,
+)
+from . import recovery
 from .discovery import discover
 from .models import Chat
 from .models import ContinuePlan
@@ -12,7 +19,7 @@ from .policy import build_prompt
 from .providers import provider_map
 from .runner import JobRunner
 from .store import Store
-from .util import disk_free_gb, load1, memory_free_percent, now_iso, parse_ts
+from .util import disk_free_gb, load1, memory_free_percent
 from .watchers import watch_signature
 
 
@@ -23,9 +30,10 @@ class Scheduler:
 
     def tick(self, dispatch: bool = True, max_projects: int | None = None) -> dict:
         self.runner.refresh()
+        self.store.queue_archive_done()
+        unstuck = recovery.reconcile_killed_chats(self.store)
         stale_leases = self.cleanup_stale_leases()
         discovery_reason = self._maybe_discover()
-        self.enforce_priority_invariants()
         active = self.active_job_count()
         cap = self.capacity()
         limit = max(0, min(max_projects or cap, cap) - active)
@@ -55,6 +63,7 @@ class Scheduler:
             "candidates": len(queued),
             "queue_snapshot": snapshot_id,
             "stale_leases": stale_leases,
+            "recovery_unstuck": unstuck,
         }
 
     def _maybe_discover(self) -> str:
@@ -80,58 +89,7 @@ class Scheduler:
     def force_discover(self) -> dict[str, int]:
         stats = discover(self.store)
         self.store.set_config("last_discovery_ts", str(time.time()))
-        self.enforce_priority_invariants()
         return stats
-
-    def enforce_priority_invariants(self) -> int:
-        """Keep active pinned priorities schedulable in their exact target chat."""
-        priorities = self.store.rows(
-            """
-            select * from project_priorities
-            where status='active' and target_chat_id!=''
-            """
-        )
-        repaired = 0
-        with self.store.connect() as con:
-            for p in priorities:
-                row = con.execute("select * from chats where id=?", (p["target_chat_id"],)).fetchone()
-                if not row:
-                    continue
-                state = "running" if row["state"] == "running" else "active"
-                if row["done"] or row["paused"] or not row["adopted"] or row["state"] not in {"active", "running", "stalled", "needs_input"}:
-                    repaired += 1
-                con.execute(
-                    """
-                    update chats
-                    set adopted=1,paused=0,done=0,state=?,objective=?,
-                      coding_score=max(coding_score, 1)
-                    where id=?
-                    """,
-                    (state, p["objective"], p["target_chat_id"]),
-                )
-                con.execute(
-                    """
-                    insert into goals(id,chat_id,objective,status,source,created_at,updated_at)
-                    values(?,?,?,?,?,?,?)
-                    on conflict(id) do update set objective=excluded.objective,status='active',updated_at=excluded.updated_at
-                    """,
-                    (
-                        f"priority:{p['id']}",
-                        p["target_chat_id"],
-                        p["objective"],
-                        "active",
-                        "priority",
-                        now_iso(),
-                        now_iso(),
-                    ),
-                )
-                con.execute(
-                    "update goals set status='superseded',updated_at=? where chat_id=? and status='active' and id!=?",
-                    (now_iso(), p["target_chat_id"], f"priority:{p['id']}"),
-                )
-        if repaired:
-            self.store.event("priority_invariants_repaired", repaired=repaired)
-        return repaired
 
     def capacity(self) -> int:
         configured = int(self.store.get_config("max_active", str(DEFAULT_MAX_ACTIVE)) or DEFAULT_MAX_ACTIVE)
@@ -159,96 +117,33 @@ class Scheduler:
         return int(row["c"] if row else 0)
 
     def candidates(self, limit: int) -> list[Row]:
-        priority_rows = self.priority_candidates(limit)
-        if self.store.get_config("priority_only", "off").lower() in {"1", "true", "yes", "on"}:
-            return priority_rows[:limit]
-        seen = {r["id"] for r in priority_rows}
-        if len(priority_rows) >= limit:
-            return priority_rows[:limit]
-        general = self.store.rows(
+        rows = self.store.rows(
             """
-            select * from chats
-            where adopted=1 and paused=0 and done=0 and coding_score>0
-              and failure_count < 3
-            order by
-              case state when 'needs_input' then 0 when 'stalled' then 1 when 'active' then 2 when 'running' then 3 else 4 end,
-              case when objective!='' then 0 else 1 end,
-              failure_count asc,
-              updated_at desc
+            select c.*, q.position as queue_position
+            from queue q join chats c on c.id=q.chat_id
+            where c.paused=0 and c.done=0 and c.failure_count < ?
+              and (
+                c.last_drive_at is not null
+                or c.last_seen_at < datetime('now', '-60 seconds')
+              )
+            order by q.position asc
             limit ?
             """,
-            (max(limit * 2, 20),),
+            (DEFAULT_MAX_FAILURE_COUNT + 4, limit * 4),
         )
-        rows = list(priority_rows)
-        for row in general:
-            if row["id"] in seen:
+        ready: list[Row] = []
+        for row in rows:
+            cap = recovery.max_failure_count(self.store, row["id"])
+            if int(row["failure_count"] or 0) >= cap:
                 continue
-            rows.append(row)
-            if len(rows) >= limit:
+            if not recovery.retry_ready(row):
+                continue
+            if recovery.provider_in_backoff(self.store, str(row["provider"] or "")):
+                continue
+            ready.append(row)
+            if len(ready) >= limit:
                 break
-        return rows
-
-    def priority_candidates(self, limit: int) -> list[Row]:
-        priorities = self.store.rows(
-            """
-            select * from project_priorities
-            where status='active'
-            order by priority desc, updated_at desc
-            limit 50
-            """
-        )
-        if not priorities:
-            return []
-        rows: list[Row] = []
-        seen: set[str] = set()
-        for p in priorities:
-            target = str(p["target_chat_id"] or "")
-            if target:
-                match = self.store.row(
-                    """
-                    select *, ? as priority_objective, ? as priority_rank, ? as priority_id,
-                      ? as priority_resource_path, ? as priority_worker_lanes
-                    from chats
-                    where id=? and paused=0 and done=0 and coding_score>0
-                    limit 1
-                    """,
-                    (p["objective"], p["priority"], p["id"], p["resource_path"], p["worker_lanes"], target),
-                )
-                if match and match["id"] not in seen:
-                    seen.add(match["id"])
-                    rows.append(match)
-                    if len(rows) >= limit:
-                        return rows
-            q = f"%{str(p['query']).lower()}%"
-            matches = self.store.rows(
-                """
-                select *, ? as priority_objective, ? as priority_rank, ? as priority_id,
-                  ? as priority_resource_path, ? as priority_worker_lanes
-                from chats
-                where paused=0 and done=0 and coding_score>0
-                  and (
-                    lower(id)=lower(?) or lower(alias)=lower(?) or lower(provider_chat_id)=lower(?)
-                    or lower(title) like ? or lower(alias) like ? or lower(cwd) like ?
-                  )
-                order by
-                  case state when 'needs_input' then 0 when 'stalled' then 1 when 'active' then 2 when 'running' then 3 else 4 end,
-                  failure_count asc,
-                  updated_at desc
-                limit 8
-                """,
-                (
-                    p["objective"], p["priority"], p["id"], p["resource_path"], p["worker_lanes"],
-                    p["query"], p["query"], p["query"], q, q, q,
-                ),
-            )
-            for row in matches:
-                if row["id"] in seen:
-                    continue
-                seen.add(row["id"])
-                rows.append(row)
-                if len(rows) >= limit:
-                    return rows
-        return rows
+        return ready
 
     def has_active_job(self, chat_id: str) -> bool:
         row = self.store.row("select count(*) c from jobs where chat_id=? and status='running'", (chat_id,))
@@ -308,12 +203,12 @@ class Scheduler:
             continuation=row["continuation"],
         )
         job_dir = self._planned_job_dir()
-        if int(row["failure_count"] or 0) >= 2 and not self._pinned_priority(row) and not self._direct_cursor_lane(row):
+        if recovery.should_use_fallback(row) and not self._direct_cursor_lane(row):
             plan = self.fallback_plan(row, prompt, job_dir)
         else:
             providers = provider_map()
             provider = providers.get(row["provider"])
-            if not provider:
+            if not provider or recovery.provider_in_backoff(self.store, str(row["provider"] or "")):
                 plan = self.fallback_plan(row, prompt, job_dir)
             else:
                 plan = provider.continue_plan(chat, prompt, job_dir)
@@ -382,12 +277,6 @@ class Scheduler:
         p = JOBS / ("job-" + uuid.uuid4().hex[:12])
         p.mkdir(parents=True, exist_ok=True)
         return p
-
-    def _pinned_priority(self, row: Row) -> bool:
-        try:
-            return bool(row["priority_id"] and row["priority_objective"])
-        except Exception:
-            return False
 
     def _direct_cursor_lane(self, row: Row) -> bool:
         try:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import uuid
@@ -8,7 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Row
 
-from .config import DEFAULT_CURSOR_JOB_TIMEOUT, DEFAULT_JOB_TIMEOUT, DEFAULT_STALL_SECONDS, JOBS
+from .config import DEFAULT_CURSOR_JOB_TIMEOUT, DEFAULT_JOB_TIMEOUT, JOBS
+from . import recovery
 from .config import HOME, WORKTREES
 from .markers import parse_fleet_marker
 from .models import Chat, ContinuePlan
@@ -110,12 +112,16 @@ class JobRunner:
             if wt:
                 cwd = str(wt)
                 worktree_path = str(wt)
+        # Merge stderr→stdout for cursor-agent so auth/rate-limit errors surface
+        # as "worked" output rather than silent_failed (0 bytes on both streams).
+        first_cmd = plan.cmd[0] if plan.cmd else ""
+        merge_stderr = "cursor-agent" in str(first_cmd)
         proc = subprocess.Popen(
             plan.cmd,
             cwd=cwd or None,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             stdout=out_f,
-            stderr=err_f,
+            stderr=out_f if merge_stderr else err_f,
             env=env,
             start_new_session=True,
         )
@@ -158,6 +164,53 @@ class JobRunner:
     def kill_all(self, reason: str = "daemon_stop") -> int:
         return self.kill_jobs(self.store.rows("select * from jobs where status='running'"), reason)
 
+    def detach_all(self, reason: str = "daemon_shutdown") -> int:
+        """Leave provider processes running across daemon restarts."""
+        jobs = self.store.rows("select * from jobs where status='running'")
+        detached = 0
+        with self.store.connect() as con:
+            for job in jobs:
+                con.execute(
+                    """
+                    update jobs set status='detached',updated_at=?,evidence_status='detached',evidence_reason=?
+                    where id=?
+                    """,
+                    (now_iso(), reason, job["id"]),
+                )
+                detached += 1
+        for job in jobs:
+            self.store.event("job_detached", job["chat_id"], job["id"], reason=reason)
+        return detached
+
+    def reattach_detached(self) -> int:
+        jobs = self.store.rows("select * from jobs where status='detached' order by updated_at desc")
+        reattached = 0
+        with self.store.connect() as con:
+            for job in jobs:
+                pid = int(job["pid"] or 0)
+                if self._pid_running(pid):
+                    con.execute(
+                        """
+                        update jobs set status='running',updated_at=?,evidence_status='running',evidence_reason='reattached_after_daemon_restart'
+                        where id=?
+                        """,
+                        (now_iso(), job["id"]),
+                    )
+                    con.execute("update chats set state='running' where id=? and state!='done'", (job["chat_id"],))
+                    reattached += 1
+                else:
+                    con.execute(
+                        """
+                        update jobs set status='completed',updated_at=?,completed_at=?,evidence_status='worked',evidence_reason='detached_process_exited'
+                        where id=?
+                        """,
+                        (now_iso(), now_iso(), job["id"]),
+                    )
+                    con.execute("delete from leases where job_id=?", (job["id"],))
+        if reattached:
+            self.store.event("jobs_reattached", count=reattached)
+        return reattached
+
     def kill_jobs(self, jobs: list[Row], reason: str) -> int:
         killed = 0
         with self.store.connect() as con:
@@ -176,6 +229,21 @@ class JobRunner:
                 killed += 1
         for job in jobs:
             self.store.event("job_killed", job["chat_id"], job["id"], reason=reason)
+            if reason not in {"daemon_shutdown", "daemon_stop", "daemon_restart", "chat_paused"}:
+                recovery.handle_job_failure(
+                    self.store,
+                    job,
+                    evidence_status="killed",
+                    evidence_reason=reason,
+                )
+            if reason in {"daemon_shutdown", "daemon_stop", "daemon_restart"}:
+                chat = self.store.row("select * from chats where id=?", (job["chat_id"],))
+                if chat and not chat["done"]:
+                    with self.store.connect() as con:
+                        con.execute(
+                            "update chats set paused=0,done=0,state='stalled' where id=? and done=0",
+                            (job["chat_id"],),
+                        )
         return killed
 
     def resource_for(self, row: Row) -> str:
@@ -214,9 +282,32 @@ class JobRunner:
         return ""
 
     def refresh(self) -> None:
+        self.reattach_detached()
         jobs = self.store.rows("select * from jobs where status='running' order by created_at")
         for job in jobs:
             self._refresh_one(job)
+        self._reconcile_idle_running_chats()
+
+    def _reconcile_idle_running_chats(self) -> None:
+        """Chats stuck in running with no live job cannot receive a new drive turn."""
+        rows = self.store.rows(
+            """
+            select c.id from chats c
+            where c.state='running' and c.done=0 and c.paused=0
+              and not exists (
+                select 1 from jobs j where j.chat_id=c.id and j.status='running'
+              )
+            """
+        )
+        if not rows:
+            return
+        with self.store.connect() as con:
+            for row in rows:
+                con.execute(
+                    "update chats set state='active',updated_at=? where id=? and state='running'",
+                    (now_iso(), row["id"]),
+                )
+        self.store.event("idle_running_chats_reconciled", count=len(rows))
 
     def _refresh_one(self, job: Row) -> None:
         pid = int(job["pid"] or 0)
@@ -226,16 +317,18 @@ class JobRunner:
         out_size = out.stat().st_size if out.exists() else 0
         err_size = err.stat().st_size if err.exists() else 0
         age = now_ts() - self._ts(job["created_at"])
+        stall_seconds = self._stall_seconds_for(job)
         evidence_status = "running_working" if out_size or err_size else "running"
         evidence_reason = f"stdout_bytes={out_size}; stderr_bytes={err_size}"
         status = "running" if running else "completed"
         completed = ""
+        archive_chat_id: str | None = None
         if running and not (out_size or err_size):
             activity = self._process_tree_snapshot(pid)
             if activity.has_activity():
-                evidence_status = "running_external_activity" if activity.is_recent_or_busy(DEFAULT_STALL_SECONDS) else "running_external_idle"
+                evidence_status = "running_external_activity" if activity.is_recent_or_busy(stall_seconds) else "running_external_idle"
                 evidence_reason = f"{evidence_reason}; {activity.summary()}"
-            elif age > DEFAULT_STALL_SECONDS:
+            elif age > stall_seconds:
                 evidence_status = "running_silent"
                 evidence_reason = f"{evidence_reason}; no output or child process activity for {int(age)}s"
         job_timeout = DEFAULT_CURSOR_JOB_TIMEOUT if job["provider"] == "cursor" else DEFAULT_JOB_TIMEOUT
@@ -324,8 +417,12 @@ class JobRunner:
                         con.execute("update chats set done=1,state='done',last_evidence_at=? where id=?", (now_iso(), job["chat_id"]))
                         con.execute("update goals set status='complete',updated_at=? where chat_id=? and status='active'", (now_iso(), job["chat_id"]))
                         con.execute("update project_priorities set status='complete',updated_at=? where status='active' and target_chat_id=?", (now_iso(), job["chat_id"]))
+                        archive_chat_id = str(job["chat_id"])
                     else:
-                        con.execute("update chats set done=0,state=?,last_evidence_at=? where id=?", (assessment.state, now_iso(), job["chat_id"]))
+                        con.execute(
+                            "update chats set done=0,state=?,failure_count=0,last_evidence_at=? where id=?",
+                            (assessment.state, now_iso(), job["chat_id"]),
+                        )
                         con.execute(
                             "insert into events(ts,kind,chat_id,job_id,details_json) values(?,?,?,?,?)",
                             (
@@ -340,6 +437,23 @@ class JobRunner:
                     con.execute("update chats set state='stalled',failure_count=failure_count+1 where id=?", (job["chat_id"],))
         if status != "running":
             self.store.event("job_finished", job["chat_id"], job["id"], status=status, evidence_status=evidence_status, reason=evidence_reason)
+            if evidence_status != "worked":
+                recovery.handle_job_failure(
+                    self.store,
+                    job,
+                    evidence_status=evidence_status,
+                    evidence_reason=evidence_reason,
+                )
+            else:
+                recovery.clear_retry_state(self.store, str(job["chat_id"]))
+                self.store.clear_provider_health(str(job["provider"] or ""))
+        if archive_chat_id:
+            self.store.queue_archive(archive_chat_id, reason="completed")
+
+    def _stall_seconds_for(self, job: Row) -> int:
+        chat = self.store.row("select objective from chats where id=?", (job["chat_id"],))
+        objective = str(chat["objective"] or "") if chat else ""
+        return recovery.stall_seconds_for_chat(self.store, str(job["chat_id"]), str(job["prompt"] or ""), objective)
 
     def _pid_running(self, pid: int) -> bool:
         if pid <= 0:

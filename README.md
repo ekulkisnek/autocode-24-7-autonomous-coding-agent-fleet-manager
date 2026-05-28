@@ -65,6 +65,24 @@ The default Cursor model is stored as AutoCode config key `cursor_model` and def
 - Jobs: `$AUTOCODE_HOME/state/jobs`
 - Logs: `$AUTOCODE_HOME/logs/autocode.log`
 
+## Reliability / recovery
+
+Queued chats that stall or fail are retried automatically until the goal completes or retry limits are hit. Job assessment records `silent_failed`, `provider_error`, and `killed` outcomes; the scheduler applies exponential backoff, bumps stall detection for silent timeouts, and can switch providers after repeated failures.
+
+Environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AUTOCODE_STALL_SECONDS` | `600` | No-output stall window before timeout (e2e goals use at least `1800`) |
+| `AUTOCODE_MAX_FAILURE_RETRIES` | `8` | Max failure streak per queued chat |
+| `AUTOCODE_PRIORITY_MAX_FAILURE_RETRIES` | `12` | Higher limit for chats with an active priority pin |
+| `AUTOCODE_RETRY_BACKOFF_BASE` | `30` | Initial retry delay (seconds) |
+| `AUTOCODE_RETRY_BACKOFF_MAX` | `900` | Cap on retry backoff (seconds) |
+| `AUTOCODE_JOB_TIMEOUT` | `1800` | Non-Cursor job wall clock |
+| `AUTOCODE_CURSOR_JOB_TIMEOUT` | `14400` | Cursor job wall clock |
+
+Explicit `autocode pause` sets `paused=1` and stops auto-recovery for that chat until you resume it.
+
 ## Newer Control Surfaces
 
 ```bash

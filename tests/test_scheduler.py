@@ -30,7 +30,7 @@ def test_failed_codex_falls_back_to_grok(tmp_path: Path):
     assert "--prompt-file" in plan.cmd
 
 
-def test_scheduler_repairs_done_priority_target(tmp_path: Path):
+def test_queue_add_sets_chat_adopted(tmp_path: Path):
     store = Store(tmp_path / "autocode.sqlite")
     chat = Chat(
         id="codex:codex.rollout:redwallet",
@@ -40,29 +40,20 @@ def test_scheduler_repairs_done_priority_target(tmp_path: Path):
         title="Implement wallet persistence",
         cwd="/tmp/redwallet",
         updated_at="2026-05-21T00:00:00-05:00",
-        latest_text="old done state",
+        latest_text="fix code",
         transcript_hash="h",
         alias="redwallet",
         continuation="codex exec resume",
     )
-    goal = "Keep RedWallet working in this exact Codex chat until production ready."
-    store.upsert_chat(chat, 5, "active", goal)
-    store.add_priority("redwallet", goal, 1001, "/tmp/redwallet", chat.id, 3)
-    with store.connect() as con:
-        con.execute("update chats set done=1,state='done',paused=1,adopted=0 where id=?", (chat.id,))
-
-    repaired = Scheduler(store).enforce_priority_invariants()
+    store.upsert_chat(chat, 1, "active", "fix redwallet")
+    store.queue_add(chat.id, 1.0)
 
     row = store.row("select * from chats where id=?", (chat.id,))
-    assert repaired == 1
-    assert row["done"] == 0
-    assert row["paused"] == 0
     assert row["adopted"] == 1
-    assert row["state"] == "active"
-    assert row["objective"] == goal
-    goals = store.rows("select * from goals where chat_id=? and status='active'", (chat.id,))
-    assert len(goals) == 1
-    assert goals[0]["source"] == "priority"
+    assert row["paused"] == 0
+    queue = store.queue_list()
+    assert len(queue) == 1
+    assert queue[0]["chat_id"] == chat.id
 
 
 def test_scheduler_skips_repeatedly_failed_non_priority(tmp_path: Path):
@@ -81,52 +72,81 @@ def test_scheduler_skips_repeatedly_failed_non_priority(tmp_path: Path):
         continuation="fork-to-codex",
     )
     store.upsert_chat(chat, 5, "active", "fix code")
+    store.queue_add(chat.id, 1.0)
     with store.connect() as con:
-        con.execute("update chats set failure_count=3 where id=?", (chat.id,))
+        con.execute("update chats set failure_count=8 where id=?", (chat.id,))
 
     assert Scheduler(store).candidates(10) == []
 
 
-def test_priority_candidate_can_override_failure_backoff(tmp_path: Path):
+def test_queue_orders_by_position(tmp_path: Path):
     store = Store(tmp_path / "autocode.sqlite")
-    chat = Chat(
-        id="codex:codex.rollout:redwallet",
-        provider="codex",
-        source="codex.rollout",
-        provider_chat_id="redwallet",
-        title="Implement wallet persistence",
-        cwd="/tmp/redwallet",
-        updated_at="2026-05-21T00:00:00-05:00",
-        latest_text="fix code",
-        transcript_hash="h",
-        alias="redwallet",
-        continuation="codex exec resume",
-    )
-    store.upsert_chat(chat, 5, "active", "fix code")
-    store.add_priority("redwallet", "finish redwallet", 1001, "/tmp/redwallet", chat.id, 1)
-    with store.connect() as con:
-        con.execute("update chats set failure_count=99 where id=?", (chat.id,))
+    for i, alias in enumerate(["first", "second", "third"]):
+        chat = Chat(
+            id=f"codex:codex.rollout:{alias}",
+            provider="codex",
+            source="codex.rollout",
+            provider_chat_id=alias,
+            title=alias,
+            cwd="/tmp",
+            updated_at="2026-05-21T00:00:00-05:00",
+            latest_text="fix code",
+            transcript_hash=f"h{i}",
+            alias=alias,
+            continuation="codex exec resume",
+        )
+        store.upsert_chat(chat, 1, "active", f"fix {alias}")
+        store.queue_add(chat.id, float(i + 1))
 
     candidates = Scheduler(store).candidates(10)
-    assert [row["id"] for row in candidates] == [chat.id]
+    assert [row["id"] for row in candidates] == [
+        "codex:codex.rollout:first",
+        "codex:codex.rollout:second",
+        "codex:codex.rollout:third",
+    ]
 
 
-def test_priority_only_mode_excludes_general_backlog(tmp_path: Path):
+def test_queue_move_reorders_correctly(tmp_path: Path):
     store = Store(tmp_path / "autocode.sqlite")
-    priority_chat = Chat(
-        id="codex:codex.rollout:redwallet",
+    for i, alias in enumerate(["alpha", "beta"]):
+        chat = Chat(
+            id=f"codex:codex.rollout:{alias}",
+            provider="codex",
+            source="codex.rollout",
+            provider_chat_id=alias,
+            title=alias,
+            cwd="/tmp",
+            updated_at="2026-05-21T00:00:00-05:00",
+            latest_text="fix code",
+            transcript_hash=f"h{i}",
+            alias=alias,
+            continuation="codex exec resume",
+        )
+        store.upsert_chat(chat, 1, "active", f"fix {alias}")
+        store.queue_add(chat.id, float(i + 1))
+
+    store.queue_move("codex:codex.rollout:beta", 0.5)
+    candidates = Scheduler(store).candidates(10)
+    assert candidates[0]["id"] == "codex:codex.rollout:beta"
+    assert candidates[1]["id"] == "codex:codex.rollout:alpha"
+
+
+def test_only_queued_chats_are_candidates(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    queued = Chat(
+        id="codex:codex.rollout:queued",
         provider="codex",
         source="codex.rollout",
-        provider_chat_id="redwallet",
-        title="Implement wallet persistence",
-        cwd="/tmp/redwallet",
+        provider_chat_id="queued",
+        title="Queued task",
+        cwd="/tmp/queued",
         updated_at="2026-05-21T00:00:00-05:00",
         latest_text="fix code",
         transcript_hash="h1",
-        alias="redwallet",
+        alias="queued",
         continuation="codex exec resume",
     )
-    backlog_chat = Chat(
+    not_queued = Chat(
         id="codex:codex.rollout:other",
         provider="codex",
         source="codex.rollout",
@@ -139,13 +159,12 @@ def test_priority_only_mode_excludes_general_backlog(tmp_path: Path):
         alias="other",
         continuation="codex exec resume",
     )
-    store.upsert_chat(priority_chat, 5, "active", "fix redwallet")
-    store.upsert_chat(backlog_chat, 5, "active", "fix other")
-    store.add_priority("redwallet", "finish redwallet", 1001, "/tmp/redwallet", priority_chat.id, 1)
-    store.set_config("priority_only", "on")
+    store.upsert_chat(queued, 1, "active", "fix queued")
+    store.upsert_chat(not_queued, 1, "active", "fix other")
+    store.queue_add(queued.id, 1.0)
 
     candidates = Scheduler(store).candidates(10)
-    assert [row["id"] for row in candidates] == [priority_chat.id]
+    assert [row["id"] for row in candidates] == [queued.id]
 
 
 def test_repeated_cursor_cli_failures_stay_on_direct_cursor_lane(tmp_path: Path):
@@ -173,7 +192,7 @@ def test_repeated_cursor_cli_failures_stay_on_direct_cursor_lane(tmp_path: Path)
     assert Scheduler(store)._direct_cursor_lane(row) is True
 
 
-def test_stale_lease_does_not_block_priority_dispatch(tmp_path: Path):
+def test_stale_lease_is_cleared_for_queued_chat(tmp_path: Path):
     store = Store(tmp_path / "autocode.sqlite")
     chat = Chat(
         id="codex:codex.rollout:redwallet",
@@ -188,8 +207,8 @@ def test_stale_lease_does_not_block_priority_dispatch(tmp_path: Path):
         alias="redwallet",
         continuation="codex exec resume",
     )
-    store.upsert_chat(chat, 5, "active", "fix redwallet")
-    store.add_priority("redwallet", "finish redwallet", 1001, str(tmp_path), chat.id, 1)
+    store.upsert_chat(chat, 1, "active", "fix redwallet")
+    store.queue_add(chat.id, 1.0)
     with store.connect() as con:
         con.execute(
             """
@@ -230,6 +249,26 @@ def test_capacity_is_zero_when_state_disk_is_almost_full(tmp_path: Path, monkeyp
     assert Scheduler(store).capacity() == 0
 
 
+def test_capacity_respects_max_active_setting(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    store.set_config("max_active", "4")
+    monkeypatch.setattr("autocode.scheduler.disk_free_gb", lambda path: 10.0)
+    monkeypatch.setattr("autocode.scheduler.memory_free_percent", lambda: 40)
+    monkeypatch.setattr("autocode.scheduler.load1", lambda: 3.0)
+
+    assert Scheduler(store).capacity() == 4
+
+
+def test_capacity_still_stops_on_critical_memory_with_priority_queue(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    store.set_config("max_active", "4")
+    monkeypatch.setattr("autocode.scheduler.disk_free_gb", lambda path: 10.0)
+    monkeypatch.setattr("autocode.scheduler.memory_free_percent", lambda: 8)
+    store.add_priority("queued", "keep workers full", 100, str(tmp_path), "", 1)
+
+    assert Scheduler(store).capacity() == 0
+
+
 def test_tick_records_persistent_queue_snapshot(tmp_path: Path, monkeypatch):
     store = Store(tmp_path / "autocode.sqlite")
     chat = Chat(
@@ -245,7 +284,8 @@ def test_tick_records_persistent_queue_snapshot(tmp_path: Path, monkeypatch):
         alias="queue-task",
         continuation="codex exec resume",
     )
-    store.upsert_chat(chat, 5, "active", "fix code")
+    store.upsert_chat(chat, 1, "active", "fix code")
+    store.queue_add(chat.id, 1.0)
     scheduler = Scheduler(store)
     monkeypatch.setattr(scheduler.runner, "refresh", lambda: None)
     monkeypatch.setattr(scheduler, "_maybe_discover", lambda: "test")
