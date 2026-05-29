@@ -178,9 +178,13 @@ def assess_output_state(objective: str, output: str) -> OutputAssessment:
     marker = parse_fleet_marker(text)
     ongoing = bool(ONGOING_OBJECTIVE_WORDS.search(objective or ""))
     missing = tuple(hard_requirement_gaps(objective, text))
-    milestone = bool((marker and marker.kind == "FLEET_MILESTONE") or FLEET_MILESTONE_MARKER.search(text))
-    not_complete = bool(NOT_COMPLETE_WORDS.search(text))
-    user_gated = bool(USER_GATED_WORDS.search(text) or (marker and marker.blockers))
+    # Tail for negative signals: ignore early FLEET_PLAN (with "todo"/"next"), prompt pollution,
+    # recovery text, or prior "failed"/"stalled" mentions in long outputs. This was causing
+    # false goal_incomplete on real work (root cause of 87x/24h + self-repair loops).
+    tail = text[-1400:] if len(text) > 1400 else text
+    milestone = bool((marker and marker.kind == "FLEET_MILESTONE") or FLEET_MILESTONE_MARKER.search(tail))
+    not_complete = bool(NOT_COMPLETE_WORDS.search(tail))
+    user_gated = bool(USER_GATED_WORDS.search(tail) or (marker and marker.blockers))
     completion_claim = bool((marker and marker.kind == "FLEET_DONE") or FLEET_DONE_MARKER.search(text) or COMPLETION_CLAIM_WORDS.search(text))
     verified = bool(VERIFICATION_WORDS.search(text))
     hard_goal = "hard requirement" in (objective or "").lower() or "hard completion definition" in (objective or "").lower()
@@ -212,6 +216,13 @@ def assess_output_state(objective: str, output: str) -> OutputAssessment:
         return OutputAssessment("active", False, "missing hard requirement evidence: " + ", ".join(missing), missing)
     if hard_goal and completion_claim and not hard_completion_has_substantial_evidence(objective, text):
         return OutputAssessment("active", False, "hard completion claim lacks substantial evidence")
+    # Lenient path for normal goals: if real work happened (edits/verif words) and tail has no
+    # blocker/next-step language, accept as done even without exact COMPLETION_CLAIM_WORDS.
+    # Directly counters over-strict LLM prompt guidance that makes models emit partials despite
+    # delivering code+tests. Complements the tail-based negative search above.
+    if not hard_goal and not ongoing and verified and len(text.split()) >= 8:
+        if not (NOT_COMPLETE_WORDS.search(tail) or MILESTONE_WORDS.search(tail) or ASK_WORDS.search(tail) or USER_GATED_WORDS.search(tail)):
+            return OutputAssessment("done", True, "real work output with verification evidence; clean tail (no blocker language)")
     return OutputAssessment("active", False, "worked output but no complete verified state", missing)
 
 
