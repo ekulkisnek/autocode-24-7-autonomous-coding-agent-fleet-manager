@@ -183,15 +183,17 @@ def schedule_retry(
     meta = chat_metadata(row)
     meta["last_failure_kind"] = kind
     meta["last_failure_status"] = evidence_status
-    meta["last_failure_reason"] = evidence_reason[:500]
+    meta["last_failure_reason"] = str(evidence_reason or "")[:500]
     meta["next_retry_at"] = retry_at
     meta["recovery_attempts"] = int(meta.get("recovery_attempts") or 0) + 1
     meta = bump_stall_extra(meta, kind)
     with store.connect() as con:
-        con.execute(
+        cur = con.execute(
             "update chats set metadata_json=?,state='stalled' where id=? and done=0",
             (json_dumps(meta), chat_id),
         )
+        if cur.rowcount == 0:
+            return False
     store.event(
         "recovery_scheduled",
         chat_id,

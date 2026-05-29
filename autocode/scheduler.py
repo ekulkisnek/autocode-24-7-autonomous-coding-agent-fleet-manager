@@ -471,15 +471,16 @@ class Scheduler:
             pass
         # Parallel sessions in same repo
         try:
+            repo_prefix = (repo_root or "").rstrip("/") + "/"
             running = self.store.rows(
                 """
                 select c.id, c.title, t.subtasks_json, j.evidence_status
                 from jobs j join chats c on c.id=j.chat_id
                 left join task_plans t on t.chat_id=c.id and t.status='active'
                 where j.status='running' and c.id != ?
-                  and (c.cwd=? or c.cwd like ?)
+                  and (c.cwd=? or c.cwd=? or c.cwd like ?)
                 """,
-                (current_chat_id, cwd, repo_root + "%"),
+                (current_chat_id, cwd, repo_root, repo_prefix + "%"),
             )
             if running:
                 peer_lines = []
