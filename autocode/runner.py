@@ -330,6 +330,12 @@ class JobRunner:
         err_size = err.stat().st_size if err.exists() else 0
         age = self._job_activity_age(job, out, err)
         stall_seconds = self._stall_seconds_for(job)
+        # Increase stall threshold for cursor jobs (long-running agent tasks frequently have
+        # quiet periods >3min with no stdout writes or terminal mtime updates while reasoning).
+        # This prevents premature lease release (running_external_idle) which triggers duplicate
+        # dispatches and "Couldn't create session" / silent_failed cascades.
+        if str(job["provider"] or "") == "cursor":
+            stall_seconds = max(stall_seconds, 600)
         evidence_status = "running_working" if out_size or err_size else "running"
         evidence_reason = f"stdout_bytes={out_size}; stderr_bytes={err_size}"
         status = "running" if running else "completed"

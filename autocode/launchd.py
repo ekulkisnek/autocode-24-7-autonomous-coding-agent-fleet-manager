@@ -24,9 +24,10 @@ def plist() -> dict:
             "PYTHONPATH": str(ROOT),
             "AUTOCODE_HOME": str(ROOT),
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/lukekensik/.grok/bin:/Users/lukekensik/.local/bin:/Applications/Codex.app/Contents/Resources",
-            # Kill non-cursor jobs after 10 min silent; detect stalls after 3 min
+            # Kill non-cursor jobs after 10 min silent; detect stalls after 5 min (raised to reduce silent_failed
+            # from premature external_idle lease release on long-running/quiet tasks like cursor-agent --print)
             "AUTOCODE_JOB_TIMEOUT": "600",
-            "AUTOCODE_STALL_SECONDS": "180",
+            "AUTOCODE_STALL_SECONDS": "300",
             "AUTOCODE_CURSOR_IDLE_SECONDS": "600",
         },
         "RunAtLoad": True,
