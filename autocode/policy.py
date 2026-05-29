@@ -13,8 +13,8 @@ CODING_WORDS = re.compile(
     r"implementation|bug|fix|refactor|deploy|e2e|detox|chrome|cursor|codex|grok build)\b",
     re.I,
 )
-FLEET_DONE_MARKER = re.compile(r"(?im)^\s*\*{0,2}\s*FLEET_DONE(?:\s*:|\b)")
-FLEET_MILESTONE_MARKER = re.compile(r"(?im)^\s*\*{0,2}\s*(FLEET_MILESTONE_COMPLETE|FLEET_MILESTONE\s*:)\b")
+FLEET_DONE_MARKER = re.compile(r"(?im)\bFLEET_DONE(?:\s*:|\b)")
+FLEET_MILESTONE_MARKER = re.compile(r"(?im)\b(FLEET_MILESTONE_COMPLETE|FLEET_MILESTONE\s*:)\b")
 DONE_WORDS = re.compile(r"\b(fully complete|complete and verified|done\.?$|nothing left|all tests pass(?:ed)?)\b", re.I)
 MILESTONE_WORDS = re.compile(r"\b(milestone complete|next step|remaining|still needs|todo|blocked|needs input|shall i proceed|continue)\b", re.I)
 ASK_WORDS = re.compile(r"\b(shall i|should i|do you want|would you like|please confirm|need permission|waiting for|blocked)\b", re.I)
@@ -176,6 +176,19 @@ def assess_output_state(objective: str, output: str) -> OutputAssessment:
 
     if user_gated and not completion_claim:
         return OutputAssessment("needs_input", False, "output says user action is required", missing)
+
+    # Explicit done signals take precedence over not_complete / milestone words that may appear
+    # in prompt history, recovery text, or verbose work logs (root cause of false goal_incomplete).
+    if marker and marker.kind == "FLEET_DONE" and not missing:
+        if hard_goal and not hard_completion_has_substantial_evidence(objective, text):
+            return OutputAssessment("active", False, "hard completion marker lacks substantial evidence")
+        return OutputAssessment("done", True, "structured FLEET_DONE marker accepted")
+    if completion_claim and verified and not (hard_goal and not hard_completion_has_substantial_evidence(objective, text)):
+        return OutputAssessment("done", True, "output claims completion with verification")
+    if completion_claim and "hard requirement" not in (objective or "").lower():
+        return OutputAssessment("done", True, "output claims completion")
+
+    # Only treat as continuing if no explicit done claim was present.
     if milestone:
         return OutputAssessment("active", False, "milestone output with continuing work", missing)
     if not_complete:
@@ -186,14 +199,6 @@ def assess_output_state(objective: str, output: str) -> OutputAssessment:
         return OutputAssessment("active", False, "hard completion claim lacks substantial evidence")
     if ongoing and completion_claim:
         return OutputAssessment("active", False, "ongoing objective remains active until explicitly stopped")
-    if marker and marker.kind == "FLEET_DONE" and not missing:
-        if hard_goal and not hard_completion_has_substantial_evidence(objective, text):
-            return OutputAssessment("active", False, "hard completion marker lacks substantial evidence")
-        return OutputAssessment("done", True, "structured FLEET_DONE marker accepted")
-    if completion_claim and verified:
-        return OutputAssessment("done", True, "output claims completion with verification")
-    if completion_claim and "hard requirement" not in (objective or "").lower():
-        return OutputAssessment("done", True, "output claims completion")
     return OutputAssessment("active", False, "worked output but no complete verified state", missing)
 
 

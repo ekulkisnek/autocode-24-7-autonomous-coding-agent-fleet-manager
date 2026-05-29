@@ -300,6 +300,9 @@ class Scheduler:
         from .util import json_loads, json_dumps
         _meta = json_loads(str(row["metadata_json"] or ""), {})
         gw_hint = str(_meta.get("gw_provider_hint") or "") if isinstance(_meta, dict) else ""
+        blocked_raw = self.store.get_config("blocked_providers", "")
+        blocked = {p.strip() for p in blocked_raw.split(",") if p.strip()}
+        native_provider = str(row["provider"] or "")
         if recovery.should_use_fallback(row) and not self._direct_cursor_lane(row):
             plan = self.fallback_plan(row, prompt, job_dir)
         else:
@@ -314,9 +317,12 @@ class Scheduler:
                     self.store.event("dispatch_provider_hint_used", row["id"], provider=gw_hint)
                 else:
                     plan = self.fallback_plan(row, prompt, job_dir)
+            elif native_provider in blocked:
+                self.store.event("dispatch_provider_blocked", row["id"], provider=native_provider)
+                plan = self.fallback_plan(row, prompt, job_dir)
             else:
-                provider = providers.get(row["provider"])
-                if not provider or recovery.provider_in_backoff(self.store, str(row["provider"] or "")):
+                provider = providers.get(native_provider)
+                if not provider or recovery.provider_in_backoff(self.store, native_provider):
                     plan = self.fallback_plan(row, prompt, job_dir)
                 else:
                     plan = provider.continue_plan(chat, prompt, job_dir)
