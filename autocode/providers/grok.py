@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -7,6 +8,30 @@ from ..config import HOME
 from ..models import Chat, ContinuePlan
 from ..util import iso_from_ts, sha, slug
 from .base import Provider
+
+_GROK_SESSION_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def grok_session_resume_id(chat: Chat) -> str | None:
+    """Return a Grok session id safe for ``--resume``, or None for a fresh session."""
+    sid = str(chat.provider_chat_id or "").strip()
+    if not sid or not _GROK_SESSION_ID.match(sid):
+        return None
+    if chat.source != "grok.sqlite":
+        return None
+    db = HOME / ".grok" / "sessions" / "session_search.sqlite"
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
+        row = con.execute("select 1 from session_docs where session_id=? limit 1", (sid,)).fetchone()
+        con.close()
+    except Exception:
+        return None
+    return sid if row else None
 
 
 class GrokProvider(Provider):
@@ -44,25 +69,31 @@ class GrokProvider(Provider):
 
     def continue_plan(self, chat: Chat, prompt: str, job_dir: Path) -> ContinuePlan:
         prompt_path = job_dir / "prompt.txt"
+        cwd = chat.cwd or str(HOME)
+        common_tail = [
+            "--prompt-file",
+            str(prompt_path),
+            "--no-alt-screen",
+            "--permission-mode",
+            "bypassPermissions",
+            "--max-turns",
+            "80" if chat.source == "grok.wiki_squad" else "40",
+            "--output-format",
+            "plain",
+        ]
+        resume_id = grok_session_resume_id(chat)
+        if resume_id:
+            cmd = ["grok", "--resume", resume_id, *common_tail]
+            same_chat = True
+        else:
+            cmd = ["grok", "--cwd", cwd, *common_tail]
+            same_chat = False
         return ContinuePlan(
             True,
             self.name,
-            chat.cwd or str(HOME),
-            cmd=[
-                "grok",
-                "--resume",
-                chat.provider_chat_id,
-                "--prompt-file",
-                str(prompt_path),
-                "--no-alt-screen",
-                "--permission-mode",
-                "bypassPermissions",
-                "--max-turns",
-                "40",
-                "--output-format",
-                "plain",
-            ],
+            cwd,
+            cmd=cmd,
             stdin=None,
             prompt_file=True,
-            same_chat=True,
+            same_chat=same_chat,
         )

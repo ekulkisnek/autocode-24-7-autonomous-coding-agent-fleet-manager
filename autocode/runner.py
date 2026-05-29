@@ -367,7 +367,11 @@ class JobRunner:
                 evidence_status = "provider_error"
                 status = "failed"
             elif out_size or self._meaningful_stderr(err):
-                if goals.output_too_minimal(self.store, stdout_preview):
+                # Use stderr as fallback when stdout is empty — stderr often carries real output
+                preview_for_minimal = stdout_preview
+                if not preview_for_minimal.strip() and err_size:
+                    preview_for_minimal = read_text(err, limit=4000)
+                if goals.output_too_minimal(self.store, preview_for_minimal):
                     evidence_status = "goal_incomplete"
                     status = "failed"
                     evidence_reason = f"process exited; minimal output; {evidence_reason}"
@@ -677,6 +681,8 @@ class JobRunner:
         text = read_text(path, limit=4000).lower()
         fatal = [
             "error: --resume requires",
+            "couldn't create session",
+            "session does not exist",
             "traceback (most recent call last)",
             "no such file or directory",
             "command not found",

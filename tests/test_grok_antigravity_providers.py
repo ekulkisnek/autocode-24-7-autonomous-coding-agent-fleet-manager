@@ -3,16 +3,32 @@ from pathlib import Path
 
 from autocode.models import Chat
 from autocode.providers.antigravity import AntigravityProvider
-from autocode.providers.grok import GrokProvider
+from autocode.providers.grok import GrokProvider, grok_session_resume_id
 
 
-def test_grok_continue_resumes_existing_session_with_prompt_file(tmp_path: Path):
+def _seed_grok_session_db(tmp_path: Path, session_id: str) -> None:
+    db = tmp_path / ".grok" / "sessions" / "session_search.sqlite"
+    db.parent.mkdir(parents=True)
+    con = sqlite3.connect(db)
+    con.execute("create table session_docs(session_id text,cwd text,updated_at real,title text,content text)")
+    con.execute(
+        "insert into session_docs values(?,?,?,?,?)",
+        (session_id, str(tmp_path), 1779000000.0, "Fix API", "User: fix API"),
+    )
+    con.commit()
+    con.close()
+
+
+def test_grok_continue_resumes_existing_session_with_prompt_file(tmp_path: Path, monkeypatch):
+    session_id = "019e71be-a60c-74c0-8297-f35b8a1dcc6c"
+    _seed_grok_session_db(tmp_path, session_id)
+    monkeypatch.setattr("autocode.providers.grok.HOME", tmp_path)
     provider = GrokProvider()
     chat = Chat(
-        id="grok:grok.sqlite:session-1",
+        id=f"grok:grok.sqlite:{session_id}",
         provider="grok",
         source="grok.sqlite",
-        provider_chat_id="session-1",
+        provider_chat_id=session_id,
         cwd=str(tmp_path),
     )
 
@@ -21,8 +37,29 @@ def test_grok_continue_resumes_existing_session_with_prompt_file(tmp_path: Path)
     assert plan.supported is True
     assert plan.same_chat is True
     assert plan.prompt_file is True
-    assert plan.cmd[:4] == ["grok", "--resume", "session-1", "--prompt-file"]
+    assert plan.cmd[:4] == ["grok", "--resume", session_id, "--prompt-file"]
     assert "--permission-mode" in plan.cmd
+    assert grok_session_resume_id(chat) == session_id
+
+
+def test_grok_wiki_squad_uses_fresh_cwd_session(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("autocode.providers.grok.HOME", tmp_path)
+    provider = GrokProvider()
+    chat = Chat(
+        id="pdox-wiki-pdox-A-textual-scholarship-3ae1d7",
+        provider="grok",
+        source="grok.wiki_squad",
+        provider_chat_id="pdox-wiki-pdox-A-textual-scholarship-3ae1d7",
+        cwd=str(tmp_path),
+    )
+
+    plan = provider.continue_plan(chat, "build wiki page", tmp_path)
+
+    assert plan.supported is True
+    assert plan.same_chat is False
+    assert plan.cmd[:3] == ["grok", "--cwd", str(tmp_path)]
+    assert "--resume" not in plan.cmd
+    assert grok_session_resume_id(chat) is None
 
 
 def test_grok_discovers_sessions_from_sqlite(tmp_path: Path):
