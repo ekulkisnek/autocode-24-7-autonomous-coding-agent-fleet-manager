@@ -1325,6 +1325,7 @@ def cmd_watchdog(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="autocode")
+    p.add_argument("--version", action="version", version="autocode 0.1.0")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("status"); s.add_argument("--limit", type=int, default=10); s.set_defaults(func=cmd_status)
     n = sub.add_parser("now"); n.add_argument("--limit", type=int, default=10); n.set_defaults(func=cmd_now)
