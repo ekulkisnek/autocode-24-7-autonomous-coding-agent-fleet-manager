@@ -27,18 +27,22 @@ GOAL_FLEETS = {
         "position": -10000.0,
         "goal": f"""RedWallet L1 E2E until verified (Goal 1).
 
+CURRENT MODE: LiPhone unplugged — simulator paths ONLY.
+Do NOT run run-l1-physical-bidirectional-e2e.sh or run-l1-ios-phone-* orchestrators.
+
 SUCCESS CRITERIA (stop with FLEET_DONE only when ALL met):
 1. Autocode runs scripts/run-l1-e2e-until-verified.sh which picks ONE path:
-   - physical: ./scripts/run-l1-physical-bidirectional-e2e.sh (preferred when devices + BitAssets RPC OK)
-   - simulator: ios-simulator→android then android→ios-simulator (fallback when LiPhone BitAssets RPC blocked)
+   - physical: ./scripts/run-l1-physical-bidirectional-e2e.sh (ONLY when LiPhone USB connected)
+   - simulator: run-l1-ios-simulator-to-android-phone-e2e.sh THEN run-l1-android-phone-to-ios-simulator-e2e.sh (ACTIVE NOW)
 2. Update {LOG_ROOT}/L1_VERIFIED_EVIDENCE.md with TWO mainchain txids, detox_exit=0, verify=ok for BOTH directions.
 3. Do NOT start parallel Detox/orchestrator runs — lock is enforced via scripts/l1-e2e-lock.sh.
 4. Do NOT spawn Cursor Task subagents — autocode fleet job only.
 
-If lock is held, wait or inspect current run logs under {LOG_ROOT}/current-l1-physical-bidirectional-e2e.
-If iOS send stalls (BitAssets RPC Host is down), inspect ios-btc-command-server logs and fix connectivity.
+If lock is held, wait or inspect current run logs under {LOG_ROOT}/current-l1-simulator-bidirectional-e2e.
+Known simulator blockers to fix: L1SendE2E not found after fund (openWalletSendScreen), iPhone 16e-Detox in .detoxrc.json, Detox app busy after fund.
 
-Devices: Android 0A201JECB03306, iPhone 00008020-0011204911F3002E.
+Devices: Android 0A201JECB03306 (connected), LiPhone 00008020-0011204911F3002E (UNPLUGGED — use iOS Simulator iPhone 16e-Detox).
+REDWALLET_SKIP_ANDROID_SEED=1 with known address tb1qewdkqej3xc6hh2v5q88rnaekd2zkccf0zq6kdf when seed already done.
 Commit redwallet fixes to fork branch codex/redwallet-utreexo-quic-sync; push to ekulkisnek/BlueWallet.
 
 End with FLEET_DONE only after verify-goal-status shows l1-e2e-verified complete.""",

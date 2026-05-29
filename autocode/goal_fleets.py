@@ -15,8 +15,15 @@ from .util import json_dumps, json_loads, now_iso
 
 DEFAULT_GOAL_TICK_INTERVAL = int(os.environ.get("AUTOCODE_GOAL_TICK_INTERVAL", "90"))
 L1_E2E_SCRIPT = ROOT / "scripts" / "run-l1-e2e-until-verified.sh"
+PICK_L1_PATH_SCRIPT = ROOT / "scripts" / "pick-l1-e2e-path.sh"
 VERIFY_SCRIPT = ROOT / "scripts" / "verify-goal-status.py"
 DISPATCH_SCRIPT = ROOT / "scripts" / "dispatch-goal-fleets.py"
+L1_SIMULATOR_CONTEXT = (
+    "LiPhone unplugged — simulator paths only. "
+    "Do NOT run run-l1-physical-bidirectional-e2e.sh or run-l1-ios-phone-* orchestrators. "
+    "Bidirectional proof via run-l1-ios-simulator-to-android-phone-e2e.sh then "
+    "run-l1-android-phone-to-ios-simulator-e2e.sh. Android 0A201JECB03306 still connected."
+)
 
 # Map verify-goal-status ids → fleet chat alias substrings.
 GOAL_FLEET_ALIASES: dict[str, str] = {
@@ -101,6 +108,56 @@ def clear_stale_l1_lock() -> bool:
         return True
 
 
+def pick_l1_e2e_path() -> str:
+    """Return physical|simulator from pick-l1-e2e-path.sh."""
+    if not PICK_L1_PATH_SCRIPT.is_file():
+        return "simulator"
+    try:
+        proc = subprocess.run(
+            ["bash", str(PICK_L1_PATH_SCRIPT)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=str(ROOT),
+        )
+        path = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout else ""
+        return path if path in {"physical", "simulator"} else "simulator"
+    except Exception:
+        return "simulator"
+
+
+def kill_physical_l1_runs() -> list[int]:
+    """Kill physical iPhone L1 orchestrators when simulator path is active."""
+    killed: list[int] = []
+    patterns = (
+        r"run-l1-physical-bidirectional",
+        r"run-l1-ios-phone-to-android",
+        r"run-l1-ios-phone-to-android-phone",
+        r"run-l1-android-phone-to-ios-phone",
+    )
+    my_pid = os.getpid()
+    for pattern in patterns:
+        try:
+            out = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            pids = [int(p.strip()) for p in (out.stdout or "").splitlines() if p.strip().isdigit()]
+        except Exception:
+            pids = []
+        for pid in pids:
+            if pid in {my_pid, os.getppid()}:
+                continue
+            try:
+                os.kill(pid, 9)
+                killed.append(pid)
+            except OSError:
+                pass
+    return killed
+
+
 def kill_simulator_l1_runs() -> list[int]:
     """Kill conflicting simulator Detox / run-l1-ios-simulator paths during physical L1."""
     killed: list[int] = []
@@ -158,7 +215,7 @@ def _l1_loop_running() -> bool:
 
 
 def start_l1_loop_if_needed(status: dict[str, Any]) -> bool:
-    """Spawn physical L1 retry loop when goal incomplete and nothing is running."""
+    """Spawn L1 retry loop when goal incomplete and nothing is running."""
     l1 = next((g for g in status.get("goals", []) if g.get("id") == "l1-e2e-verified"), None)
     if not l1 or l1.get("complete"):
         return False
@@ -166,17 +223,26 @@ def start_l1_loop_if_needed(status: dict[str, Any]) -> bool:
         return False
     if not L1_E2E_SCRIPT.is_file():
         return False
+    path = pick_l1_e2e_path()
+    if path == "simulator":
+        kill_physical_l1_runs()
     log_dir = Path("/Volumes/T705/redwallet-logs")
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "l1-e2e-until-verified-autocode.log"
+    env = os.environ.copy()
+    if path == "simulator":
+        env["L1_E2E_SKIP_PHYSICAL_IOS"] = "1"
+        env.setdefault("L1_E2E_FORCE_PATH", "simulator")
+        env.setdefault("REDWALLET_SKIP_ANDROID_SEED", "1")
     with log_path.open("a", encoding="utf-8") as log:
-        log.write(f"\n=== autocode goal_fleets spawn {now_iso()} ===\n")
+        log.write(f"\n=== autocode goal_fleets spawn {now_iso()} path={path} ===\n")
         subprocess.Popen(
             ["bash", str(L1_E2E_SCRIPT)],
             stdout=log,
             stderr=subprocess.STDOUT,
             cwd=str(ROOT),
             start_new_session=True,
+            env=env,
         )
     return True
 
@@ -294,10 +360,14 @@ def _inject_failure_context(store: Store, chat_id: str, goal: dict, reason: str)
     meta = json_loads(str(row["metadata_json"] or "" if row else ""), {})
     if not isinstance(meta, dict):
         meta = {}
+    path = pick_l1_e2e_path()
+    if path == "simulator":
+        reason = f"{L1_SIMULATOR_CONTEXT}\n{reason}"
     meta["goal_fleet_retry"] = {
         "goal_id": goal.get("id"),
         "pct": goal.get("pct"),
         "reason": reason[:500],
+        "l1_path": path,
         "at": now_iso(),
     }
     meta["remediation_prompt_prefix"] = (
@@ -417,6 +487,8 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
 
     l1_incomplete = any(g.get("id") == "l1-e2e-verified" and not g.get("complete") for g in status.get("goals", []))
     l1_busy = _l1_orchestrator_running() or _l1_loop_running()
+    l1_path = pick_l1_e2e_path() if l1_incomplete else ""
+    result["l1_path"] = l1_path
     if l1_incomplete:
         result["l1_fleet_deduped"], result["l1_fleet_jobs_killed"] = pause_duplicate_l1_fleet_chats(store, scheduler)
         if not l1_busy:
@@ -427,7 +499,12 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
 
         lock = coordination.read_l1_lock()
         holder = str((lock or {}).get("holder") or "")
-        if not l1_busy:
+        if l1_path == "simulator":
+            result["physical_killed"] = kill_physical_l1_runs()
+            if holder and "physical" in holder:
+                coordination.release_l1_lock()
+                result["stale_physical_lock_released"] = True
+        elif not l1_busy:
             if "simulator" in holder:
                 if not coordination.l1_lock_active():
                     result["physical_killed"] = coordination.kill_duplicate_l1_processes()

@@ -916,6 +916,12 @@ def cmd_coord(args: argparse.Namespace) -> None:
             f"Paused {paused} competing chat(s); killed {killed} job(s); "
             f"sim_killed={len(sim_killed)}"
         )
+    elif args.coord_cmd == "kill-physical-l1":
+        from . import goal_fleets
+
+        killed = goal_fleets.kill_physical_l1_runs()
+        coordination.release_l1_lock()
+        print(f"killed_physical_pids={killed}")
     elif args.coord_cmd == "release-l1":
         coordination.release_l1_lock()
         print("L1 lock released")
@@ -1676,6 +1682,8 @@ def build_parser() -> argparse.ArgumentParser:
     cop.set_defaults(func=cmd_coord)
     cor = cosub.add_parser("release-l1", help="release L1 E2E lock file")
     cor.set_defaults(func=cmd_coord)
+    cok = cosub.add_parser("kill-physical-l1", help="kill physical iPhone L1 orchestrators and release lock")
+    cok.set_defaults(func=cmd_coord)
     cow = cosub.add_parser("set-windows-sequential", help="set windows-main capacity=1")
     cow.set_defaults(func=cmd_coord)
     dn = sub.add_parser("done"); dn.add_argument("query"); dn.set_defaults(func=cmd_done)
