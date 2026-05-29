@@ -531,6 +531,15 @@ class JobRunner:
                         verified = True
                         verify_reason = "fleet_done_in_stdout"
                     if verified:
+                        from . import goal_fleets
+
+                        ext_ok, ext_gid, ext_reason = goal_fleets.external_goal_complete_for_chat(
+                            self.store, str(job["chat_id"])
+                        )
+                        if not ext_ok:
+                            verified = False
+                            verify_reason = ext_reason or f"external goal {ext_gid} incomplete"
+                    if verified:
                         con.execute("update chats set done=1,state='done',last_evidence_at=? where id=?", (now_iso(), job["chat_id"]))
                         con.execute("update goals set status='complete',updated_at=? where chat_id=? and status='active'", (now_iso(), job["chat_id"]))
                         con.execute("update project_priorities set status='complete',updated_at=? where status='active' and target_chat_id=?", (now_iso(), job["chat_id"]))

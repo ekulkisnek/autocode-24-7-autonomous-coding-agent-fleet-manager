@@ -21,24 +21,27 @@ LOG_ROOT = "/Volumes/T705/redwallet-logs"
 GOAL_FLEETS = {
     "l1-e2e-verified": {
         "alias": "l1-e2e-until-verified",
-        "provider": "grok",
+        "provider": "cursor",
+        "fallback_provider": "grok",
         "cwd": REDWALLET,
-        "position": -300.0,
+        "position": -500.0,
         "goal": f"""RedWallet L1 E2E until verified (Goal 1).
 
 SUCCESS CRITERIA (stop with FLEET_DONE only when ALL met):
-1. Run ./scripts/run-l1-physical-bidirectional-e2e.sh (physical iPhone + Android preferred)
-   OR run ios→android then android→ios orchestrators sequentially with l1-e2e-lock.
+1. Autocode runs scripts/run-l1-e2e-until-verified.sh which picks ONE path:
+   - physical: ./scripts/run-l1-physical-bidirectional-e2e.sh (preferred when devices + BitAssets RPC OK)
+   - simulator: ios-simulator→android then android→ios-simulator (fallback when LiPhone BitAssets RPC blocked)
 2. Update {LOG_ROOT}/L1_VERIFIED_EVIDENCE.md with TWO mainchain txids, detox_exit=0, verify=ok for BOTH directions.
 3. Do NOT start parallel Detox/orchestrator runs — lock is enforced via scripts/l1-e2e-lock.sh.
+4. Do NOT spawn Cursor Task subagents — autocode fleet job only.
 
 If lock is held, wait or inspect current run logs under {LOG_ROOT}/current-l1-physical-bidirectional-e2e.
-If Detox fails on Send navigation, spec uses openWalletSendScreen (no post-create relaunch unless L1_E2E_POST_CREATE_RELAUNCH=1).
+If iOS send stalls (BitAssets RPC Host is down), inspect ios-btc-command-server logs and fix connectivity.
 
 Devices: Android 0A201JECB03306, iPhone 00008020-0011204911F3002E.
 Commit redwallet fixes to fork branch codex/redwallet-utreexo-quic-sync; push to ekulkisnek/BlueWallet.
 
-End with FLEET_DONE and paste evidence table rows.""",
+End with FLEET_DONE only after verify-goal-status shows l1-e2e-verified complete.""",
     },
     "windows-remote-health": {
         "alias": "windows-remote-health",
@@ -95,9 +98,15 @@ def load_status() -> dict:
 
 
 def ensure_chat(store: Store, spec: dict) -> str:
+    from autocode import recovery
+
     goal = spec.get("goal", "")
     alias = spec["alias"]
     provider = spec["provider"]
+    fallback = spec.get("fallback_provider", "")
+    if fallback and recovery.provider_in_backoff(store, provider):
+        if not recovery.provider_in_backoff(store, fallback):
+            provider = fallback
     cwd = spec["cwd"]
     chat_id = f"{provider}:goal-fleet:{alias}:{sha(goal or alias)[:8]}"
     chat = Chat(
@@ -146,10 +155,18 @@ def main() -> None:
     l1_active = any(g["id"] == "l1-e2e-verified" for g in incomplete)
     if l1_active:
         from autocode import coordination
+        from autocode.goal_fleets import (
+            _l1_orchestrator_running,
+            pause_duplicate_l1_fleet_chats,
+            pause_l1_competitors_no_lock,
+        )
 
+        pause_duplicate_l1_fleet_chats(store, sched)
+        if not coordination.l1_lock_active() and not _l1_orchestrator_running():
+            coordination.kill_duplicate_l1_processes()
         if not coordination.l1_lock_active():
-            print("L1 incomplete — pausing liquid/patreon competitors")
-            coordination.pause_competing_chats(store, sched)
+            print("L1 incomplete — pausing non-goal competitors (no lock acquire)")
+            pause_l1_competitors_no_lock(store, sched)
 
     for g in incomplete:
         gid = g["id"]
@@ -157,6 +174,19 @@ def main() -> None:
         if not spec:
             print(f"SKIP no fleet spec for {gid}")
             continue
+        if gid == "l1-e2e-verified":
+            alias = spec["alias"]
+            active = store.row(
+                """
+                select count(*) c from jobs j
+                join chats c on c.id=j.chat_id
+                where j.status='running' and (c.alias=? or c.alias like ?)
+                """,
+                (alias, f"%{alias}%"),
+            )
+            if active and int(active["c"] or 0) > 0:
+                print(f"SKIP {gid}: l1 fleet job already running")
+                continue
         if spec.get("dispatch_script"):
             script = Path(__file__).resolve().parent / Path(spec["dispatch_script"]).name
             print(f"RUN {script} for {gid}")

@@ -59,6 +59,9 @@ class Scheduler:
         auto_fix["watchdog_unblock"] = unblock
         watchdog_executor.process_actions(self.store, self)
         self_improve.scan(self.store)
+        from . import goal_fleets
+
+        goal_fleet_result = goal_fleets.tick(self.store, self)
         queue_archived.extend(self.store.queue_archive_done())
         auto_fix["queue_archived"] = queue_archived
         unstuck = recovery.reconcile_killed_chats(self.store)
@@ -154,6 +157,14 @@ class Scheduler:
             available=max(0.0, float(cap) - self._running_dispatch_weight()),
             mac_can_take_more=self._running_dispatch_weight() < float(cap) and len(sent) < limit,
         )
+        goal_fleets_result: dict = {}
+        try:
+            from . import goal_fleets
+
+            goal_fleets_result = goal_fleets.tick(self.store, self)
+        except Exception as exc:
+            self.store.event("goal_fleets_tick_error", error=str(exc))
+            goal_fleets_result = {"error": str(exc)}
         return {
             "sent": len(sent),
             "jobs": sent,
@@ -166,8 +177,10 @@ class Scheduler:
             "stale_leases": stale_leases,
             "recovery_unstuck": unstuck,
             "goal_reopened": reopened,
+            "goal_fleets": goal_fleet_result,
             "auto_fix": auto_fix,
             "coordination": coord,
+            "goal_fleets": goal_fleets_result,
         }
 
     def _maybe_discover(self) -> str:

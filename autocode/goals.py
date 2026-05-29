@@ -67,6 +67,18 @@ def _gw_completion_override(store: Store, chat_id: str) -> tuple[str, str]:
 
 def verify_goal_complete(store: Store, objective: str, output: str, chat_id: str = "") -> tuple[bool, str]:
     """Return whether job output may mark the chat goal complete."""
+    alias = ""
+    if chat_id:
+        row = store.row("select alias from chats where id=?", (chat_id,))
+        alias = str(row["alias"] or "") if row else ""
+    from . import goal_fleets
+
+    external_ok, external_reason = goal_fleets.is_fleet_goal_complete(alias, objective)
+    if external_ok:
+        return True, external_reason
+    if goal_fleets.goal_id_for_chat(alias, objective):
+        return False, external_reason or "goal fleet evidence incomplete"
+
     override, reason = _gw_completion_override(store, chat_id)
     if override == "confirm":
         return True, reason or "watchdog: completion confirmed"

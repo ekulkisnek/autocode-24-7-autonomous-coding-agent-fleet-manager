@@ -10,7 +10,7 @@ from typing import Any
 
 DEFAULT_L1_LOCK = Path("/Volumes/T705/redwallet-logs/.l1-e2e-lock")
 
-# Chat alias/title substrings paused while L1 lock is held (Mac local dispatch).
+# Chat alias/title substrings paused while L1 is incomplete (Mac local dispatch).
 L1_COMPETING_QUERIES = (
     "patreon-transcribe",
     "liquid-utreexo",
@@ -22,6 +22,11 @@ L1_COMPETING_QUERIES = (
     "l1-ios",
     "l1-android",
     "run-l1-",
+    "lukekensik-",
+    "redwallet-l1-e2e",
+    "fund-l1-e2e",
+    "physical-l1-e2e",
+    "retry-l1-e2e",
 )
 
 # Fleets that must not run on Mac during L1 (liquid cursor/grok on redwallet).
@@ -50,11 +55,17 @@ def l1_lock_active() -> bool:
         return False
     pid = int(info.get("pid") or 0)
     if pid <= 0:
+        holder = str(info.get("holder") or "")
+        # Stale manual pause locks from coord-cli should not block physical E2E.
+        if holder in {"coord-cli", "manual-pause"}:
+            release_l1_lock()
+            return False
         return True
     try:
         os.kill(pid, 0)
         return True
     except OSError:
+        release_l1_lock()
         return False
 
 
@@ -83,29 +94,104 @@ def release_l1_lock() -> None:
             pass
 
 
-def kill_duplicate_l1_processes(*, keep_pid: int | None = None) -> list[int]:
-    """Kill stray run-l1-* orchestrators (not the lock holder)."""
+def _process_tree_pids(root_pid: int, *, depth: int = 8) -> set[int]:
+    """Return root_pid plus ancestors (up to depth) and descendants (pgrep -P BFS)."""
+    protected: set[int] = set()
+    if root_pid <= 0:
+        return protected
+    protected.add(root_pid)
+    # Walk up to find run-l1-e2e-until-verified parent loop.
+    cur = root_pid
+    for _ in range(depth):
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(cur)],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            ppid = int((out.stdout or "").strip() or 0)
+        except (ValueError, OSError, subprocess.SubprocessError):
+            break
+        if ppid <= 1 or ppid in protected:
+            break
+        protected.add(ppid)
+        cur = ppid
+    # Walk down: all child processes.
+    frontier = [root_pid]
+    for _ in range(depth * 4):
+        if not frontier:
+            break
+        next_frontier: list[int] = []
+        for parent in frontier:
+            try:
+                out = subprocess.run(
+                    ["pgrep", "-P", str(parent)],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                for line in (out.stdout or "").splitlines():
+                    if line.strip().isdigit():
+                        child = int(line.strip())
+                        if child not in protected:
+                            protected.add(child)
+                            next_frontier.append(child)
+            except Exception:
+                pass
+        frontier = next_frontier
+    return protected
+
+
+def l1_protected_pids(*, extra_keep: int | None = None) -> set[int]:
+    """PIDs that must not be killed during L1 dedup (lock holder + loop + children)."""
+    protected: set[int] = {os.getpid(), os.getppid()}
+    if extra_keep and extra_keep > 0:
+        protected |= _process_tree_pids(extra_keep)
     lock = read_l1_lock()
     holder_pid = int((lock or {}).get("pid") or 0)
-    keep = keep_pid or holder_pid or 0
-    killed: list[int] = []
+    if holder_pid > 0:
+        protected |= _process_tree_pids(holder_pid)
+    # Protect active run-l1-e2e-until-verified monitor loops.
     try:
         out = subprocess.run(
-            ["pgrep", "-f", r"run-l1-(physical|ios|android).*e2e\.sh"],
+            ["pgrep", "-f", r"run-l1-e2e-until-verified\.sh"],
             capture_output=True,
             text=True,
             timeout=5,
         )
-        pids = [int(p.strip()) for p in (out.stdout or "").splitlines() if p.strip().isdigit()]
+        for line in (out.stdout or "").splitlines():
+            if line.strip().isdigit():
+                protected |= _process_tree_pids(int(line.strip()))
     except Exception:
-        pids = []
-    my_pid = os.getpid()
+        pass
+    return protected
+
+
+def kill_duplicate_l1_processes(*, keep_pid: int | None = None) -> list[int]:
+    """Kill stray run-l1-* orchestrators and simulator Detox L1 runs (not the lock holder tree)."""
+    protected = l1_protected_pids(extra_keep=keep_pid)
+    killed: list[int] = []
+    patterns = (
+        r"l1_ios_simulator_to_android\.spec\.js",
+        r"run-l1-ios-simulator",
+    )
+    pids: set[int] = set()
+    for pattern in patterns:
+        try:
+            out = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            for line in (out.stdout or "").splitlines():
+                if line.strip().isdigit():
+                    pids.add(int(line.strip()))
+        except Exception:
+            pass
     for pid in pids:
-        if pid in {my_pid, os.getppid()}:
-            continue
-        if keep and pid == keep:
-            continue
-        if holder_pid and pid == holder_pid:
+        if pid in protected:
             continue
         try:
             os.kill(pid, 9)

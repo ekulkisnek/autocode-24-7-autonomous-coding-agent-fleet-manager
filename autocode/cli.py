@@ -908,11 +908,14 @@ def cmd_coord(args: argparse.Namespace) -> None:
         else:
             print("L1 lock: none")
     elif args.coord_cmd == "pause-l1-competitors":
-        if not coordination.l1_lock_active():
-            coordination.acquire_l1_lock(run_dir="manual-pause", holder="coord-cli")
-        paused, killed = coordination.pause_competing_chats(store, sched)
-        dupes = coordination.kill_duplicate_l1_processes()
-        print(f"Paused {paused} competing chat(s); killed {killed} job(s); killed {len(dupes)} duplicate l1/detox pids")
+        from . import goal_fleets
+
+        paused, killed = goal_fleets.pause_l1_competitors_no_lock(store, sched)
+        sim_killed = goal_fleets.kill_simulator_l1_runs()
+        print(
+            f"Paused {paused} competing chat(s); killed {killed} job(s); "
+            f"sim_killed={len(sim_killed)}"
+        )
     elif args.coord_cmd == "release-l1":
         coordination.release_l1_lock()
         print("L1 lock released")
