@@ -53,6 +53,9 @@ class Scheduler:
         reopened = goals.reconcile_false_done_chats(self.store)
         auto_fix = remediation.remediation_pass(self.store)
         from . import watchdog_executor, self_improve
+
+        unblock = watchdog_executor.process_deterministic_unblock(self.store, self)
+        auto_fix["watchdog_unblock"] = unblock
         watchdog_executor.process_actions(self.store, self)
         self_improve.scan(self.store)
         queue_archived.extend(self.store.queue_archive_done())
@@ -172,6 +175,13 @@ class Scheduler:
                     if mem_free < 20:
                         t = (mem_free - 12) / 8.0  # 0.0 at 12%, 1.0 at 20%
                         budget = min(budget, 1.5 * t)
+                        # 15–25% free: keep at least one slot when work is queued.
+                        if 15 <= mem_free < 25:
+                            queued = self.store.row(
+                                "select count(*) c from queue q join chats c on c.id=q.chat_id where c.paused=0 and c.done=0"
+                            )
+                            if queued and int(queued["c"] or 0) > 0:
+                                budget = max(budget, 1.0)
                     elif mem_free < 30:
                         t = (mem_free - 20) / 10.0  # 0.0 at 20%, 1.0 at 30%
                         budget = min(budget, 1.5 + t * max(0, configured - 1.5))

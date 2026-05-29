@@ -5,10 +5,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .config import STATE
 from .store import Store
 from .util import now_iso, now_ts
 
-ACTIONS_FILE = Path("/Users/lukekensik/autocode/state/watchdog-actions.json")
+ACTIONS_FILE = STATE / "watchdog-actions.json"
 
 ALLOWED_TYPES = frozenset({
     "complete_chat",
@@ -47,6 +48,43 @@ def _applied_this_hour(actions: list[dict]) -> int:
         if a.get("status") == "applied"
         and float(a.get("applied_at_ts") or 0) >= cutoff
     )
+
+
+def process_deterministic_unblock(store: Store, scheduler: Any | None = None) -> dict[str, Any]:
+    """
+    Closed-loop fixes that do not require Grok or AUTOCODE_WATCHDOG_AUTO.
+    Runs every scheduler.tick() after remediation_pass (see scheduler.py).
+    Grok watchdog (grok_watchdog.py) is Signal-only; this module mutates queue/health.
+    """
+    from . import recovery, self_improve
+
+    result: dict[str, Any] = {
+        "si_archived": [],
+        "grok_backoff_cleared": False,
+    }
+    archived = self_improve.reconcile_stalled_self_improvement(store)
+    result["si_archived"] = archived
+    if archived:
+        store.clear_provider_health("grok")
+        result["grok_backoff_cleared"] = True
+        store.event("watchdog_deterministic_unblock", si_archived=len(archived))
+    elif recovery.provider_in_backoff(store, "grok"):
+        # Clear stale grok backoff when queue has only SI dead letters left.
+        rows = store.rows(
+            """
+            select c.alias, c.failure_count
+            from queue q join chats c on c.id=q.chat_id
+            where c.done=0 and c.paused=0
+            """
+        )
+        if rows and all(
+            str(r["alias"] or "").startswith("si-")
+            and int(r["failure_count"] or 0) >= 8
+            for r in rows
+        ):
+            store.clear_provider_health("grok")
+            result["grok_backoff_cleared"] = True
+    return result
 
 
 def process_actions(store: Store, scheduler: Any) -> list[str]:

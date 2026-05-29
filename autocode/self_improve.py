@@ -11,8 +11,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .config import DEFAULT_MAX_FAILURE_COUNT
 from .store import Store
-from .util import iso_from_ts, json_dumps, now_iso, now_ts
+from .util import iso_from_ts, json_dumps, json_loads, now_iso, now_ts, read_text
 
 AUTOCODE_DIR = Path("/Users/lukekensik/autocode")
 IPC_LOG = AUTOCODE_DIR / "state" / "ipc_log.jsonl"
@@ -289,6 +290,95 @@ def _last_scan_ts(store: Store) -> float:
         return 0.0
     from .util import parse_ts
     return parse_ts(str(row["ts"]))
+
+
+def _last_job_has_max_turns(store: Store, chat_id: str) -> bool:
+    job = store.row(
+        """
+        select evidence_reason, stderr_path from jobs
+        where chat_id=?
+        order by updated_at desc
+        limit 1
+        """,
+        (chat_id,),
+    )
+    if not job:
+        return False
+    reason = str(job["evidence_reason"] or "").lower()
+    if "max_turns" in reason:
+        return True
+    stderr = read_text(Path(str(job["stderr_path"] or "")), limit=4096).lower()
+    return "max_turns exceeded" in stderr
+
+
+def _is_self_improve_chat(row) -> bool:
+    alias = str(row["alias"] or "")
+    if alias.startswith("si-"):
+        return True
+    meta = json_loads(str(row["metadata_json"] or ""), {}) or {}
+    return bool(meta.get("self_improve")) or str(row["source"] or "") == "grok.self_improve"
+
+
+def reconcile_stalled_self_improvement(store: Store, *, min_failures: int | None = None) -> list[str]:
+    """
+    Break SI death loops: pause + archive queue items that exhausted retries on max_turns.
+    Also archives duplicate si-* siblings when another same-alias row already hit the threshold.
+    Returns archived chat_ids.
+    """
+    threshold = min_failures if min_failures is not None else DEFAULT_MAX_FAILURE_COUNT
+    archived: list[str] = []
+    rows = store.rows(
+        """
+        select c.*
+        from queue q join chats c on c.id=q.chat_id
+        where c.done=0
+        """
+    )
+    si_rows = [r for r in rows if _is_self_improve_chat(r)]
+    by_alias: dict[str, list] = {}
+    for row in si_rows:
+        alias = str(row["alias"] or "")
+        by_alias.setdefault(alias, []).append(row)
+
+    def _alias_exhausted(alias: str) -> bool:
+        peak = store.row("select max(failure_count) m from chats where alias=?", (alias,))
+        if peak and int(peak["m"] or 0) >= threshold:
+            return True
+        archived = store.row(
+            "select 1 from queue_finished where alias=? and reason='si_loop_breaker' limit 1",
+            (alias,),
+        )
+        return bool(archived)
+
+    def _should_break(row, *, alias_exhausted: bool) -> bool:
+        failures = int(row["failure_count"] or 0)
+        max_turns = _last_job_has_max_turns(store, str(row["id"]))
+        if failures >= threshold:
+            # SI at max retries cannot self-heal; max_turns is the common root cause but not required.
+            return max_turns or failures >= threshold
+        if not max_turns:
+            return False
+        # Duplicate SI queue entries: drop younger copies when same alias already dead.
+        return alias_exhausted and failures >= 2
+
+    for alias, group in by_alias.items():
+        exhausted = _alias_exhausted(alias)
+        for row in group:
+            if not _should_break(row, alias_exhausted=exhausted):
+                continue
+            chat_id = str(row["id"])
+            if chat_id in archived:
+                continue
+            store.pause_chat(chat_id)
+            if store.queue_archive(chat_id, reason="si_loop_breaker"):
+                archived.append(chat_id)
+                store.event(
+                    "si_loop_breaker",
+                    chat_id,
+                    alias=alias,
+                    failure_count=int(row["failure_count"] or 0),
+                )
+    return archived
 
 
 def scan(store: Store, force: bool = False) -> dict | None:
