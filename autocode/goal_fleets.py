@@ -243,6 +243,10 @@ def pause_duplicate_l1_fleet_chats(store: Store, scheduler: Any) -> tuple[int, i
     """Keep only one active l1-e2e-until-verified fleet chat (prefer cursor over grok in backoff)."""
     from . import recovery
 
+    # Shell orchestrator + agent fleet may run together; dedupe only when idle.
+    if _l1_orchestrator_running() or _l1_loop_running():
+        return 0, 0
+
     alias = GOAL_FLEET_ALIASES["l1-e2e-verified"]
     rows = store.rows(
         """
@@ -360,7 +364,13 @@ def dispatch_incomplete_goals(store: Store, status: dict[str, Any]) -> dict[str,
         return {"dispatched": [], "skipped": "all_complete"}
     dispatched: list[str] = []
     skipped: list[str] = []
+    l1_incomplete = any(g.get("id") == "l1-e2e-verified" for g in incomplete)
     for goal in incomplete:
+        gid = str(goal["id"])
+        # Goal 1 blocks goals 2-4 until L1_VERIFIED_EVIDENCE has two verify=ok txids.
+        if l1_incomplete and gid != "l1-e2e-verified":
+            skipped.append(gid)
+            continue
         gid = str(goal["id"])
         if _active_fleet_job(store, gid):
             skipped.append(gid)
@@ -406,32 +416,29 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
         return result
 
     l1_incomplete = any(g.get("id") == "l1-e2e-verified" and not g.get("complete") for g in status.get("goals", []))
+    l1_busy = _l1_orchestrator_running() or _l1_loop_running()
     if l1_incomplete:
         result["l1_fleet_deduped"], result["l1_fleet_jobs_killed"] = pause_duplicate_l1_fleet_chats(store, scheduler)
-        result["competitors_paused"], result["competitor_jobs_killed"] = pause_l1_competitors_no_lock(store, scheduler)
+        if not l1_busy:
+            result["competitors_paused"], result["competitor_jobs_killed"] = pause_l1_competitors_no_lock(
+                store, scheduler
+            )
         from . import coordination
 
         lock = coordination.read_l1_lock()
         holder = str((lock or {}).get("holder") or "")
-        if "simulator" in holder:
-            if not coordination.l1_lock_active():
-                result["physical_killed"] = coordination.kill_duplicate_l1_processes()
-        elif coordination.l1_lock_active() or _l1_orchestrator_running():
-            result["simulator_killed"] = kill_simulator_l1_runs()
-        elif not _l1_orchestrator_running() and not _l1_loop_running():
-            result["simulator_killed"] = kill_simulator_l1_runs()
+        if not l1_busy:
+            if "simulator" in holder:
+                if not coordination.l1_lock_active():
+                    result["physical_killed"] = coordination.kill_duplicate_l1_processes()
+            else:
+                result["simulator_killed"] = kill_simulator_l1_runs()
         result["l1_loop_started"] = start_l1_loop_if_needed(status)
 
     result["reopened"] = reconcile_false_complete_fleets(store, status)
 
-    # Re-load after reopening; dispatch if Mac has headroom or remote spill available.
-    active_jobs = store.row("select count(*) c from jobs where status='running'")
-    running = int(active_jobs["c"] if active_jobs else 0)
-    cap = scheduler.capacity()
-    if running < max(cap, 1) or cap == 0:
-        result["dispatch"] = dispatch_incomplete_goals(store, status)
-    else:
-        result["dispatch"] = {"skipped": "mac_full", "running": running, "capacity": cap}
+    # Goal fleets always re-dispatch on verify failure (yolo); never gate on Mac capacity.
+    result["dispatch"] = dispatch_incomplete_goals(store, status)
 
     _record_goal_tick(store)
     store.event("goal_fleets_tick", **{k: v for k, v in result.items() if k not in {"goals"}})

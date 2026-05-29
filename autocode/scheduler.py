@@ -59,9 +59,6 @@ class Scheduler:
         auto_fix["watchdog_unblock"] = unblock
         watchdog_executor.process_actions(self.store, self)
         self_improve.scan(self.store)
-        from . import goal_fleets
-
-        goal_fleet_result = goal_fleets.tick(self.store, self)
         queue_archived.extend(self.store.queue_archive_done())
         auto_fix["queue_archived"] = queue_archived
         unstuck = recovery.reconcile_killed_chats(self.store)
@@ -177,10 +174,9 @@ class Scheduler:
             "stale_leases": stale_leases,
             "recovery_unstuck": unstuck,
             "goal_reopened": reopened,
-            "goal_fleets": goal_fleet_result,
+            "goal_fleets": goal_fleets_result,
             "auto_fix": auto_fix,
             "coordination": coord,
-            "goal_fleets": goal_fleets_result,
         }
 
     def _maybe_discover(self) -> str:
@@ -749,6 +745,14 @@ class Scheduler:
         )
         prompt_path = job_dir / "prompt.txt"
         source = str(row["source"] or "")
+        chat_id = str(row["id"] or "")
+        max_turns = (
+            "200"
+            if "l1-e2e-until-verified" in chat_id
+            else "120"
+            if source == "grok.wiki_squad" or "goal-fleet" in chat_id
+            else "40"
+        )
         grok_tail = [
             "--prompt-file",
             str(prompt_path),
@@ -756,7 +760,7 @@ class Scheduler:
             "--permission-mode",
             "bypassPermissions",
             "--max-turns",
-            "120" if source == "grok.wiki_squad" else "40",
+            max_turns,
             "--output-format",
             "plain",
         ]

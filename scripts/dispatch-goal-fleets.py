@@ -24,7 +24,7 @@ GOAL_FLEETS = {
         "provider": "cursor",
         "fallback_provider": "grok",
         "cwd": REDWALLET,
-        "position": -500.0,
+        "position": -10000.0,
         "goal": f"""RedWallet L1 E2E until verified (Goal 1).
 
 SUCCESS CRITERIA (stop with FLEET_DONE only when ALL met):
@@ -156,20 +156,29 @@ def main() -> None:
     if l1_active:
         from autocode import coordination
         from autocode.goal_fleets import (
+            _l1_loop_running,
             _l1_orchestrator_running,
             pause_duplicate_l1_fleet_chats,
             pause_l1_competitors_no_lock,
         )
 
         pause_duplicate_l1_fleet_chats(store, sched)
-        if not coordination.l1_lock_active() and not _l1_orchestrator_running():
+        if (
+            not coordination.l1_lock_active()
+            and not _l1_orchestrator_running()
+            and not _l1_loop_running()
+        ):
             coordination.kill_duplicate_l1_processes()
-        if not coordination.l1_lock_active():
+        if not coordination.l1_lock_active() and not _l1_orchestrator_running():
             print("L1 incomplete — pausing non-goal competitors (no lock acquire)")
             pause_l1_competitors_no_lock(store, sched)
 
+    l1_incomplete = any(g["id"] == "l1-e2e-verified" for g in incomplete)
     for g in incomplete:
         gid = g["id"]
+        if l1_incomplete and gid != "l1-e2e-verified":
+            print(f"SKIP {gid}: Goal 1 (l1-e2e-verified) incomplete — defer until verified")
+            continue
         spec = GOAL_FLEETS.get(gid)
         if not spec:
             print(f"SKIP no fleet spec for {gid}")
