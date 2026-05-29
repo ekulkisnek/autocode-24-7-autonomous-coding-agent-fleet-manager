@@ -80,7 +80,7 @@ def ensure_l1_loop(actions: list[str], status: dict) -> bool:
     l1 = next((g for g in status.get("goals", []) if g.get("id") == "l1-e2e-verified"), None)
     if not l1 or l1.get("complete"):
         return False
-    if _pgrep("run-l1-e2e-until-verified"):
+    if _pgrep(r"run-l1-e2e-until-verified\.sh"):
         return False
     if not L1_LOOP_SCRIPT.is_file():
         actions.append("missing_l1_loop_script")
@@ -163,7 +163,7 @@ def run_supervisor(*, json_out: bool = False) -> dict:
         "goals": {g["id"]: g.get("pct", 0) for g in status.get("goals", [])},
         "actions": actions,
         "daemon_pids": _pgrep("autocode.cli daemon run"),
-        "l1_loop_pids": _pgrep("run-l1-e2e-until-verified"),
+        "l1_loop_pids": _pgrep(r"run-l1-e2e-until-verified\.sh"),
         "detox_pids": _pgrep("detox test"),
         "electrum_up": _port_open("127.0.0.1", 60101),
         "l1_lock": (LOG_ROOT / ".l1-e2e-lock").is_file(),
