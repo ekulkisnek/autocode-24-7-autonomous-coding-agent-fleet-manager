@@ -66,6 +66,56 @@ class JobRunner:
             queue_snapshot_id=queue_snapshot_id,
         )
 
+    def start_remote(self, row: Row, plan: ContinuePlan, prompt: str, worker: dict, job_dir: Path | None = None, queue_snapshot_id: str = "") -> str:
+        """Dispatch a job to a remote worker over SSH, streaming output back locally."""
+        from . import remote_ssh
+
+        job_id = job_dir.name if job_dir else "job-" + uuid.uuid4().hex[:12]
+        job_dir = job_dir or JOBS / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = job_dir / "stdout.txt"
+        stderr_path = job_dir / "stderr.txt"
+
+        host = worker["host"]
+        worker_id = worker["id"] if "id" in worker.keys() else host
+        remote_cwd = worker["default_cwd"] or "~"
+
+        mkdir = remote_ssh.ensure_remote_job_dir(worker, job_id)
+        if mkdir.returncode != 0:
+            raise RuntimeError(
+                f"remote mkdir failed for {worker_id}: {(mkdir.stderr or mkdir.stdout).strip()}"
+            )
+        if plan.prompt_file or str(plan.provider or "") == "cursor":
+            (job_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+            copied = remote_ssh.scp_prompt_file(worker, str(job_dir / "prompt.txt"), job_id)
+            if copied.returncode != 0:
+                raise RuntimeError(
+                    f"remote scp failed for {worker_id}: {(copied.stderr or copied.stdout).strip()}"
+                )
+
+        full_cmd = remote_ssh.build_remote_exec_command(worker, remote_cwd, plan.cmd, job_id, env=plan.env)
+
+        out_f = stdout_path.open("wb")
+        err_f = stderr_path.open("wb")
+        proc = subprocess.Popen(full_cmd, stdout=out_f, stderr=err_f, stdin=subprocess.DEVNULL, start_new_session=True)
+        out_f.close()
+        err_f.close()
+
+        chat_id = str(row["id"])
+        with self.store.connect() as con:
+            con.execute(
+                """
+                insert into jobs(id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,created_at,updated_at,queue_snapshot_id,worker_id)
+                values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (job_id, chat_id, plan.provider, "running", proc.pid, remote_cwd,
+                 json_dumps(full_cmd), prompt, str(stdout_path), str(stderr_path),
+                 now_iso(), now_iso(), queue_snapshot_id, worker["id"]),
+            )
+            con.execute("update chats set state='running',last_drive_at=? where id=?", (now_iso(), chat_id))
+        self.store.event("job_started_remote", chat_id, job_id, provider=plan.provider, pid=proc.pid, worker=worker["id"], host=host)
+        return job_id
+
     def start_aux(
         self,
         chat_id: str,
@@ -219,6 +269,8 @@ class JobRunner:
         with self.store.connect() as con:
             for job in jobs:
                 pid = int(job["pid"] or 0)
+                if str(job["worker_id"] or "").strip():
+                    self._kill_remote_job(job)
                 self._terminate(pid)
                 con.execute(
                     """
@@ -294,11 +346,29 @@ class JobRunner:
         return ""
 
     def refresh(self) -> None:
+        self.reap_stale_remote_jobs()
         self.reattach_detached()
         jobs = self.store.rows("select * from jobs where status='running' order by created_at")
         for job in jobs:
             self._refresh_one(job)
         self._reconcile_idle_running_chats()
+
+    def reap_stale_remote_jobs(self, *, dry_run: bool = False) -> list[str]:
+        """Finalize remote jobs whose local SSH wrapper has already exited."""
+        reaped: list[str] = []
+        jobs = self.store.rows(
+            "select * from jobs where status='running' and coalesce(worker_id, '') != ''"
+        )
+        for job in jobs:
+            pid = int(job["pid"] or 0)
+            if self._pid_running(pid):
+                continue
+            reaped.append(str(job["id"]))
+            if not dry_run:
+                self._refresh_one(job)
+        if reaped and not dry_run:
+            self.store.event("remote_jobs_reaped", count=len(reaped), job_ids=reaped[:20])
+        return reaped
 
     def _reconcile_idle_running_chats(self) -> None:
         """Chats stuck in running with no live job cannot receive a new drive turn."""
@@ -322,6 +392,9 @@ class JobRunner:
         self.store.event("idle_running_chats_reconciled", count=len(rows))
 
     def _refresh_one(self, job: Row) -> None:
+        if str(job["worker_id"] or "").strip():
+            self._refresh_one_remote(job)
+            return
         pid = int(job["pid"] or 0)
         running = self._pid_running(pid)
         out = Path(job["stdout_path"])
@@ -532,6 +605,104 @@ class JobRunner:
         if archive_chat_id:
             self.store.queue_archive(archive_chat_id, reason="completed")
 
+    def _refresh_one_remote(self, job: Row) -> None:
+        """Refresh a job dispatched via SSH to a remote worker (tracks local ssh pid only)."""
+        pid = int(job["pid"] or 0)
+        running = self._pid_running(pid)
+        out = Path(job["stdout_path"])
+        err = Path(job["stderr_path"])
+        out_size = out.stat().st_size if out.exists() else 0
+        err_size = err.stat().st_size if err.exists() else 0
+        age = self._job_activity_age(job, out, err)
+        stall_seconds = max(self._stall_seconds_for(job), 600)
+        if str(job["provider"] or "") == "cursor":
+            stall_seconds = max(stall_seconds, 1800)
+        worker_id = str(job["worker_id"] or "")
+        evidence_status = "running_working" if out_size or err_size else "running"
+        evidence_reason = f"remote worker={worker_id}; ssh_pid={pid}; stdout_bytes={out_size}; stderr_bytes={err_size}"
+        status = "running" if running else "completed"
+        completed = ""
+        release_lease = False
+        if running and err_size and self._fatal_stderr(err) and not out_size:
+            evidence_status = "provider_error"
+            evidence_reason = f"{evidence_reason}; ssh/provider error in stderr"
+        elif running and not (out_size or err_size) and age > stall_seconds:
+            evidence_status = "running_silent"
+            evidence_reason = f"{evidence_reason}; no remote output for {int(age)}s"
+        job_timeout = DEFAULT_CURSOR_JOB_TIMEOUT if job["provider"] == "cursor" else DEFAULT_JOB_TIMEOUT
+        if age > job_timeout and running:
+            self._kill_remote_job(job)
+            self._terminate(pid)
+            status = "failed"
+            completed = now_iso()
+            evidence_status = "timed_out_with_work" if out_size or err_size else "silent_failed"
+            evidence_reason = f"remote timed out after {int(age)}s; {evidence_reason}"
+        elif not running:
+            completed = now_iso()
+            stdout_preview = read_text(out, limit=12000) if out_size else ""
+            stderr_preview = read_text(err, limit=4000) if err_size else ""
+            if self._fatal_stderr(err) and not out_size:
+                evidence_status = "provider_error"
+                status = "failed"
+            elif out_size or self._meaningful_stderr(err):
+                preview_for_minimal = stdout_preview or stderr_preview
+                if goals.output_too_minimal(self.store, preview_for_minimal):
+                    evidence_status = "goal_incomplete"
+                    status = "failed"
+                elif self._fatal_stderr(err) and not stdout_preview.strip():
+                    evidence_status = "provider_error"
+                    status = "failed"
+                else:
+                    evidence_status = "worked"
+            else:
+                evidence_status = "silent_failed"
+                status = "failed"
+            evidence_reason = f"remote ssh exited; {evidence_reason}"
+        with self.store.connect() as con:
+            con.execute(
+                """
+                update jobs set status=?,updated_at=?,completed_at=case when ?!='' then ? else completed_at end,
+                  evidence_status=?,evidence_reason=?,stdout_size=?,stderr_size=? where id=?
+                """,
+                (status, now_iso(), completed, completed, evidence_status, evidence_reason, out_size, err_size, job["id"]),
+            )
+            if release_lease or status != "running":
+                con.execute("delete from leases where job_id=?", (job["id"],))
+            if status != "running":
+                chat = con.execute("select * from chats where id=?", (job["chat_id"],)).fetchone()
+                if chat and not chat["done"]:
+                    new_state = "active" if status == "completed" and evidence_status == "worked" else "stalled"
+                    con.execute(
+                        "update chats set state=?,updated_at=? where id=? and state='running'",
+                        (new_state, now_iso(), job["chat_id"]),
+                    )
+        if status == "failed":
+            recovery.handle_job_failure(
+                self.store,
+                job,
+                evidence_status=evidence_status,
+                evidence_reason=evidence_reason,
+            )
+
+    def _kill_remote_job(self, job: Row) -> None:
+        from . import remote_ssh
+
+        worker_id = str(job["worker_id"] or "").strip()
+        if not worker_id:
+            return
+        worker = self.store.row("select * from remote_workers where id=?", (worker_id,))
+        if not worker:
+            return
+        try:
+            subprocess.run(
+                remote_ssh.build_remote_kill_command(worker, str(job["id"])),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except Exception:
+            pass
+
     def _stall_seconds_for(self, job: Row) -> int:
         chat = self.store.row("select objective from chats where id=?", (job["chat_id"],))
         objective = str(chat["objective"] or "") if chat else ""
@@ -695,6 +866,16 @@ class JobRunner:
             "http_status",
             "internal error",
             "does not support parameter",
+            "exec request failed on channel",
+            "failed to read",
+            "cannot find the path specified",
+            "max_turns exceeded",
+            "workspace path does not exist",
+            "workspace path does not exist:",
+            "signing in with grok",
+            "open this url to sign in",
+            "out of usage",
+            "increase your limit",
         ]
         return any(marker in text for marker in fatal)
 

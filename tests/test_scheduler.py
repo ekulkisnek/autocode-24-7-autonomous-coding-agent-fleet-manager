@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from autocode.models import Chat
+from autocode.models import Chat, ContinuePlan
 from autocode.runner import JobRunner
 from autocode.scheduler import Scheduler
 from autocode.store import Store
@@ -505,3 +505,182 @@ def test_same_repo_distinct_chats_not_blocked_by_lease(tmp_path: Path):
 
     assert sched.has_active_job(queued.id) is False
     assert sched.has_active_lease(row) is False
+
+
+def _seed_grok_chat(store: Store, tmp_path: Path, alias: str, position: float) -> str:
+    chat = Chat(
+        id=f"grok:grok.sqlite:{alias}",
+        provider="grok",
+        source="grok.sqlite",
+        provider_chat_id=f"{alias}-session",
+        title=alias,
+        cwd=str(tmp_path / alias),
+        updated_at="2026-05-21T00:00:00-05:00",
+        latest_text="work",
+        transcript_hash=f"h-{alias}",
+        alias=alias,
+        continuation="grok --resume",
+    )
+    (tmp_path / alias).mkdir(parents=True, exist_ok=True)
+    store.upsert_chat(chat, 5, "active", f"goal {alias}")
+    store.queue_add(chat.id, position)
+    return chat.id
+
+
+def test_tick_spills_to_remote_when_mac_is_full(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    with store.connect() as con:
+        con.execute(
+            """insert into remote_workers(id,host,ssh_user,provider_types,weight_capacity,default_cwd,ssh_key_path,enabled,notes,remote_shell)
+               values(?,?,?,?,?,?,?,1,?,?)""",
+            ("win", "100.0.0.1", "Luke", "grok", 4.0, "C:/Users/Luke", "", "", "powershell"),
+        )
+    _seed_grok_chat(store, tmp_path, "alpha", 1.0)
+    _seed_grok_chat(store, tmp_path, "beta", 2.0)
+
+    scheduler = Scheduler(store)
+    monkeypatch.setattr(scheduler.runner, "refresh", lambda: None)
+    monkeypatch.setattr(scheduler, "_maybe_discover", lambda: "test")
+    monkeypatch.setattr(scheduler, "capacity", lambda: 2)
+    monkeypatch.setattr(scheduler, "_running_dispatch_weight", lambda: 1.0)
+
+    local: list[str] = []
+    remote: list[str] = []
+
+    monkeypatch.setattr(scheduler, "dispatch", lambda row, queue_snapshot_id="": local.append(str(row["id"])) or "job-local")
+    monkeypatch.setattr(
+        scheduler,
+        "dispatch_remote",
+        lambda row, worker, queue_snapshot_id="": remote.append(str(row["id"])) or "job-remote",
+    )
+
+    result = scheduler.tick(dispatch=True)
+
+    assert result["sent"] == 1
+    assert local == ["grok:grok.sqlite:alpha"]
+    assert result["remote_sent"] == 1
+    assert remote == ["grok:grok.sqlite:beta"]
+    assert result["coordination"]["mac_can_take_more"] is False
+
+
+def test_tick_does_not_spill_to_remote_when_mac_has_capacity(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    with store.connect() as con:
+        con.execute(
+            """insert into remote_workers(id,host,ssh_user,provider_types,weight_capacity,default_cwd,ssh_key_path,enabled,notes,remote_shell)
+               values(?,?,?,?,?,?,?,1,?,?)""",
+            ("win", "100.0.0.1", "Luke", "grok", 4.0, "C:/Users/Luke", "", "", "powershell"),
+        )
+    _seed_grok_chat(store, tmp_path, "alpha", 1.0)
+    _seed_grok_chat(store, tmp_path, "beta", 2.0)
+
+    scheduler = Scheduler(store)
+    monkeypatch.setattr(scheduler.runner, "refresh", lambda: None)
+    monkeypatch.setattr(scheduler, "_maybe_discover", lambda: "test")
+    monkeypatch.setattr(scheduler, "capacity", lambda: 3)
+    monkeypatch.setattr(scheduler, "_running_dispatch_weight", lambda: 0.0)
+
+    local: list[str] = []
+    remote: list[str] = []
+    monkeypatch.setattr(scheduler, "dispatch", lambda row, queue_snapshot_id="": local.append(str(row["id"])) or f"job-{len(local)}")
+    monkeypatch.setattr(
+        scheduler,
+        "dispatch_remote",
+        lambda row, worker, queue_snapshot_id="": remote.append(str(row["id"])) or "job-remote",
+    )
+
+    result = scheduler.tick(dispatch=True)
+
+    assert result["sent"] == 2
+    assert len(local) == 2
+    assert result["remote_sent"] == 0
+    assert remote == []
+
+
+def test_adapt_plan_for_remote_rewrites_grok_cwd(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    sched = Scheduler(store)
+    plan = ContinuePlan(
+        True,
+        "grok",
+        "/Users/luke/project",
+        cmd=["grok", "--cwd", "/Users/luke/project", "--prompt-file", "/tmp/prompt.txt"],
+        prompt_file=True,
+    )
+    worker = {"default_cwd": "C:/Users/Luke"}
+    adapted = sched._adapt_plan_for_remote(plan, worker, job_id="job-1")
+    assert adapted.cwd == "C:/Users/Luke"
+    assert adapted.cmd[2] == "C:/Users/Luke"
+
+
+def test_adapt_plan_for_remote_maps_redwallet_workspace(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    sched = Scheduler(store)
+    long_prompt = "continue work\n" + ("x" * 250)
+    plan = ContinuePlan(
+        True,
+        "cursor",
+        "/Volumes/T705/code/work-on-something-to-do-with/redwallet",
+        cmd=[
+            "cursor-agent",
+            "--print",
+            "--workspace",
+            "/Volumes/T705/code/work-on-something-to-do-with/redwallet",
+            long_prompt,
+        ],
+        env={"CURSOR_API_KEY": "test-key"},
+    )
+    worker = {"default_cwd": "C:/Users/Luke"}
+    adapted = sched._adapt_plan_for_remote(plan, worker, job_id="job-rw")
+    assert adapted.cwd == "C:/Users/Luke/redwallet"
+    assert adapted.cmd[3] == "C:/Users/Luke/redwallet"
+    assert adapted.prompt_file is True
+    assert adapted.cmd[-1].startswith("__AUTOCODE_REMOTE_PROMPT_CONTENT__:")
+
+
+def test_pick_remote_worker_supports_cursor_provider(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    with store.connect() as con:
+        con.execute(
+            """insert into remote_workers(id,host,ssh_user,provider_types,weight_capacity,default_cwd,ssh_key_path,enabled,notes,remote_shell)
+               values(?,?,?,?,?,?,?,1,?,?)""",
+            ("win", "100.0.0.1", "Luke", "grok,cursor", 8.0, "C:/Users/Luke", "", "", "powershell"),
+        )
+    sched = Scheduler(store)
+    assert sched._pick_remote_worker("cursor", 1.0)["id"] == "win"
+    assert sched._pick_remote_worker("grok", 1.0)["id"] == "win"
+    assert sched._pick_remote_worker("codex", 1.0) is None
+
+
+def test_pick_remote_worker_requires_headroom_for_job_weight(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    with store.connect() as con:
+        con.execute(
+            """insert into remote_workers(id,host,ssh_user,provider_types,weight_capacity,default_cwd,ssh_key_path,enabled,notes,remote_shell)
+               values(?,?,?,?,?,?,?,1,?,?)""",
+            ("win", "100.0.0.1", "Luke", "grok", 1.0, "C:/Users/Luke", "", "", "powershell"),
+        )
+        con.execute(
+            """
+            insert into jobs(id,chat_id,provider,status,pid,cwd,cmd_json,prompt,stdout_path,stderr_path,created_at,updated_at,worker_id)
+            values(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "job-busy",
+                "grok:grok.sqlite:busy",
+                "grok",
+                "running",
+                123,
+                "C:/Users/Luke",
+                "[]",
+                "",
+                str(tmp_path / "out.txt"),
+                str(tmp_path / "err.txt"),
+                now_iso(),
+                now_iso(),
+                "win",
+            ),
+        )
+    sched = Scheduler(store)
+    assert sched._pick_remote_worker("grok", 1.0) is None
+    assert sched._pick_remote_worker("grok", 0.5) is None

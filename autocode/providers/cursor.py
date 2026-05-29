@@ -541,8 +541,18 @@ class CursorProvider(Provider):
             return base + ["--model", selected]
         return base
 
+    def _resolve_cwd(self, cwd: str) -> str:
+        text = str(cwd or "").strip()
+        if not text:
+            return str(HOME)
+        if re.match(r"^[A-Za-z]:[/\\]", text):
+            return text.replace("\\", "/")
+        if Path(text).exists():
+            return text
+        return str(HOME)
+
     def continue_plan(self, chat: Chat, prompt: str, job_dir: Path) -> ContinuePlan:
-        cwd = chat.cwd if chat.cwd and Path(chat.cwd).exists() else str(HOME)
+        cwd = self._resolve_cwd(chat.cwd)
         if chat.source == "cursor.cli":
             same_chat_prompt = self._cursor_safe_prompt(self._same_chat_prompt(prompt))
             return ContinuePlan(

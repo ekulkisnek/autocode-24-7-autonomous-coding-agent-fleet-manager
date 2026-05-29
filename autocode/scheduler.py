@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from sqlite3 import Row
@@ -77,6 +78,7 @@ class Scheduler:
             active_jobs=active,
             resource_for=self.runner.resource_for,
         )
+        dispatched_chat_ids: set[str] = set()
         if dispatch and limit > 0:
             for row in queued:
                 if len(sent) >= limit:
@@ -87,10 +89,60 @@ class Scheduler:
                 job_id = self.dispatch(row, queue_snapshot_id=snapshot_id)
                 if job_id:
                     sent.append(job_id)
+                    dispatched_chat_ids.add(str(row["id"]))
                     grok_watchdog.request("dispatch")
+
+        # Remote worker pass: spill to Windows/Linux workers once Mac is full.
+        remote_sent: list[str] = []
+        running_weight = self._running_dispatch_weight()
+        available = max(0.0, float(cap) - running_weight)
+        mac_can_take_more = available > 0 and len(sent) < limit
+        # Spill when Mac is full OR Mac is above soft spill threshold (default 85%).
+        spill_threshold = float(self.store.get_config("remote_spill_threshold", "0.85") or 0.85)
+        mac_utilization = running_weight / float(cap) if cap > 0 else 1.0
+        should_spill = dispatch and (not mac_can_take_more or mac_utilization >= spill_threshold)
+        if should_spill:
+            remote_budget = self._remote_dispatch_budget()
+            for row in queued:
+                if remote_budget <= 0:
+                    break
+                if str(row["id"]) in dispatched_chat_ids:
+                    continue
+                if self.has_active_job(row["id"]) or self.has_active_lease(row):
+                    continue
+                if recovery.provider_in_backoff(self.store, str(row["provider"] or "")):
+                    continue
+                job_weight = self._job_weight(row)
+                worker = self._pick_remote_worker(str(row["provider"] or ""), job_weight)
+                if not worker:
+                    continue
+                try:
+                    job_id = self.dispatch_remote(row, worker, queue_snapshot_id=snapshot_id)
+                except Exception as exc:
+                    self.store.event(
+                        "dispatch_remote_failed",
+                        row["id"],
+                        error=str(exc),
+                        worker=worker["id"],
+                        provider=str(row["provider"] or ""),
+                    )
+                    continue
+                if job_id:
+                    remote_sent.append(job_id)
+                    dispatched_chat_ids.add(str(row["id"]))
+                    remote_budget = max(0.0, remote_budget - job_weight)
+
+        coord = self.coordination_snapshot(
+            cap=cap,
+            running_weight=self._running_dispatch_weight(),
+            available=max(0.0, float(cap) - self._running_dispatch_weight()),
+            mac_can_take_more=self._running_dispatch_weight() < float(cap) and len(sent) < limit,
+        )
         return {
             "sent": len(sent),
             "jobs": sent,
+            "remote_sent": len(remote_sent),
+            "remote_jobs": remote_sent,
             "active_jobs": self.active_job_count(),
             "capacity": cap,
             "candidates": len(queued),
@@ -99,6 +151,7 @@ class Scheduler:
             "recovery_unstuck": unstuck,
             "goal_reopened": reopened,
             "auto_fix": auto_fix,
+            "coordination": coord,
         }
 
     def _maybe_discover(self) -> str:
@@ -132,26 +185,234 @@ class Scheduler:
         base = _PROVIDER_WEIGHT.get(provider, 1.0)
         try:
             from .util import json_loads
-            meta = json_loads(str(row.get("metadata_json") or ""), {}) or {}
+
+            meta_key = "metadata_json"
+            raw = ""
+            if isinstance(row, dict):
+                raw = str(row.get(meta_key) or "")
+            elif hasattr(row, "keys") and meta_key in row.keys():
+                raw = str(row[meta_key] or "")
+            meta = json_loads(raw, {}) or {}
             if provider == "grok" and float(meta.get("gw_suggested_timeout") or 0) >= _HEAVY_TIMEOUT_THRESHOLD:
                 base = 2.0
         except Exception:
             pass
         return base
 
+    def coordination_snapshot(
+        self,
+        *,
+        cap: int | None = None,
+        running_weight: float | None = None,
+        available: float | None = None,
+        mac_can_take_more: bool | None = None,
+    ) -> dict:
+        cap = self.capacity() if cap is None else cap
+        running_weight = self._running_dispatch_weight() if running_weight is None else running_weight
+        available = max(0.0, float(cap) - running_weight) if available is None else available
+        if mac_can_take_more is None:
+            mac_can_take_more = available > 0
+        workers: list[dict] = []
+        for w in self.store.rows("select * from remote_workers order by id asc"):
+            wid = str(w["id"])
+            used = self._remote_worker_weight(wid)
+            weight_cap = float(w["weight_capacity"] or 4.0)
+            workers.append(
+                {
+                    "id": wid,
+                    "enabled": bool(w["enabled"]),
+                    "host": str(w["host"] or ""),
+                    "providers": str(w["provider_types"] or ""),
+                    "load": round(used, 2),
+                    "capacity": weight_cap,
+                    "headroom": round(max(0.0, weight_cap - used), 2),
+                }
+            )
+        local_running = self.store.row(
+            "select count(*) c from jobs where status='running' and coalesce(worker_id,'')=''"
+        )
+        remote_running = self.store.row(
+            "select count(*) c from jobs where status='running' and coalesce(worker_id,'')!=''"
+        )
+        remote_weight = sum(
+            self._remote_worker_weight(str(w["id"]))
+            for w in self.store.rows("select id from remote_workers")
+        )
+        running_jobs = self.store.rows(
+            """
+            select j.id, j.worker_id, j.provider, j.evidence_status, j.created_at, c.alias
+            from jobs j left join chats c on c.id=j.chat_id
+            where j.status='running'
+            order by j.created_at asc
+            limit 20
+            """
+        )
+        return {
+            "mac_capacity": cap,
+            "mac_running_weight": round(running_weight, 2),
+            "mac_available": round(available, 2),
+            "mac_can_take_more": mac_can_take_more,
+            "local_running_jobs": int(local_running["c"] if local_running else 0),
+            "remote_running_jobs": int(remote_running["c"] if remote_running else 0),
+            "remote_running_weight": round(remote_weight, 2),
+            "remote_dispatch_budget": round(self._remote_dispatch_budget(), 2),
+            "workers": workers,
+            "running_jobs": [
+                {
+                    "id": str(r["id"]),
+                    "worker_id": str(r["worker_id"] or ""),
+                    "provider": str(r["provider"] or ""),
+                    "evidence_status": str(r["evidence_status"] or ""),
+                    "alias": str(r["alias"] or ""),
+                }
+                for r in running_jobs
+            ],
+        }
+
     def _running_dispatch_weight(self) -> float:
-        """Sum of resource weights for running jobs that occupy dispatch slots."""
+        """Sum of resource weights for locally running jobs (excludes remote worker jobs)."""
         placeholders = ",".join("?" * len(DISPATCH_SLOT_EXCLUDED_EVIDENCE))
         rows = self.store.rows(
             f"""
-            select j.id, c.provider, c.metadata_json
-            from jobs j join chats c on c.id=j.chat_id
+            select j.id, coalesce(nullif(j.provider, ''), c.provider) as provider, c.metadata_json
+            from jobs j left join chats c on c.id=j.chat_id
             where j.status='running'
+              and coalesce(j.worker_id, '') = ''
               and coalesce(j.evidence_status, '') not in ({placeholders})
             """,
             tuple(DISPATCH_SLOT_EXCLUDED_EVIDENCE),
         )
         return sum(self._job_weight(r) for r in rows)
+
+    def _remote_dispatch_budget(self) -> float:
+        """Total remote weight headroom across enabled workers."""
+        total = 0.0
+        for w in self.store.rows("select * from remote_workers where enabled=1"):
+            cap = float(w["weight_capacity"] or 4.0)
+            used = self._remote_worker_weight(str(w["id"]))
+            total += max(0.0, cap - used)
+        return total
+
+    def _remote_worker_weight(self, worker_id: str) -> float:
+        """Sum of resource weights for jobs running on a specific remote worker."""
+        rows = self.store.rows(
+            """
+            select j.id, j.provider, c.metadata_json
+            from jobs j left join chats c on c.id=j.chat_id
+            where j.status='running' and j.worker_id=?
+            """,
+            (worker_id,),
+        )
+        return sum(self._job_weight(r) for r in rows)
+
+    def _pick_remote_worker(self, provider: str, job_weight: float = 1.0) -> dict | None:
+        """Return the remote worker with most available headroom for this provider, or None."""
+        workers = self.store.rows("select * from remote_workers where enabled=1")
+        best: dict | None = None
+        best_headroom = 0.0
+        needed = max(0.1, float(job_weight or 1.0))
+        for w in workers:
+            supported = {p.strip() for p in str(w["provider_types"] or "").split(",") if p.strip()}
+            if provider not in supported:
+                continue
+            weight_cap = float(w["weight_capacity"] or 4.0)
+            used = self._remote_worker_weight(str(w["id"]))
+            headroom = weight_cap - used
+            if headroom >= needed and headroom > best_headroom:
+                best_headroom = headroom
+                best = dict(w)
+        return best
+
+    def _map_path_for_remote(self, mac_path: str, worker: dict) -> str:
+        """Map a Mac workspace path to the corresponding path on a remote worker."""
+        from .remote_ssh import normalize_cwd, worker_field
+
+        path = normalize_cwd(str(mac_path or "").strip())
+        remote_base = normalize_cwd(worker_field(worker, "default_cwd") or "~")
+        if remote_base == "~":
+            remote_base = "C:/Users/Luke"
+        if not path or path == "~":
+            return remote_base
+        if re.match(r"^[A-Za-z]:/", path):
+            return path
+        mappings = [
+            ("/Volumes/T705/code/work-on-something-to-do-with/redwallet", f"{remote_base}/redwallet"),
+            ("/Volumes/T705/code/drivechain-wallet-dev", f"{remote_base}/drivechain-wallet-dev"),
+            ("/Users/lukekensik/redwallet", f"{remote_base}/redwallet"),
+        ]
+        for mac_prefix, win_prefix in mappings:
+            if path == mac_prefix or path.startswith(mac_prefix + "/"):
+                return win_prefix + path[len(mac_prefix):]
+        name = Path(path).name.lower()
+        if name in {"redwallet", "bluewallet"}:
+            return f"{remote_base}/redwallet"
+        if "drivechain-wallet-dev" in path:
+            suffix = path.split("drivechain-wallet-dev", 1)[-1].lstrip("/")
+            return f"{remote_base}/drivechain-wallet-dev/{suffix}" if suffix else f"{remote_base}/drivechain-wallet-dev"
+        return remote_base
+
+    def _adapt_plan_for_remote(self, plan: ContinuePlan, worker: dict, job_id: str = "") -> ContinuePlan:
+        from .remote_ssh import REMOTE_PROMPT_CONTENT, normalize_cwd, worker_field
+
+        remote_cwd = self._map_path_for_remote(plan.cwd or worker_field(worker, "default_cwd") or "~", worker)
+        cmd = list(plan.cmd)
+        path_flags = {"--cwd", "--workspace"}
+        for index, arg in enumerate(cmd):
+            if str(arg) in path_flags and index + 1 < len(cmd):
+                cmd[index + 1] = self._map_path_for_remote(str(cmd[index + 1]), worker)
+        prompt_file = plan.prompt_file
+        # Cursor takeover/resume passes multi-KB prompts inline; remote SSH cannot carry that.
+        if plan.provider == "cursor" and not prompt_file and cmd:
+            inline = str(cmd[-1])
+            if len(inline) > 200 and not inline.startswith("-"):
+                cmd[-1] = f"{REMOTE_PROMPT_CONTENT}:{job_id or 'remote'}"
+                prompt_file = True
+        return ContinuePlan(
+            plan.supported,
+            plan.provider,
+            remote_cwd,
+            cmd=cmd,
+            stdin=plan.stdin,
+            prompt_file=prompt_file,
+            env=plan.env,
+            same_chat=plan.same_chat,
+            reason=plan.reason,
+        )
+
+    def dispatch_remote(self, row: Row, worker: dict, queue_snapshot_id: str = "") -> str | None:
+        """Dispatch a job to a specific remote worker."""
+        from .models import Chat
+        from .providers import provider_map
+        prompt = build_prompt(self._row_with_plan(row), recovery=row["state"] == "stalled")
+        job_dir = self._planned_job_dir()
+        raw_cwd = str(row["cwd"] or str(HOME))
+        mapped_cwd = self._map_path_for_remote(raw_cwd, worker)
+        chat = Chat(
+            id=row["id"], provider=row["provider"], source=row["source"],
+            provider_chat_id=row["provider_chat_id"], title=row["title"], cwd=mapped_cwd,
+            updated_at=row["updated_at"], latest_text=row["latest_text"],
+            transcript_hash=row["transcript_hash"], alias=row["alias"],
+            continuation=row["continuation"],
+        )
+        providers = provider_map()
+        native = str(row["provider"] or "")
+        provider = providers.get(native)
+        if not provider:
+            return None
+        plan = provider.continue_plan(chat, prompt, job_dir)
+        if not plan.supported:
+            plan = self.fallback_plan(row, prompt, job_dir)
+        if not plan.supported:
+            return None
+        if plan.cmd and str(plan.cmd[0]).startswith("python"):
+            return None
+        plan = self._adapt_plan_for_remote(plan, worker, job_id=job_dir.name)
+        job_id = self.runner.start_remote(row, plan, prompt, worker, job_dir, queue_snapshot_id=queue_snapshot_id)
+        from . import remote_ssh
+
+        remote_ssh.touch_worker_seen(self.store, str(worker["id"]))
+        self.store.event("dispatch_remote", row["id"], job_id, provider=plan.provider, worker=worker["id"])
+        return job_id
 
     def capacity(self) -> int:
         """Return weight-budget for dispatch (total slots assuming standard-weight new jobs)."""
