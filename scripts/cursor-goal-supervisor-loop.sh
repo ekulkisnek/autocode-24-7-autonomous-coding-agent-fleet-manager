@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-INTERVAL="${CURSOR_GOAL_SUPERVISOR_INTERVAL:-600}"
+INTERVAL="${CURSOR_GOAL_SUPERVISOR_INTERVAL:-120}"
 AUTOCODE="${AUTOCODE_HOME:-$HOME/autocode}"
 PID_FILE="${AUTOCODE}/state/cursor-goal-supervisor-loop.pid"
 

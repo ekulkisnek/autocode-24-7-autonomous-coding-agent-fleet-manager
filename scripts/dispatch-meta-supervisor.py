@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from autocode.models import Chat
+from autocode.goal_supervisor_adaptive import adaptive_context_for_dispatch, format_escalation_block
 from autocode.scheduler import Scheduler
 from autocode.store import Store
 from autocode.util import now_iso, sha
@@ -19,7 +20,7 @@ AUTOCODE_ROOT = Path(__file__).resolve().parents[1]
 REDWALLET = "/Volumes/T705/code/work-on-something-to-do-with/redwallet"
 LOG_ROOT = "/Volumes/T705/redwallet-logs"
 META_ALIAS = "autocode-meta-supervisor"
-DEFAULT_INTERVAL_SEC = int(__import__("os").environ.get("AUTOCODE_META_SUPERVISOR_INTERVAL", "600"))
+DEFAULT_INTERVAL_SEC = int(__import__("os").environ.get("AUTOCODE_META_SUPERVISOR_INTERVAL", "120"))
 
 
 def load_infra_report() -> dict:
@@ -78,9 +79,11 @@ def meta_supervisor_due(store: Store, *, infra_actions: list[str]) -> bool:
         return True
 
 
-def build_goal(status: dict, infra: dict, ctx: str) -> str:
+def build_goal(status: dict, infra: dict, ctx: str, adaptive_ctx: dict | None = None) -> str:
     goals_txt = json.dumps(status.get("goals", []), indent=2)
     infra_txt = json.dumps(infra, indent=2)
+    escalation = format_escalation_block(adaptive_ctx or {})
+    escalation_block = f"\n\n{escalation}" if escalation else ""
     return f"""AutoCode meta-supervisor (self-healing control plane).
 
 You supervise autocode until ALL final goals pass verify-goal-status.py.
@@ -108,7 +111,7 @@ LiPhone unplugged — simulator path ONLY. Android 0A201JECB03306 connected.
 6. Commit + push meaningful fixes to ekulkisnek forks.
 
 ## Failure context
-{ctx}
+{ctx}{escalation_block}
 
 ## End condition for THIS job
 - If you made fixes: summarize what changed and what should run next.
@@ -146,7 +149,8 @@ def main() -> None:
         return
 
     ctx = failure_context()
-    goal = build_goal(status, infra, ctx)
+    adaptive_ctx = adaptive_context_for_dispatch()
+    goal = build_goal(status, infra, ctx, adaptive_ctx)
     chat_id = f"cursor:meta-supervisor:{sha(goal)[:8]}"
     chat = Chat(
         id=chat_id,

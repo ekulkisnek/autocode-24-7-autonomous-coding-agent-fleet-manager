@@ -13,7 +13,13 @@ from .config import ROOT
 from .store import Store
 from .util import json_dumps, json_loads, now_iso
 
-DEFAULT_GOAL_TICK_INTERVAL = int(os.environ.get("AUTOCODE_GOAL_TICK_INTERVAL", "90"))
+from .goal_supervisor_adaptive import (
+    format_adaptive_block,
+    maybe_bump_l1_mac_workers,
+    record_tick,
+)
+
+DEFAULT_GOAL_TICK_INTERVAL = int(os.environ.get("AUTOCODE_GOAL_TICK_INTERVAL", "120"))
 L1_RUNNER_STUCK_SECONDS = int(os.environ.get("L1_E2E_RUNNER_STUCK_SECONDS", "2700"))
 LOG_ROOT = Path("/Volumes/T705/redwallet-logs")
 L1_RUN_SYMLINKS = (
@@ -496,7 +502,14 @@ def _l1_runner_stuck() -> bool:
     return age is not None and age >= L1_RUNNER_STUCK_SECONDS
 
 
-def _inject_failure_context(store: Store, chat_id: str, goal: dict, reason: str) -> None:
+def _inject_failure_context(
+    store: Store,
+    chat_id: str,
+    goal: dict,
+    reason: str,
+    *,
+    adaptive_ctx: dict[str, Any] | None = None,
+) -> None:
     row = store.row("select metadata_json from chats where id=?", (chat_id,))
     meta = json_loads(str(row["metadata_json"] or "" if row else ""), {})
     if not isinstance(meta, dict):
@@ -517,6 +530,7 @@ def _inject_failure_context(store: Store, chat_id: str, goal: dict, reason: str)
         "at": now_iso(),
     }
     meta["remediation_prompt_prefix"] = (
+        f"{format_adaptive_block(adaptive_ctx or {})}\n\n"
         f"GOAL INCOMPLETE ({goal.get('id')} at {goal.get('pct')}%): {reason[:6000]}\n"
         f"External verify-goal-status still failing. Continue until criteria met.\n\n"
     )
@@ -524,7 +538,12 @@ def _inject_failure_context(store: Store, chat_id: str, goal: dict, reason: str)
         con.execute("update chats set metadata_json=? where id=?", (json_dumps(meta), chat_id))
 
 
-def reconcile_false_complete_fleets(store: Store, status: dict[str, Any]) -> list[str]:
+def reconcile_false_complete_fleets(
+    store: Store,
+    status: dict[str, Any],
+    *,
+    adaptive_ctx: dict[str, Any] | None = None,
+) -> list[str]:
     """Re-open fleet chats marked done while external goal verification still fails."""
     from . import goals
 
@@ -552,7 +571,7 @@ def reconcile_false_complete_fleets(store: Store, status: dict[str, Any]) -> lis
                 continue
         reason = f"external goal {goal['id']} incomplete at {goal.get('pct')}%"
         if goals.reopen_chat_for_goal(store, chat_id, reason="external_goal_incomplete"):
-            _inject_failure_context(store, chat_id, goal, reason)
+            _inject_failure_context(store, chat_id, goal, reason, adaptive_ctx=adaptive_ctx)
             reopened.append(chat_id)
             store.event("goal_fleet_reopened", chat_id, goal_id=goal["id"], pct=goal.get("pct"))
     return reopened
@@ -573,7 +592,12 @@ def _active_fleet_job(store: Store, goal_id: str) -> bool:
     return bool(row and int(row["c"] or 0) > 0)
 
 
-def dispatch_incomplete_goals(store: Store, status: dict[str, Any]) -> dict[str, Any]:
+def dispatch_incomplete_goals(
+    store: Store,
+    status: dict[str, Any],
+    *,
+    adaptive_ctx: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Dispatch goal fleets when idle and incomplete."""
     incomplete = [g for g in status.get("goals", []) if not g.get("complete")]
     if not incomplete:
@@ -594,7 +618,7 @@ def dispatch_incomplete_goals(store: Store, status: dict[str, Any]) -> dict[str,
         chat = _fleet_chat_for_goal(store, gid)
         if chat:
             reason = f"external goal {gid} at {goal.get('pct')}% — re-dispatch after verify failure"
-            _inject_failure_context(store, str(chat["id"]), goal, reason)
+            _inject_failure_context(store, str(chat["id"]), goal, reason, adaptive_ctx=adaptive_ctx)
         dispatched.append(gid)
     if not dispatched:
         return {"dispatched": [], "skipped": skipped}
@@ -642,9 +666,14 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
     result["goals"] = {g["id"]: g.get("pct", 0) for g in status.get("goals", [])}
 
     if status.get("all_complete"):
+        record_tick(goals_complete=True)
         _record_goal_tick(store)
         store.event("goal_fleets_all_complete")
         return result
+
+    adaptive_ctx = record_tick(goals_complete=False)
+    result["adaptive_supervisor"] = adaptive_ctx
+    result["l1_mac_worker_bump"] = maybe_bump_l1_mac_workers(store, adaptive_ctx)
 
     l1_incomplete = any(g.get("id") == "l1-e2e-verified" and not g.get("complete") for g in status.get("goals", []))
     l1_busy = _l1_orchestrator_running() or _l1_loop_running()
@@ -676,10 +705,10 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
         result["l1_runner_stuck"] = _l1_runner_stuck()
         result["latest_l1_run_dir"] = str(find_latest_l1_run_dir() or "")
 
-    result["reopened"] = reconcile_false_complete_fleets(store, status)
+    result["reopened"] = reconcile_false_complete_fleets(store, status, adaptive_ctx=adaptive_ctx)
 
     # Goal fleets always re-dispatch on verify failure (yolo); never gate on Mac capacity.
-    result["dispatch"] = dispatch_incomplete_goals(store, status)
+    result["dispatch"] = dispatch_incomplete_goals(store, status, adaptive_ctx=adaptive_ctx)
 
     if l1_incomplete and L1_WORKERS_SCRIPT.is_file():
         if l1_busy:
