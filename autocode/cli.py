@@ -480,6 +480,7 @@ def cmd_squad(args: argparse.Namespace) -> None:
         if not args.force:
             print(f"Squad resource budget: active_jobs={active}/{cap}, launch_slots={requested}, load={load1():.2f}{mem_text}")
         launched = 0
+        launched_chat_ids: list[str] = []
         for lane in lanes:
             if args.mode != "all" and lane["mode"] != args.mode:
                 continue
@@ -504,15 +505,23 @@ def cmd_squad(args: argparse.Namespace) -> None:
             if args.dry_run:
                 print(f"would launch {lane['name']} [{lane['provider']}/{lane['mode']}]")
                 print(f"cmd: {' '.join(plan.cmd)}")
+                launched_chat_ids.append(chat_id)
                 launched += 1
                 continue
             lease = lane["path"] if lane["mode"] == "worktree" else ""
             job_id = sched.runner.start_aux(chat_id, lane["path"], plan, prompt, job_dir, lease_resource=lease)
             store.event("squad_lane_started", chat_id, job_id, priority_id=priority["id"], lane=lane["name"], mode=lane["mode"])
             print(f"launched {lane['name']}: {job_id}")
+            launched_chat_ids.append(chat_id)
             launched += 1
         if launched == 0 and not args.dry_run:
             print("No squad lanes launched.")
+        # Note: squad lanes are parallel by design (helper lenses).
+        # --sequential records the launch order as a dependency hint in the event log only.
+        if getattr(args, "sequential", False) and len(launched_chat_ids) > 1:
+            order = " → ".join(cid.split(":")[-1] for cid in launched_chat_ids)
+            print(f"  sequential order recorded: {order}")
+            store.event("squad_sequential_hint", priority["id"], lane_order=order)
         return
     if args.squad_cmd == "collect":
         pattern = f"squad:{priority['id']}:%"
@@ -891,6 +900,36 @@ def cmd_done(args: argparse.Namespace) -> None:
     print(f"Done {row['alias']}")
 
 
+def cmd_depend(args: argparse.Namespace) -> None:
+    store = Store()
+    chat = store.find_chat(args.query)
+    if not chat:
+        raise SystemExit(f"No chat matched: {args.query}")
+    if args.depend_cmd == "list":
+        deps = store.get_dependencies(chat["id"])
+        if not deps:
+            print(f"{chat['alias']} has no dependencies.")
+        else:
+            print(f"Dependencies of {chat['alias']}:")
+            for d in deps:
+                state = "done" if d["done"] else d["state"]
+                print(f"  [{state}] {d['depends_on'][:8]}  {d['title'] or '(no title)'}")
+    elif args.depend_cmd == "add":
+        on_chat = store.find_chat(args.on)
+        if not on_chat:
+            raise SystemExit(f"No chat matched for --on: {args.on}")
+        if store.add_dependency(chat["id"], on_chat["id"]):
+            print(f"Added: {chat['alias']} depends on {on_chat['alias']}")
+        else:
+            print("Dependency already exists or self-reference rejected.")
+    elif args.depend_cmd == "remove":
+        on_chat = store.find_chat(args.on)
+        if not on_chat:
+            raise SystemExit(f"No chat matched for --on: {args.on}")
+        store.remove_dependency(chat["id"], on_chat["id"])
+        print(f"Removed dependency: {chat['alias']} no longer waits on {on_chat['alias']}")
+
+
 def cmd_logs(args: argparse.Namespace) -> None:
     if not LOG.exists():
         print("No log yet.")
@@ -974,6 +1013,13 @@ def cmd_queue(args: argparse.Namespace) -> None:
             return
         active = store.rows("select chat_id from jobs where status='running'")
         running_ids = {r["chat_id"] for r in active}
+        show_deps = getattr(args, "deps", False)
+        # Pre-fetch all dependency info when --deps is set
+        dep_map: dict = {}
+        if show_deps:
+            for r in rows:
+                deps = store.get_dependencies(r["chat_id"])
+                dep_map[r["chat_id"]] = deps
         print(f"Active queue ({len(rows)} items):")
         for r in rows:
             pos = r["position"]
@@ -982,9 +1028,21 @@ def cmd_queue(args: argparse.Namespace) -> None:
             is_running = r["chat_id"] in running_ids
             flag = " [RUNNING]" if is_running else ""
             title = r["alias"] or r["title"] or r["chat_id"]
-            print(f"  {pos_str:<6} {rel_time(r['updated_at']):>5}  {r['provider']:<11} {state:<13} {short(title)}{flag}")
+            # Show [BLOCKED] if any unfinished dep exists
+            blocking = []
+            if show_deps and r["chat_id"] in dep_map:
+                blocking = [d for d in dep_map[r["chat_id"]] if not d["done"]]
+            blocked_flag = " [BLOCKED]" if blocking else ""
+            print(f"  {pos_str:<6} {rel_time(r['updated_at']):>5}  {r['provider']:<11} {state:<13} {short(title)}{flag}{blocked_flag}")
             if r["objective"]:
                 print(f"         goal: {compact(r['objective'], 160)}")
+            if show_deps and r["chat_id"] in dep_map:
+                all_deps = dep_map[r["chat_id"]]
+                for d in all_deps:
+                    dep_state = "done" if d["done"] else d["state"]
+                    dep_title = short(d["title"] or d["depends_on"][:8])
+                    dep_mark = "✓" if d["done"] else "⏳"
+                    print(f"         {dep_mark} depends on: {dep_title} [{dep_state}]")
         if stale:
             print(f"\nDone but still in queue ({len(stale)} — run: autocode queue archive --all-done):")
             for r in stale:
@@ -1198,6 +1256,73 @@ def cmd_preprint_kit(args: argparse.Namespace) -> None:
             print(f"- {finding}")
 
 
+def cmd_ipc(args: argparse.Namespace) -> None:
+    from . import self_improve
+    store = Store()
+    if getattr(args, "scan", False):
+        result = self_improve.scan(store, force=True)
+        print(json.dumps(result, indent=2))
+        return
+    print(self_improve.format_ipc_report(store))
+
+
+def cmd_watchdog(args: argparse.Namespace) -> None:
+    from . import watchdog_executor
+    from .store import Store
+
+    if args.watchdog_cmd == "list":
+        actions = watchdog_executor._load_actions()
+        status_filter = getattr(args, "status", None)
+        if status_filter:
+            actions = [a for a in actions if a.get("status") == status_filter]
+        if not actions:
+            print("no actions" + (f" with status={status_filter}" if status_filter else ""))
+            return
+        for a in actions:
+            aid = a.get("id", "?")
+            atype = a.get("type", "?")
+            chat = a.get("chat_id", "")
+            status = a.get("status", "?")
+            conf = a.get("confidence", 1.0)
+            needs = " [needs_luke]" if a.get("needs_luke") else ""
+            reason = a.get("reject_reason", "")
+            print(f"  {aid:<20} {atype:<22} {chat:<20} {status}{needs}  conf={conf:.2f}{'  '+reason if reason else ''}")
+
+    elif args.watchdog_cmd == "apply":
+        action_id = args.action_id
+        actions = watchdog_executor._load_actions()
+        target = next((a for a in actions if str(a.get("id") or "") == action_id), None)
+        if not target:
+            print(f"action {action_id!r} not found")
+            return
+        if target.get("status") == "applied":
+            print(f"action {action_id} already applied")
+            return
+        store = Store()
+        try:
+            result = watchdog_executor._apply_action(store, target)
+        except Exception as exc:
+            print(f"error: {exc}")
+            return
+        if result:
+            target["status"] = "applied"
+            from .util import now_iso, now_ts
+            target["applied_at"] = now_iso()
+            target["applied_at_ts"] = now_ts()
+            watchdog_executor._save_actions(actions)
+            store.event("watchdog_action_applied_manual", action_id=action_id, action_type=target.get("type", ""))
+            print(f"applied: {action_id} ({target.get('type')})")
+        else:
+            print(f"action returned False (no-op or precondition failed)")
+
+    elif args.watchdog_cmd == "clear":
+        actions = watchdog_executor._load_actions()
+        before = len(actions)
+        keep = [a for a in actions if a.get("status") != "rejected"]
+        watchdog_executor._save_actions(keep)
+        print(f"cleared {before - len(keep)} rejected actions ({len(keep)} remain)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="autocode")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1247,11 +1372,17 @@ def build_parser() -> argparse.ArgumentParser:
     sq = sub.add_parser("squad")
     sqsub = sq.add_subparsers(dest="squad_cmd", required=True)
     sqp = sqsub.add_parser("plan"); sqp.add_argument("query"); sqp.set_defaults(func=cmd_squad)
-    sql = sqsub.add_parser("launch"); sql.add_argument("query"); sql.add_argument("--limit", type=int, default=0, help="maximum lanes to launch; 0 means use current resource headroom"); sql.add_argument("--mode", choices=["read_only", "worktree", "all"], default="read_only"); sql.add_argument("--dry-run", action="store_true"); sql.add_argument("--force", action="store_true"); sql.set_defaults(func=cmd_squad)
+    sql = sqsub.add_parser("launch"); sql.add_argument("query"); sql.add_argument("--limit", type=int, default=0, help="maximum lanes to launch; 0 means use current resource headroom"); sql.add_argument("--mode", choices=["read_only", "worktree", "all"], default="read_only"); sql.add_argument("--dry-run", action="store_true"); sql.add_argument("--force", action="store_true"); sql.add_argument("--sequential", action="store_true", help="record lane launch order as a sequential hint event"); sql.set_defaults(func=cmd_squad)
     sqc = sqsub.add_parser("collect"); sqc.add_argument("query"); sqc.add_argument("--limit", type=int, default=8); sqc.add_argument("--send-writer", action="store_true"); sqc.set_defaults(func=cmd_squad)
     y = sub.add_parser("yolo"); y.add_argument("state", choices=["on", "off"]); y.set_defaults(func=cmd_yolo)
     pa = sub.add_parser("pause"); pa.add_argument("query"); pa.set_defaults(func=cmd_pause)
     dn = sub.add_parser("done"); dn.add_argument("query"); dn.set_defaults(func=cmd_done)
+    dep = sub.add_parser("depend")
+    dep.add_argument("query", help="chat to inspect or modify dependencies for")
+    depsub = dep.add_subparsers(dest="depend_cmd", required=True)
+    depl = depsub.add_parser("list"); depl.set_defaults(func=cmd_depend)
+    depa = depsub.add_parser("add"); depa.add_argument("--on", required=True, help="chat that must be done first"); depa.set_defaults(func=cmd_depend)
+    depr = depsub.add_parser("remove"); depr.add_argument("--on", required=True); depr.set_defaults(func=cmd_depend)
     l = sub.add_parser("logs"); l.add_argument("--lines", type=int, default=80); l.set_defaults(func=cmd_logs)
     doc = sub.add_parser("doctor")
     doc.add_argument("--auto-fix", action="store_true", help="run remediation pass on live DB")
@@ -1260,7 +1391,7 @@ def build_parser() -> argparse.ArgumentParser:
     tick = sub.add_parser("tick"); tick.add_argument("--dry-run", action="store_true"); tick.add_argument("--max-projects", type=int, default=None); tick.set_defaults(func=cmd_tick)
     q = sub.add_parser("queue")
     qsub = q.add_subparsers(dest="queue_cmd", required=True)
-    ql = qsub.add_parser("list"); ql.set_defaults(func=cmd_queue)
+    ql = qsub.add_parser("list"); ql.add_argument("--deps", action="store_true", help="show dependency tree for each queued chat"); ql.set_defaults(func=cmd_queue)
     qf = qsub.add_parser("finished"); qf.add_argument("--limit", type=int, default=30); qf.set_defaults(func=cmd_queue)
     qarch = qsub.add_parser("archive"); qarch.add_argument("query", nargs="?", default=""); qarch.add_argument("--all-done", action="store_true", help="archive every done chat still in the active queue"); qarch.add_argument("--reason", default="done"); qarch.set_defaults(func=cmd_queue)
     qa = qsub.add_parser("add"); qa.add_argument("query"); qa.add_argument("--position", type=float, default=None, help="queue position (float; lower = higher priority)"); qa.add_argument("--goal", default="", help="optional goal to attach"); qa.set_defaults(func=cmd_queue)
@@ -1281,6 +1412,14 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("install", "start", "stop", "restart"):
         x = dsub.add_parser(name); x.set_defaults(func=cmd_daemon)
     st = dsub.add_parser("status"); st.add_argument("--verbose", action="store_true"); st.set_defaults(func=cmd_daemon)
+    ipc = sub.add_parser("ipc", help="show IPC (jobs-per-completion) metric and self-improvement status")
+    ipc.add_argument("--scan", action="store_true", help="force a self-improvement scan now")
+    ipc.set_defaults(func=cmd_ipc)
+    wd = sub.add_parser("watchdog", help="manage watchdog action queue")
+    wdsub = wd.add_subparsers(dest="watchdog_cmd", required=True)
+    wdl = wdsub.add_parser("list", help="list watchdog actions"); wdl.add_argument("--status", default="", help="filter by status: pending, applied, rejected"); wdl.set_defaults(func=cmd_watchdog)
+    wda = wdsub.add_parser("apply", help="manually apply a watchdog action (for needs_luke actions)"); wda.add_argument("action_id", help="action id to apply"); wda.set_defaults(func=cmd_watchdog)
+    wdc = wdsub.add_parser("clear", help="remove rejected actions from the queue file"); wdc.set_defaults(func=cmd_watchdog)
     return p
 
 

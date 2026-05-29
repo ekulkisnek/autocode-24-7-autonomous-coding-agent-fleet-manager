@@ -13,8 +13,8 @@ CODING_WORDS = re.compile(
     r"implementation|bug|fix|refactor|deploy|e2e|detox|chrome|cursor|codex|grok build)\b",
     re.I,
 )
-FLEET_DONE_MARKER = re.compile(r"(?im)^\s*FLEET_DONE(?:\s*:|\b)")
-FLEET_MILESTONE_MARKER = re.compile(r"(?im)^\s*(FLEET_MILESTONE_COMPLETE|FLEET_MILESTONE\s*:)\b")
+FLEET_DONE_MARKER = re.compile(r"(?im)^\s*\*{0,2}\s*FLEET_DONE(?:\s*:|\b)")
+FLEET_MILESTONE_MARKER = re.compile(r"(?im)^\s*\*{0,2}\s*(FLEET_MILESTONE_COMPLETE|FLEET_MILESTONE\s*:)\b")
 DONE_WORDS = re.compile(r"\b(fully complete|complete and verified|done\.?$|nothing left|all tests pass(?:ed)?)\b", re.I)
 MILESTONE_WORDS = re.compile(r"\b(milestone complete|next step|remaining|still needs|todo|blocked|needs input|shall i proceed|continue)\b", re.I)
 ASK_WORDS = re.compile(r"\b(shall i|should i|do you want|would you like|please confirm|need permission|waiting for|blocked)\b", re.I)
@@ -39,7 +39,8 @@ USER_GATED_WORDS = re.compile(
 )
 COMPLETION_CLAIM_WORDS = re.compile(
     r"\b(complete(?:d)?|finished|done|production ready|fully verified|all tests pass(?:ed)?|"
-    r"shipped|wrapped up|no remaining work|nothing left)\b",
+    r"shipped|wrapped up|no remaining work|nothing left|objective (?:met|achieved|complete|done)|"
+    r"task (?:complete|finished|done)|goal (?:satisfied|achieved|complete)|ready to (?:ship|close|mark done))\b",
     re.I,
 )
 VERIFICATION_WORDS = re.compile(
@@ -234,13 +235,15 @@ def build_prompt(row: Row, recovery: bool = False) -> str:
         "- Take the fastest safe path to complete the goal.\n"
         "- Do not wait for Luke/Hermes if a safe next action exists.\n"
         "- Edit files, run tests, commit, and push when appropriate.\n"
+        "- Always end your response with exactly one structured marker line (FLEET_PLAN or FLEET_MILESTONE or FLEET_DONE). Put it as the very last line.\n"
         "- Do not spend a turn passively waiting on long tests or background processes. If work will take more than 30 seconds, start it in tmux/background, record the log path/status command, report current evidence, and exit so AutoCode can re-enter immediately.\n"
         "- When a background test/process is already running, inspect its current log/process state and either fix/continue from new evidence or report that it is still running; do not sleep longer than 30 seconds inside the agent turn.\n"
         "- If this is only a milestone, output FLEET_MILESTONE_COMPLETE and continueable next steps.\n"
-        "- Always end your response with exactly one structured marker line.\n"
         "- If no decomposition is captured yet, first include `FLEET_PLAN: {\"goal\":\"...\",\"subtasks\":[{\"id\":\"...\",\"title\":\"...\",\"status\":\"pending\"}]}` with 3-5 logical subtasks, then continue useful work in the same turn if possible.\n"
         "- Use `FLEET_MILESTONE: {\"status\":\"active|blocked|needs_input\",\"summary\":\"...\",\"evidence\":[\"...\"],\"blockers\":[\"...\"],\"next_action\":\"...\"}` for partial progress.\n"
-        "- Use `FLEET_DONE: {\"status\":\"done\",\"summary\":\"...\",\"evidence\":[\"tests/logs/commits\"],\"next_action\":\"none\"}` only when the whole goal is complete and verified.\n"
+        "- Be decisive on completion: once the objective is met, changes implemented, verification (tests/lint/pass) present, and no blockers remain, emit FLEET_DONE marker to mark success. Do not over-require 'nothing left' or wait for user; the system will stop retries on FLEET_DONE. Use FLEET_DONE: {\"status\":\"done\",\"summary\":\"...\",\"evidence\":[\"tests/logs/commits\"],\"next_action\":\"none\"} when whole goal complete+verified.\n"
+        "- Before emitting FLEET_MILESTONE, run `git add -A && git commit -m 'wip: <one-line summary>'` to protect all in-progress work from crashes. Skip if nothing to commit.\n"
+        "- If another AutoCode session is working in this workspace (noted in context), coordinate: pick complementary subtasks, avoid editing the same files. Note any coordination in your FLEET_MILESTONE.\n"
         "- If blocked, state the exact blocker and the best automatic fallback.\n\n"
         f"Current decomposition:\n{plan or '(not yet decomposed; infer the next concrete subtask from the goal and context)'}\n\n"
         f"Latest known context:\n{latest}\n"

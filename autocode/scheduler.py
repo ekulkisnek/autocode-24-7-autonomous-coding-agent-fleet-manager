@@ -41,6 +41,9 @@ class Scheduler:
         queue_archived = goals.reconcile_done_still_in_queue(self.store)
         reopened = goals.reconcile_false_done_chats(self.store)
         auto_fix = remediation.remediation_pass(self.store)
+        from . import watchdog_executor, self_improve
+        watchdog_executor.process_actions(self.store, self)
+        self_improve.scan(self.store)
         queue_archived.extend(self.store.queue_archive_done())
         auto_fix["queue_archived"] = queue_archived
         unstuck = recovery.reconcile_killed_chats(self.store)
@@ -165,6 +168,11 @@ class Scheduler:
             select c.*, q.position as queue_position
             from queue q join chats c on c.id=q.chat_id
             where c.paused=0 and c.done=0 and c.failure_count < ?
+              and not exists (
+                select 1 from chat_dependencies d
+                join chats dep on dep.id=d.depends_on
+                where d.chat_id=c.id and dep.done=0
+              )
             order by q.position asc
             limit ?
             """,
@@ -217,6 +225,15 @@ class Scheduler:
             ready.append(row)
             if len(ready) >= limit:
                 break
+
+        # Apply gw_candidate_priority_boost: in-memory re-sort by effective position.
+        # boost subtracts from queue_position so higher boost = dispatched sooner.
+        if any(recovery.chat_metadata(r).get("gw_candidate_priority_boost") for r in ready):
+            def _eff_pos(r: Row) -> float:
+                boost = float(recovery.chat_metadata(r).get("gw_candidate_priority_boost") or 0)
+                return float(r["queue_position"]) - boost
+            ready.sort(key=_eff_pos)
+
         return ready
 
     def has_active_job(self, chat_id: str) -> bool:
@@ -280,15 +297,29 @@ class Scheduler:
             continuation=row["continuation"],
         )
         job_dir = self._planned_job_dir()
+        from .util import json_loads, json_dumps
+        _meta = json_loads(str(row["metadata_json"] or ""), {})
+        gw_hint = str(_meta.get("gw_provider_hint") or "") if isinstance(_meta, dict) else ""
         if recovery.should_use_fallback(row) and not self._direct_cursor_lane(row):
             plan = self.fallback_plan(row, prompt, job_dir)
         else:
             providers = provider_map()
-            provider = providers.get(row["provider"])
-            if not provider or recovery.provider_in_backoff(self.store, str(row["provider"] or "")):
-                plan = self.fallback_plan(row, prompt, job_dir)
+            hint_provider = providers.get(gw_hint) if gw_hint else None
+            if hint_provider and not recovery.provider_in_backoff(self.store, gw_hint):
+                plan = hint_provider.continue_plan(chat, prompt, job_dir)
+                if plan.supported:
+                    _meta.pop("gw_provider_hint", None)
+                    with self.store.connect() as con:
+                        con.execute("update chats set metadata_json=? where id=?", (json_dumps(_meta), row["id"]))
+                    self.store.event("dispatch_provider_hint_used", row["id"], provider=gw_hint)
+                else:
+                    plan = self.fallback_plan(row, prompt, job_dir)
             else:
-                plan = provider.continue_plan(chat, prompt, job_dir)
+                provider = providers.get(row["provider"])
+                if not provider or recovery.provider_in_backoff(self.store, str(row["provider"] or "")):
+                    plan = self.fallback_plan(row, prompt, job_dir)
+                else:
+                    plan = provider.continue_plan(chat, prompt, job_dir)
         if not plan.supported:
             self.store.event("dispatch_unsupported", row["id"], provider=row["provider"], reason=plan.reason)
             return None
@@ -320,11 +351,27 @@ class Scheduler:
                         (json_dumps(meta), row["id"]),
                     )
 
+            briefing = meta.get("gw_briefing_notes")
+            if briefing and isinstance(briefing, str):
+                existing = str(data.get("prior_job_context") or "")
+                data["prior_job_context"] = (
+                    "[WATCHDOG BRIEFING]\n" + briefing + ("\n\n" + existing if existing else "")
+                )
+
+        # Inject workspace context: dirty git state + parallel session awareness
+        cwd = str(data.get("cwd") or "")
+        if cwd and Path(cwd).exists():
+            workspace_ctx = self._workspace_context(cwd, str(data.get("id", "")))
+            if workspace_ctx:
+                existing = str(data.get("prior_job_context") or "")
+                data["prior_job_context"] = workspace_ctx + ("\n\n" + existing if existing else "")
+
         class PromptRow(dict):
             def keys(self):
                 return super().keys()
 
-        return PromptRow(data) if plan or prior else row
+        has_enrichment = plan or prior or data.get("prior_job_context")
+        return PromptRow(data) if has_enrichment else row
 
     def fallback_plan(self, row: Row, prompt: str, job_dir) -> ContinuePlan:
         raw_cwd = row["cwd"] or str(HOME)
@@ -355,14 +402,24 @@ class Scheduler:
                 same_chat=False,
                 reason="Codex stalled twice; switching to Grok takeover.",
             )
+        prompt_path = job_dir / "prompt.txt"
         return ContinuePlan(
             True,
-            "codex",
+            "grok",
             cwd,
-            cmd=["codex", "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-C", cwd, "-"],
-            stdin=takeover,
+            cmd=[
+                "grok",
+                "--cwd",
+                cwd,
+                "--prompt-file",
+                str(prompt_path),
+                "--no-alt-screen",
+                "--permission-mode",
+                "bypassPermissions",
+            ],
+            prompt_file=True,
             same_chat=False,
-            reason=f"{row['provider']} stalled/unsupported; switching to Codex takeover.",
+            reason=f"{row['provider']} stalled/unsupported; switching to Grok takeover.",
         )
 
     def _planned_job_dir(self):
@@ -377,3 +434,64 @@ class Scheduler:
             return row["provider"] == "cursor" and row["source"] in {"cursor.cli", "cursor.cloud"}
         except Exception:
             return False
+
+    def _workspace_context(self, cwd: str, current_chat_id: str) -> str:
+        import subprocess
+        parts = []
+        # Git repo root
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=cwd, capture_output=True, text=True, timeout=5
+            )
+            repo_root = result.stdout.strip() if result.returncode == 0 else cwd
+        except Exception:
+            repo_root = cwd
+        # Dirty working tree
+        try:
+            diff_stat = subprocess.check_output(
+                ["git", "diff", "--stat", "HEAD"],
+                cwd=repo_root, text=True, timeout=10, stderr=subprocess.DEVNULL
+            ).strip()
+            status = subprocess.check_output(
+                ["git", "status", "--short"],
+                cwd=repo_root, text=True, timeout=5, stderr=subprocess.DEVNULL
+            ).strip()
+            if status:
+                parts.append(f"Workspace git status ({repo_root}):\n{status}")
+            if diff_stat:
+                parts.append(f"Uncommitted changes:\n{diff_stat}")
+        except Exception:
+            pass
+        # Parallel sessions in same repo
+        try:
+            running = self.store.rows(
+                """
+                select c.id, c.title, t.subtasks_json, j.evidence_status
+                from jobs j join chats c on c.id=j.chat_id
+                left join task_plans t on t.chat_id=c.id and t.status='active'
+                where j.status='running' and c.id != ?
+                  and (c.cwd=? or c.cwd like ?)
+                """,
+                (current_chat_id, cwd, repo_root + "%"),
+            )
+            if running:
+                peer_lines = []
+                for r in running:
+                    title = str(r["title"] or "")[:60]
+                    ev = str(r["evidence_status"] or "")
+                    subtasks = ""
+                    if r["subtasks_json"]:
+                        try:
+                            from .util import json_loads
+                            st = json_loads(str(r["subtasks_json"]), [])
+                            active = [s.get("title", "") for s in st if isinstance(s, dict) and s.get("status") not in ("completed", "done")]
+                            if active:
+                                subtasks = f" | working on: {'; '.join(active[:2])}"
+                        except Exception:
+                            pass
+                    peer_lines.append(f"  - {title} [{ev}]{subtasks}")
+                parts.append("PARALLEL SESSIONS in this workspace:\n" + "\n".join(peer_lines))
+        except Exception:
+            pass
+        return "\n\n".join(parts) if parts else ""

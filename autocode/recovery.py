@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone, timedelta
 from sqlite3 import Row
 from typing import Any
 
@@ -30,6 +31,19 @@ FAILURE_KINDS = frozenset(
         "chat_paused",
     }
 )
+
+
+def now_iso_minus(window_seconds: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
+
+
+def recent_kill_count(store: Store, chat_id: str, window_seconds: int = 1200) -> int:
+    cutoff = now_iso_minus(window_seconds)
+    row = store.row(
+        "select count(*) c from jobs where chat_id=? and status='killed' and updated_at > ?",
+        (chat_id, cutoff),
+    )
+    return int(row["c"] if row else 0)
 
 
 def chat_metadata(row: Row | None) -> dict[str, Any]:
@@ -134,8 +148,10 @@ def stall_seconds_for_chat(store: Store, chat_id: str, prompt: str, objective: s
     if re.search(r"\be2e\b", haystack, re.IGNORECASE):
         base = max(base, 1800)
     row = store.row("select metadata_json from chats where id=?", (chat_id,))
-    extra = int(chat_metadata(row).get("stall_extra_seconds") or 0)
-    return base + max(0, extra)
+    meta = chat_metadata(row)
+    extra = int(meta.get("stall_extra_seconds") or 0)
+    gw_timeout = int(meta.get("gw_suggested_timeout") or 0)
+    return max(gw_timeout, base + max(0, extra))
 
 
 def bump_stall_extra(meta: dict[str, Any], kind: str) -> dict[str, Any]:
@@ -217,6 +233,48 @@ def handle_job_failure(
     evidence_reason: str,
 ) -> None:
     kind = failure_kind(evidence_status, evidence_reason, job)
+    chat_id = str(job["chat_id"])
+
+    # gw_failure_class: watchdog-classified failure takes priority over generic handling
+    chat_row = store.row("select metadata_json from chats where id=?", (chat_id,))
+    gw_class = str(chat_metadata(chat_row).get("gw_failure_class") or "")
+    if gw_class == "auth_wall":
+        with store.connect() as con:
+            con.execute("update chats set paused=1 where id=? and done=0", (chat_id,))
+        store.event("recovery_auth_wall", chat_id, str(job["id"]))
+        return
+    if gw_class == "rate_limit":
+        meta = chat_metadata(chat_row)
+        meta["next_retry_at"] = now_ts() + 60
+        with store.connect() as con:
+            con.execute(
+                "update chats set metadata_json=?, state='stalled' where id=? and done=0",
+                (json_dumps(meta), chat_id),
+            )
+        store.queue_bump_front(chat_id)
+        store.event("recovery_rate_limit_backoff", chat_id, str(job["id"]))
+        return
+    if gw_class == "hung_process":
+        kind = "killed"  # treat as killed → immediate retry path
+    if gw_class == "impossible":
+        with store.connect() as con:
+            con.execute("update chats set paused=1 where id=? and done=0", (chat_id,))
+        store.event("recovery_impossible_task", chat_id, str(job["id"]))
+        return
+    if gw_class == "overdelivered":
+        from . import goals
+        goals.mark_goal_complete(store, chat_id, "watchdog: overdelivered")
+        return
+
+    if kind == "killed":
+        kills = recent_kill_count(store, str(job["chat_id"]))
+        if kills >= 3:
+            store.event("kill_loop_detected", str(job["chat_id"]), str(job["id"]), recent_kills=kills)
+            with store.connect() as con:
+                con.execute(
+                    "update chats set failure_count=2 where id=? and failure_count < 2",
+                    (str(job["chat_id"]),),
+                )
     if kind == "provider_error":
         store.record_provider_failure(str(job["provider"] or ""), evidence_reason[:240])
     if schedule_retry(

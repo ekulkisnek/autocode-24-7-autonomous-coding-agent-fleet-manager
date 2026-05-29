@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-MARKER_RE = re.compile(r"(?ims)^\s*(FLEET_DONE|FLEET_MILESTONE|FLEET_PLAN)\s*:\s*(\{.*?\})\s*$")
+MARKER_RE = re.compile(r"(?ims)^\s*\*{0,2}\s*(FLEET_DONE|FLEET_MILESTONE|FLEET_PLAN)\s*:\s*(\{[\s\S]*?\})\s*$")
 
 
 @dataclass(frozen=True)

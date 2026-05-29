@@ -439,6 +439,11 @@ class JobRunner:
                     objective = str(priority["objective"] if priority else (chat["objective"] if chat else ""))
                     assessment = goals.assess_for_completion(self.store, objective, assessment_text)
                     verified, verify_reason = goals.verify_goal_complete(self.store, objective, assessment_text)
+                    # If stdout explicitly contains FLEET_DONE, always accept as verified
+                    from .policy import FLEET_DONE_MARKER
+                    if not verified and (marker and marker.kind == "FLEET_DONE" or FLEET_DONE_MARKER.search(stdout_text)):
+                        verified = True
+                        verify_reason = "fleet_done_in_stdout"
                     if verified:
                         con.execute("update chats set done=1,state='done',last_evidence_at=? where id=?", (now_iso(), job["chat_id"]))
                         con.execute("update goals set status='complete',updated_at=? where chat_id=? and status='active'", (now_iso(), job["chat_id"]))

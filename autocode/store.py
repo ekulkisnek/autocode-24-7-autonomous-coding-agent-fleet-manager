@@ -198,6 +198,15 @@ class Store:
                   job_id text,
                   details_json text not null default '{}'
                 );
+
+                create table if not exists chat_dependencies (
+                  chat_id text not null references chats(id) on delete cascade,
+                  depends_on text not null references chats(id) on delete cascade,
+                  created_at text not null,
+                  primary key (chat_id, depends_on)
+                );
+                create index if not exists idx_chat_deps_chat on chat_dependencies(chat_id);
+                create index if not exists idx_chat_deps_on on chat_dependencies(depends_on);
                 """
             )
             con.execute("insert or ignore into config(key,value) values('yolo','on')")
@@ -491,6 +500,36 @@ class Store:
             return False
         front = float(row["m"] or 1) - 1.0
         return self.queue_move(chat_id, front)
+
+    def add_dependency(self, chat_id: str, depends_on: str) -> bool:
+        """Block chat_id from dispatching until depends_on is done."""
+        if chat_id == depends_on:
+            return False
+        with self.connect() as con:
+            con.execute(
+                "insert or ignore into chat_dependencies(chat_id,depends_on,created_at) values(?,?,?)",
+                (chat_id, depends_on, now_iso()),
+            )
+        self.event("dependency_added", chat_id, depends_on=depends_on)
+        return True
+
+    def remove_dependency(self, chat_id: str, depends_on: str) -> bool:
+        with self.connect() as con:
+            con.execute(
+                "delete from chat_dependencies where chat_id=? and depends_on=?",
+                (chat_id, depends_on),
+            )
+        return True
+
+    def get_dependencies(self, chat_id: str) -> list[sqlite3.Row]:
+        return self.rows(
+            """
+            select d.depends_on, c.title, c.done, c.state
+            from chat_dependencies d join chats c on c.id=d.depends_on
+            where d.chat_id=?
+            """,
+            (chat_id,),
+        )
 
     def record_provider_failure(self, provider: str, error: str) -> None:
         if not provider:

@@ -51,10 +51,29 @@ def output_too_minimal(store: Store, text: str) -> bool:
     return True
 
 
-def verify_goal_complete(store: Store, objective: str, output: str) -> tuple[bool, str]:
+def _gw_completion_override(store: Store, chat_id: str) -> tuple[str, str]:
+    """Return (override, reason) from gw_completion_override metadata field."""
+    if not chat_id:
+        return "", ""
+    row = store.row("select metadata_json from chats where id=?", (chat_id,))
+    if not row:
+        return "", ""
+    from .util import json_loads
+    meta = json_loads(str(row["metadata_json"] or ""), {})
+    if not isinstance(meta, dict):
+        return "", ""
+    return str(meta.get("gw_completion_override") or ""), str(meta.get("gw_completion_reason") or "")
+
+
+def verify_goal_complete(store: Store, objective: str, output: str, chat_id: str = "") -> tuple[bool, str]:
     """Return whether job output may mark the chat goal complete."""
+    override, reason = _gw_completion_override(store, chat_id)
+    if override == "confirm":
+        return True, reason or "watchdog: completion confirmed"
     if output_too_minimal(store, output):
         return False, "output too minimal to count as completion"
+    if override == "reject":
+        return False, reason or "watchdog: completion blocked"
     assessment = assess_output_state(objective, output)
     if not assessment.complete:
         return False, assessment.reason
@@ -65,9 +84,14 @@ def verify_goal_complete(store: Store, objective: str, output: str) -> tuple[boo
     return True, assessment.reason
 
 
-def assess_for_completion(store: Store, objective: str, output: str) -> OutputAssessment:
+def assess_for_completion(store: Store, objective: str, output: str, chat_id: str = "") -> OutputAssessment:
+    override, reason = _gw_completion_override(store, chat_id)
+    if override == "confirm":
+        return OutputAssessment("done", True, reason or "watchdog: completion confirmed")
     if output_too_minimal(store, output):
         return OutputAssessment("stalled", False, "output too minimal to count as completion")
+    if override == "reject":
+        return OutputAssessment("active", False, reason or "watchdog: completion blocked")
     assessment = assess_output_state(objective, output)
     if assessment.complete and require_fleet_done(store):
         marker = parse_fleet_marker(output)
@@ -355,8 +379,6 @@ def reconcile_false_done_chats(store: Store) -> int:
               select 1 from project_priorities p
               where p.target_chat_id=c.id and p.status='active'
             )
-            or exists (select 1 from queue q where q.chat_id=c.id)
-            or exists (select 1 from queue_finished qf where qf.chat_id=c.id)
           )
         """
     )
