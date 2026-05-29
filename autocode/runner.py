@@ -440,8 +440,13 @@ class JobRunner:
             completed = now_iso()
             stdout_preview = read_text(out, limit=12000) if out_size else ""
             if self._fatal_stderr(err) and not out_size:
-                evidence_status = "provider_error"
-                status = "failed"
+                if self._goal_fleet_max_turns(str(job["chat_id"]), err):
+                    evidence_status = "goal_incomplete"
+                    status = "failed"
+                    evidence_reason = f"max_turns; {evidence_reason}"
+                else:
+                    evidence_status = "provider_error"
+                    status = "failed"
             elif out_size or self._meaningful_stderr(err):
                 # Use stderr as fallback when stdout is empty — stderr often carries real output
                 preview_for_minimal = stdout_preview
@@ -859,6 +864,12 @@ class JobRunner:
             return False
         noisy = ["could not find a git repository", "new version", "warning"]
         return any(line.strip() and not any(n in line.lower() for n in noisy) for line in text.splitlines())
+
+    def _goal_fleet_max_turns(self, chat_id: str, err: Path) -> bool:
+        if "goal-fleet" not in str(chat_id or ""):
+            return False
+        text = read_text(err, limit=4000).lower()
+        return "max_turns exceeded" in text
 
     def _fatal_stderr(self, path: Path) -> bool:
         text = read_text(path, limit=4000).lower()

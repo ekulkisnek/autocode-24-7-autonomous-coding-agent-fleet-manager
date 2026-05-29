@@ -67,6 +67,19 @@ class GrokProvider(Provider):
             ))
         return chats
 
+    def _max_turns(self, chat: Chat) -> str:
+        if chat.source == "grok.wiki_squad":
+            return "120"
+        blob = f"{chat.id} {chat.alias or ''}".lower()
+        if "goal-fleet" in blob or chat.alias in {
+            "l1-e2e-until-verified",
+            "windows-remote-health",
+            "github-sync-ekulkisnek",
+            "liquid-utreexo-windows-fleet",
+        }:
+            return "120"
+        return "40"
+
     def continue_plan(self, chat: Chat, prompt: str, job_dir: Path) -> ContinuePlan:
         prompt_path = job_dir / "prompt.txt"
         cwd = chat.cwd or str(HOME)
@@ -77,7 +90,7 @@ class GrokProvider(Provider):
             "--permission-mode",
             "bypassPermissions",
             "--max-turns",
-            "120" if chat.source == "grok.wiki_squad" else "40",
+            self._max_turns(chat),
             "--output-format",
             "plain",
         ]

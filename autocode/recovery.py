@@ -277,7 +277,15 @@ def handle_job_failure(
                     "update chats set failure_count=2 where id=? and failure_count < 2",
                     (str(job["chat_id"]),),
                 )
-    if kind == "provider_error":
+    immediate = False
+    if kind == "provider_error" and "max_turns" in str(evidence_reason or "").lower():
+        if "goal-fleet" in chat_id:
+            kind = "goal_incomplete"
+            evidence_status = "goal_incomplete"
+            immediate = True
+        else:
+            store.record_provider_failure(str(job["provider"] or ""), evidence_reason[:240])
+    elif kind == "provider_error":
         store.record_provider_failure(str(job["provider"] or ""), evidence_reason[:240])
     if schedule_retry(
         store,
@@ -286,6 +294,7 @@ def handle_job_failure(
         evidence_status=evidence_status,
         evidence_reason=evidence_reason,
         job_id=str(job["id"]),
+        immediate=immediate,
     ):
         return
     chat = store.row("select failure_count from chats where id=?", (job["chat_id"],))
@@ -381,6 +390,8 @@ def should_use_fallback(row: Row, failure_count: int | None = None) -> bool:
     if kind == "provider_error" and provider == "grok" and source in {"grok.new", "grok.sqlite"}:
         return failures >= 1
     if kind == "provider_error" and provider == "grok" and "goal-fleet" in str(row["id"] or ""):
+        return failures >= 1
+    if kind == "provider_error" and provider == "cursor" and "goal-fleet" in str(row["id"] or ""):
         return failures >= 1
     if kind == "silent_failed":
         return failures >= 2

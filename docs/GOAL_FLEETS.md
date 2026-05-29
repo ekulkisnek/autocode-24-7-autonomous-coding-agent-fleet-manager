@@ -1,5 +1,9 @@
 # Goal Fleets
 
+## Operating model: autocode only
+
+All four goals are driven **only** by the autocode daemon (`goal_fleets.tick` every ~90s + `run-l1-e2e-until-verified.sh`). Do **not** start parallel Cursor parent agents, manual `dispatch-goal-fleets.py` runs, or duplicate L1 orchestrators outside autocode. Cursor/Grok fleet jobs fix blockers (iOS command server, BitAssets RPC); the shell loop owns Detox/orchestrator execution.
+
 Autocode goal-driven loops for the four final goals. Run status check:
 
 ```bash
