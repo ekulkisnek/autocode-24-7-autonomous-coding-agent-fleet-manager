@@ -21,6 +21,7 @@ from .launchd import stop as launchd_stop
 from .providers import providers
 from .preprint_release import write_kit
 from .scheduler import Scheduler
+from .runner import JobRunner
 from .store import Store
 from .models import ContinuePlan
 from .util import command_exists, compact, json_loads, load1, memory_free_percent, read_text, rel_time, sha
@@ -1323,6 +1324,261 @@ def cmd_watchdog(args: argparse.Namespace) -> None:
         print(f"cleared {before - len(keep)} rejected actions ({len(keep)} remain)")
 
 
+def _worker_refresh(store: Store) -> JobRunner:
+    runner = JobRunner(store)
+    runner.refresh()
+    return runner
+
+
+def _print_coord_human(coord: dict, sched: Scheduler, queued_count: int) -> None:
+    print(
+        f"Mac: {coord['mac_running_weight']:.1f}/{coord['mac_capacity']} used, "
+        f"{coord['mac_available']:.1f} free, can_take_more={coord['mac_can_take_more']}"
+    )
+    print(
+        f"Remote: {coord['remote_running_jobs']} job(s), weight {coord['remote_running_weight']:.1f}, "
+        f"dispatch_budget={coord['remote_dispatch_budget']:.1f}"
+    )
+    for w in coord.get("workers") or []:
+        flag = "on" if w["enabled"] else "off"
+        providers = w.get("providers") or ""
+        prov_tag = f" [{providers}]" if providers else ""
+        print(
+            f"  {w['id']}@{w['host']}{prov_tag} load={w['load']:.1f}/{w['capacity']:.1f} "
+            f"headroom={w['headroom']:.1f} [{flag}]"
+        )
+    jobs = coord.get("running_jobs") or []
+    if jobs:
+        print("Running jobs:")
+        for j in jobs[:10]:
+            where = j["worker_id"] or "mac"
+            print(f"  {j['id']} {where} {j['provider']} {j['evidence_status']} {j.get('alias') or ''}")
+    print(f"queued_candidates={queued_count}")
+
+
+def cmd_worker(args: argparse.Namespace) -> None:
+    import subprocess as sp
+    import uuid
+
+    from . import remote_ssh
+
+    store = Store()
+    refresh_cmds = {"list", "coord", "jobs", "reap", "bench"}
+    runner = _worker_refresh(store) if args.worker_cmd in refresh_cmds else JobRunner(store)
+
+    if args.worker_cmd == "list":
+        workers = store.rows("select * from remote_workers order by id asc")
+        if not workers:
+            print("No remote workers configured. Use `autocode worker add`.")
+            return
+        sched = Scheduler(store)
+        for w in workers:
+            used = sched._remote_worker_weight(str(w["id"]))
+            cap = float(w["weight_capacity"] or 4.0)
+            status = "enabled" if w["enabled"] else "disabled"
+            shell = remote_ssh.worker_shell(w)
+            job_count = store.row(
+                "select count(*) c from jobs where status='running' and worker_id=?",
+                (str(w["id"]),),
+            )
+            jobs_n = int(job_count["c"] if job_count else 0)
+            seen = str(w["last_seen_at"] or "") or "never"
+            providers = str(w["provider_types"] or "").replace(" ", "")
+            print(
+                f"{w['id']}  {w['ssh_user']}@{w['host']}  providers=[{providers}]  "
+                f"load={used:.1f}/{cap:.1f} jobs={jobs_n} shell={shell} seen={seen} {status}"
+            )
+            if w["notes"]:
+                print(f"  notes: {w['notes']}")
+
+    elif args.worker_cmd == "add":
+        store.init()
+        with store.connect() as con:
+            con.execute(
+                """insert into remote_workers(id,host,ssh_user,provider_types,weight_capacity,default_cwd,ssh_key_path,enabled,notes,remote_shell)
+                   values(?,?,?,?,?,?,?,1,?,?)
+                   on conflict(id) do update set host=excluded.host,ssh_user=excluded.ssh_user,
+                   provider_types=excluded.provider_types,weight_capacity=excluded.weight_capacity,
+                   default_cwd=excluded.default_cwd,ssh_key_path=excluded.ssh_key_path,enabled=1,
+                   notes=excluded.notes,remote_shell=excluded.remote_shell""",
+                (args.id, args.host, args.user, args.providers, float(args.capacity),
+                 args.cwd, args.key or "", args.notes or "", args.shell or ""),
+            )
+        print(f"added remote worker: {args.id} ({args.user}@{args.host})")
+
+    elif args.worker_cmd == "remove":
+        active = store.row(
+            "select count(*) c from jobs where status='running' and worker_id=?",
+            (args.id,),
+        )
+        if active and int(active["c"] or 0) > 0:
+            print(f"refusing remove: {active['c']} running job(s) on {args.id}; run `autocode worker reap {args.id}` first")
+            return
+        with store.connect() as con:
+            con.execute("delete from remote_workers where id=?", (args.id,))
+        print(f"removed remote worker: {args.id}")
+
+    elif args.worker_cmd == "enable":
+        with store.connect() as con:
+            con.execute("update remote_workers set enabled=? where id=?", (0 if args.disable else 1, args.id))
+        print(f"{'disabled' if args.disable else 'enabled'}: {args.id}")
+
+    elif args.worker_cmd == "ping":
+        worker = store.row("select * from remote_workers where id=?", (args.id,))
+        if not worker:
+            print(f"no worker with id: {args.id}")
+            return
+        cmd = remote_ssh.build_ping_command(worker)
+        result = sp.run(cmd, capture_output=True, text=True, timeout=15)
+        remote_ssh.touch_worker_seen(store, args.id)
+        print(result.stdout or "(no output)")
+        if result.returncode != 0:
+            print(f"STDERR: {result.stderr.strip()}")
+            print(f"exit code: {result.returncode}")
+
+    elif args.worker_cmd == "probe":
+        worker = store.row("select * from remote_workers where id=?", (args.id,))
+        if not worker:
+            print(f"no worker with id: {args.id}")
+            return
+        worker = dict(worker)
+        worker["id"] = args.id
+        report = remote_ssh.probe_worker(worker)
+        remote_ssh.touch_worker_seen(store, args.id)
+        if getattr(args, "json", False):
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return
+        res = report.get("resources") or {}
+        prov = report.get("providers") or {}
+        print(f"{args.id}@{worker['host']}")
+        print(f"  RAM: {res.get('ram_gb', '?')} GB ({res.get('ram_bytes', 0)} bytes)")
+        print(f"  CPU cores: {res.get('cpu_cores', '?')}")
+        print(f"  grok: {prov.get('grok', 'unknown')}")
+        print(f"  cursor-agent: {prov.get('cursor_agent', 'unknown')}")
+        suggested = float(report.get("suggested_capacity") or 4.0)
+        current = float(worker.get("weight_capacity") or 4.0)
+        print(f"  suggested capacity: {suggested:.1f} (configured: {current:.1f})")
+        if getattr(args, "apply_capacity", False):
+            with store.connect() as con:
+                con.execute("update remote_workers set weight_capacity=? where id=?", (suggested, args.id))
+            print(f"  applied capacity={suggested:.1f}")
+
+    elif args.worker_cmd == "set-capacity":
+        with store.connect() as con:
+            con.execute("update remote_workers set weight_capacity=? where id=?", (float(args.capacity), args.id))
+        print(f"set {args.id} capacity={float(args.capacity):.1f}")
+
+    elif args.worker_cmd == "smoke":
+        worker = store.row("select * from remote_workers where id=?", (args.id,))
+        if not worker:
+            print(f"no worker with id: {args.id}")
+            return
+        job_id = f"smoke-{uuid.uuid4().hex[:8]}"
+        prompt = "autocode remote worker smoke test"
+        print(f"smoke job_id={job_id}")
+        mkdir = remote_ssh.ensure_remote_job_dir(worker, job_id)
+        if mkdir.returncode != 0:
+            print(f"mkdir failed: {(mkdir.stderr or mkdir.stdout).strip()}")
+            return
+        local_prompt = store.path.parent / "jobs" / job_id / "prompt.txt"
+        local_prompt.parent.mkdir(parents=True, exist_ok=True)
+        local_prompt.write_text(prompt, encoding="utf-8")
+        copied = remote_ssh.scp_prompt_file(worker, str(local_prompt), job_id)
+        if copied.returncode != 0:
+            print(f"scp failed: {(copied.stderr or copied.stdout).strip()}")
+            return
+        cmd = remote_ssh.build_smoke_command(worker, job_id)
+        result = sp.run(cmd, capture_output=True, text=True, timeout=30)
+        print(result.stdout or "(no output)")
+        if result.returncode != 0:
+            print(f"STDERR: {result.stderr.strip()}")
+            print(f"exit code: {result.returncode}")
+            return
+        grok_cmd = remote_ssh.build_remote_exec_command(
+            worker,
+            worker["default_cwd"] or "~",
+            ["grok", "--version"],
+            job_id,
+        )
+        print("remote exec preview:", " ".join(grok_cmd[-4:]))
+        remote_ssh.touch_worker_seen(store, args.id)
+        print("smoke ok")
+
+    elif args.worker_cmd == "bench":
+        worker = store.row("select * from remote_workers where id=?", (args.id,))
+        if not worker:
+            print(f"no worker with id: {args.id}")
+            return
+        print(f"benchmarking {args.id} ({worker['ssh_user']}@{worker['host']})...")
+        result = remote_ssh.bench_remote_worker(worker)
+        remote_ssh.touch_worker_seen(store, args.id)
+        print(json.dumps(result, indent=2, sort_keys=True))
+
+    elif args.worker_cmd == "jobs":
+        worker_filter = getattr(args, "id", "") or ""
+        query = (
+            "select j.*, c.alias from jobs j left join chats c on c.id=j.chat_id "
+            "where j.status='running' and coalesce(j.worker_id,'')!=''"
+        )
+        params: tuple = ()
+        if worker_filter:
+            query += " and j.worker_id=?"
+            params = (worker_filter,)
+        query += " order by j.created_at asc"
+        rows = store.rows(query, params)
+        if not rows:
+            print("no running remote jobs")
+            return
+        for row in rows:
+            print(
+                f"{row['id']}  worker={row['worker_id']}  {row['provider']}  "
+                f"pid={row['pid']}  {row['evidence_status']}  {row['alias'] or row['chat_id']}"
+            )
+
+    elif args.worker_cmd == "reap":
+        worker_filter = getattr(args, "id", "") or ""
+        if worker_filter:
+            jobs = store.rows(
+                "select * from jobs where status='running' and worker_id=?",
+                (worker_filter,),
+            )
+            reaped = []
+            for job in jobs:
+                if not runner._pid_running(int(job["pid"] or 0)):
+                    if not args.dry_run:
+                        runner._refresh_one(job)
+                    reaped.append(str(job["id"]))
+        else:
+            reaped = runner.reap_stale_remote_jobs(dry_run=args.dry_run)
+        verb = "would reap" if args.dry_run else "reaped"
+        print(f"{verb} {len(reaped)} remote job(s)")
+        for job_id in reaped:
+            print(f"  {job_id}")
+
+    elif args.worker_cmd == "coord":
+        sched = Scheduler(store)
+        coord = sched.coordination_snapshot()
+        queued = sched.candidates(5)
+        if getattr(args, "json", False):
+            print(json.dumps(coord, indent=2, sort_keys=True))
+        else:
+            _print_coord_human(coord, sched, len(queued))
+        if queued and not coord["mac_can_take_more"]:
+            row = queued[0]
+            worker = sched._pick_remote_worker(str(row["provider"] or ""), sched._job_weight(row))
+            if worker:
+                print(
+                    f"next_remote_target={worker['id']} for {row['alias'] or row['id']} "
+                    f"provider={row['provider']} weight={sched._job_weight(row):.1f}"
+                )
+            else:
+                print("next_remote_target=none (no worker headroom or unsupported provider)")
+        elif queued:
+            print("next_local_dispatch=yes (mac has capacity)")
+        else:
+            print("queue_empty")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="autocode")
     p.add_argument("--version", action="version", version="autocode 0.1.0")
@@ -1421,6 +1677,50 @@ def build_parser() -> argparse.ArgumentParser:
     wdl = wdsub.add_parser("list", help="list watchdog actions"); wdl.add_argument("--status", default="", help="filter by status: pending, applied, rejected"); wdl.set_defaults(func=cmd_watchdog)
     wda = wdsub.add_parser("apply", help="manually apply a watchdog action (for needs_luke actions)"); wda.add_argument("action_id", help="action id to apply"); wda.set_defaults(func=cmd_watchdog)
     wdc = wdsub.add_parser("clear", help="remove rejected actions from the queue file"); wdc.set_defaults(func=cmd_watchdog)
+
+    wk = sub.add_parser("worker", help="manage remote worker machines")
+    wksub = wk.add_subparsers(dest="worker_cmd", required=True)
+    wkl = wksub.add_parser("list", help="list configured remote workers"); wkl.set_defaults(func=cmd_worker)
+    wka = wksub.add_parser("add", help="add or update a remote worker")
+    wka.add_argument("id", help="short name for this worker, e.g. windows-main")
+    wka.add_argument("host", help="Tailscale hostname or IP")
+    wka.add_argument("user", help="SSH username on the remote machine")
+    wka.add_argument("--providers", default="grok", help="comma-separated provider types this worker supports")
+    wka.add_argument("--capacity", type=float, default=4.0, help="weight capacity (default 4.0)")
+    wka.add_argument("--cwd", default="~", help="default working directory on the remote machine")
+    wka.add_argument("--key", default="", help="path to SSH private key (leave blank to use default)")
+    wka.add_argument("--shell", default="", help="remote shell style: powershell, bash, or blank for auto")
+    wka.add_argument("--notes", default="", help="optional notes")
+    wka.set_defaults(func=cmd_worker)
+    wkr = wksub.add_parser("remove", help="remove a remote worker"); wkr.add_argument("id"); wkr.set_defaults(func=cmd_worker)
+    wke = wksub.add_parser("enable", help="enable or disable a remote worker")
+    wke.add_argument("id"); wke.add_argument("--disable", action="store_true"); wke.set_defaults(func=cmd_worker)
+    wkp = wksub.add_parser("ping", help="test SSH connectivity and grok/cursor-agent on a remote worker")
+    wkp.add_argument("id"); wkp.set_defaults(func=cmd_worker)
+    wkpr = wksub.add_parser("probe", help="report RAM/CPU, provider binaries, and suggested capacity")
+    wkpr.add_argument("id")
+    wkpr.add_argument("--json", action="store_true", help="emit raw JSON")
+    wkpr.add_argument("--apply-capacity", action="store_true", help="set weight_capacity to suggested value")
+    wkpr.set_defaults(func=cmd_worker)
+    wksc = wksub.add_parser("set-capacity", help="set remote worker weight capacity")
+    wksc.add_argument("id")
+    wksc.add_argument("capacity", type=float)
+    wksc.set_defaults(func=cmd_worker)
+    wks = wksub.add_parser("smoke", help="test remote mkdir/scp/exec path used by start_remote()")
+    wks.add_argument("id"); wks.set_defaults(func=cmd_worker)
+    wkc = wksub.add_parser("coord", help="show mac/remote coordination state and next spill target")
+    wkc.add_argument("--json", action="store_true", help="emit raw JSON")
+    wkc.set_defaults(func=cmd_worker)
+    wkj = wksub.add_parser("jobs", help="list running remote jobs")
+    wkj.add_argument("id", nargs="?", default="", help="optional worker id filter")
+    wkj.set_defaults(func=cmd_worker)
+    wkrp = wksub.add_parser("reap", help="finalize stale remote jobs with dead SSH wrappers")
+    wkrp.add_argument("id", nargs="?", default="", help="optional worker id filter")
+    wkrp.add_argument("--dry-run", action="store_true")
+    wkrp.set_defaults(func=cmd_worker)
+    wkb = wksub.add_parser("bench", help="benchmark SSH ping/mkdir/scp/smoke latency")
+    wkb.add_argument("id")
+    wkb.set_defaults(func=cmd_worker)
     return p
 
 

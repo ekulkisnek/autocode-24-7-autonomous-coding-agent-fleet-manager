@@ -51,8 +51,10 @@ def render_dashboard(
     width = width or shutil.get_terminal_size((132, 40)).columns
     width = max(92, min(width, 180))
     daemon_ok, _ = launchd_status()
-    active_jobs = _count(store, "select count(*) c from jobs where status='running'")
-    cap = Scheduler(store).capacity()
+    scheduler = Scheduler(store)
+    coord = scheduler.coordination_snapshot()
+    active_jobs = coord["local_running_jobs"] + coord["remote_running_jobs"]
+    cap = coord["mac_capacity"]
     queue_size = _count(
         store,
         "select count(*) c from queue q join chats c on c.id=q.chat_id where c.done=0",
@@ -62,15 +64,29 @@ def render_dashboard(
     yolo = store.get_config("yolo", "off")
     resources = system_resource()
 
-    working_banner = f"  *** WORKING: {active_jobs}/{cap} slots active ***" if active_jobs > 0 else "  -- IDLE (no jobs running) --"
+    working_banner = (
+        f"  *** WORKING: mac {coord['mac_running_weight']:.1f}/{cap} | "
+        f"remote {coord['remote_running_jobs']} job(s) ***"
+        if active_jobs > 0
+        else "  -- IDLE (no jobs running) --"
+    )
 
     lines: list[str] = []
     lines.append(_bar("AutoCode Dashboard", width))
     lines.append(working_banner)
+    worker_bits = [
+        f"{w['id']} {w['load']:.1f}/{w['capacity']:.1f}"
+        for w in coord["workers"]
+        if w["enabled"]
+    ]
+    worker_line = f"remote workers: {', '.join(worker_bits)}" if worker_bits else "remote workers: none configured"
     lines.append(
         f"{now_iso()} | daemon={'on' if daemon_ok else 'off'} | yolo={yolo} | "
-        f"jobs={active_jobs}/{cap} | queue={queue_size} | finished={finished_size} | {format_system_resource(resources)}"
+        f"jobs={active_jobs} (mac {coord['local_running_jobs']}, remote {coord['remote_running_jobs']}) | "
+        f"mac_avail={coord['mac_available']:.1f}/{cap} | queue={queue_size} | finished={finished_size} | "
+        f"{format_system_resource(resources)}"
     )
+    lines.append(worker_line)
     lines.append(f"db={DB} | chats={total_chats} discovered")
     lines.extend(_session_summary(store, width))
     lines.append("")
@@ -208,9 +224,11 @@ def _running_section(store: Store, width: int, limit: int) -> list[str]:
         model = model_info(row).label()
         working = _job_working_text(row, 900)
         counts = _chat_drive_counts(store, row["chat_id"])
+        worker = str(row["worker_id"] or "").strip()
+        where = f"worker={worker}" if worker else "worker=mac"
         lines.append(
             f"  {rel_time(row['created_at']):>4}  {row['provider']:<11} {model:<24} "
-            f"{row['evidence_status']:<16} {row['id']}  {_fit(label, 42)}"
+            f"{row['evidence_status']:<16} {where:<16} {row['id']}  {_fit(label, 34)}"
         )
         lines.append(f"        prompts: session={counts[0]} total={counts[1]}")
         if row["cwd"]:

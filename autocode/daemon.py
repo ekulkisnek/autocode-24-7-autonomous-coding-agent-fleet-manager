@@ -33,7 +33,11 @@ class Daemon:
         while not self.stop:
             try:
                 result = self.scheduler.tick(dispatch=True)
-                self.log(f"tick sent={result['sent']} active={result['active_jobs']} candidates={result['candidates']} capacity={result['capacity']}")
+                remote = result.get("remote_sent", 0)
+                self.log(
+                    f"tick sent={result['sent']} remote={remote} active={result['active_jobs']} "
+                    f"candidates={result['candidates']} capacity={result['capacity']}"
+                )
                 grok_watchdog.on_daemon_tick()
             except Exception as exc:
                 self.log(f"tick_error {exc!r}")

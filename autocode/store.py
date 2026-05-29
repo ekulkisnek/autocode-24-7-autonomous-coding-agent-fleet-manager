@@ -207,6 +207,19 @@ class Store:
                 );
                 create index if not exists idx_chat_deps_chat on chat_dependencies(chat_id);
                 create index if not exists idx_chat_deps_on on chat_dependencies(depends_on);
+
+                create table if not exists remote_workers (
+                  id text primary key,
+                  host text not null,
+                  ssh_user text not null,
+                  provider_types text not null default 'grok',
+                  weight_capacity real not null default 4.0,
+                  default_cwd text not null default '~',
+                  ssh_key_path text not null default '',
+                  enabled integer not null default 1,
+                  last_seen_at text not null default '',
+                  notes text not null default ''
+                );
                 """
             )
             con.execute("insert or ignore into config(key,value) values('yolo','on')")
@@ -233,6 +246,8 @@ class Store:
                 "alter table jobs add column token_input integer not null default 0",
                 "alter table jobs add column token_output integer not null default 0",
                 "alter table jobs add column cost_estimate real not null default 0",
+                "alter table jobs add column worker_id text not null default ''",
+                "alter table remote_workers add column remote_shell text not null default ''",
             ):
                 try:
                     con.execute(ddl)

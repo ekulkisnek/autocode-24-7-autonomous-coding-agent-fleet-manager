@@ -307,7 +307,7 @@ def build_smoke_command(worker: Mapping[str, str] | Any, job_id: str) -> list[st
             "Write-Output ('prompt=' + (Get-Content -Raw $prompt).Trim()); "
             "grok --version 2>$null"
         )
-        return _remote_command(worker, "powershell", "-NoProfile", "-Command", ps, connect_timeout=15)
+        return _remote_command(worker, *_powershell_encoded_argv(ps), connect_timeout=15)
     return _remote_command(
         worker,
         f"test -f ~/autocode-jobs/{job_id}/prompt.txt && "
@@ -346,9 +346,18 @@ def _build_powershell_script(
         "$cursorAgent = Join-Path $env:LOCALAPPDATA 'cursor-agent/cursor-agent.cmd'",
         f"$jobDir = {job_dir}",
         "$prompt = Join-Path $jobDir 'prompt.txt'",
+    ]
+    for index, arg in enumerate(cmd):
+        if str(arg) == "--workspace" and index + 1 < len(cmd):
+            ws = normalize_cwd(str(cmd[index + 1]))
+            ws_expr = "$env:USERPROFILE" if ws == "~" else ps_quote(ws)
+            parts.append(
+                f"if (-not (Test-Path {ws_expr})) {{ $null = New-Item -ItemType Directory -Force -Path ({ws_expr}) }}"
+            )
+    parts.extend([
         f"if (-not (Test-Path {location_expr})) {{ $null = New-Item -ItemType Directory -Force -Path ({location_expr}) }}",
         f"Set-Location {location_expr}",
-    ]
+    ])
     rendered: list[str] = []
     for index, arg in enumerate(cmd):
         token = str(arg)

@@ -352,7 +352,7 @@ class Scheduler:
         return remote_base
 
     def _adapt_plan_for_remote(self, plan: ContinuePlan, worker: dict, job_id: str = "") -> ContinuePlan:
-        from .remote_ssh import REMOTE_PROMPT_CONTENT, normalize_cwd, worker_field
+        from .remote_ssh import REMOTE_PROMPT_CONTENT, REMOTE_PROMPT_FILE, normalize_cwd, worker_field
 
         remote_cwd = self._map_path_for_remote(plan.cwd or worker_field(worker, "default_cwd") or "~", worker)
         cmd = list(plan.cmd)
@@ -361,11 +361,15 @@ class Scheduler:
             if str(arg) in path_flags and index + 1 < len(cmd):
                 cmd[index + 1] = self._map_path_for_remote(str(cmd[index + 1]), worker)
         prompt_file = plan.prompt_file
-        # Cursor takeover/resume passes multi-KB prompts inline; remote SSH cannot carry that.
-        if plan.provider == "cursor" and not prompt_file and cmd:
-            inline = str(cmd[-1])
-            if len(inline) > 200 and not inline.startswith("-"):
+        # Remote Windows SSH must read prompts from scp'd job dir, never Mac paths or inline multi-KB text.
+        if plan.provider == "cursor" and cmd:
+            last = str(cmd[-1])
+            if last and not last.startswith("-") and not last.startswith(f"{REMOTE_PROMPT_CONTENT}:"):
                 cmd[-1] = f"{REMOTE_PROMPT_CONTENT}:{job_id or 'remote'}"
+                prompt_file = True
+        for index, arg in enumerate(cmd):
+            if str(arg) == "--prompt-file" and index + 1 < len(cmd):
+                cmd[index + 1] = f"{REMOTE_PROMPT_FILE}:{job_id or 'remote'}"
                 prompt_file = True
         return ContinuePlan(
             plan.supported,
