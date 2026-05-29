@@ -36,8 +36,11 @@ run_orchestrator() {
 
   if [[ "$path" == "physical" ]]; then
     PYTHONPATH="${ROOT}:${PYTHONPATH:-}" python3 -m autocode coord pause-l1-competitors 2>/dev/null || true
+    set +e
     bash "$REDWALLET/scripts/run-l1-physical-bidirectional-e2e.sh"
-    return $?
+    local rc=$?
+    set -e
+    return "$rc"
   fi
 
   echo "Physical iOS unavailable — simulator-only bidirectional (iOS sim → Android, then Android → iOS sim)"
@@ -73,18 +76,21 @@ run_orchestrator() {
   export L1_E2E_BALANCE_WAIT_MS="${L1_E2E_BALANCE_WAIT_MS:-120000}"
   export L1_E2E_POST_FUND_RELAUNCH="${L1_E2E_POST_FUND_RELAUNCH:-1}"
 
+  local ios_rc=0 android_rc=0
+  set +e
   L1_E2E_SKIP_LOCK=1 \
     L1_IOS_ANDROID_E2E_LOG_DIR="$run_dir/ios-to-android" \
     L1_E2E_BIDIRECTIONAL=0 \
     REDWALLET_SKIP_ANDROID_SEED="$REDWALLET_SKIP_ANDROID_SEED" \
     ANDROID_L1_RECEIVE_ADDRESS="$ANDROID_L1_RECEIVE_ADDRESS" \
     bash "$REDWALLET/scripts/run-l1-ios-simulator-to-android-phone-e2e.sh"
-  local ios_rc=$?
+  ios_rc=$?
 
   L1_E2E_SKIP_LOCK=1 \
     L1_ANDROID_IOS_E2E_LOG_DIR="$run_dir/android-to-ios" \
     bash "$REDWALLET/scripts/run-l1-android-phone-to-ios-simulator-e2e.sh"
-  local android_rc=$?
+  android_rc=$?
+  set -e
 
   local final_rc=0
   if [[ "$ios_rc" -ne 0 || "$android_rc" -ne 0 ]]; then
