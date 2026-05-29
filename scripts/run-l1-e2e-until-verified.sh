@@ -86,8 +86,31 @@ run_orchestrator() {
     bash "$REDWALLET/scripts/run-l1-ios-simulator-to-android-phone-e2e.sh"
   ios_rc=$?
 
+  # Propagate iOS receive address from ios→android leg for android→ios (skip seed only when known).
+  IOS_L1_RECEIVE_ADDRESS="${IOS_L1_RECEIVE_ADDRESS:-}"
+  if [[ -f "$run_dir/ios-to-android/ios-receive-address.txt" ]]; then
+    parsed_ios="$(grep -Eo 'tb1[a-z0-9]{20,}' "$run_dir/ios-to-android/ios-receive-address.txt" | head -1 || true)"
+    if [[ -n "$parsed_ios" ]]; then
+      IOS_L1_RECEIVE_ADDRESS="$parsed_ios"
+    fi
+  fi
+  if [[ -z "$IOS_L1_RECEIVE_ADDRESS" && -f "$run_dir/ios-to-android/detox.log" ]]; then
+    parsed_ios="$(grep -Eo 'ios_receive_address=tb1[a-z0-9]+' "$run_dir/ios-to-android/detox.log" | head -1 | sed 's/.*=//' || true)"
+    IOS_L1_RECEIVE_ADDRESS="${parsed_ios:-}"
+  fi
+  android_skip_ios_seed="${REDWALLET_SKIP_IOS_SEED:-1}"
+  if [[ -z "$IOS_L1_RECEIVE_ADDRESS" ]]; then
+    echo "ios_receive unset after ios leg — android leg will run iOS seed detox"
+    android_skip_ios_seed=0
+  else
+    echo "ios_receive=$IOS_L1_RECEIVE_ADDRESS (reuse for android→ios)"
+  fi
+  export IOS_L1_RECEIVE_ADDRESS
+
   L1_E2E_SKIP_LOCK=1 \
     L1_ANDROID_IOS_E2E_LOG_DIR="$run_dir/android-to-ios" \
+    REDWALLET_SKIP_IOS_SEED="$android_skip_ios_seed" \
+    IOS_L1_RECEIVE_ADDRESS="${IOS_L1_RECEIVE_ADDRESS:-}" \
     bash "$REDWALLET/scripts/run-l1-android-phone-to-ios-simulator-e2e.sh"
   android_rc=$?
   set -e
