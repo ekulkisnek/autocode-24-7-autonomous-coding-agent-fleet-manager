@@ -18,6 +18,7 @@ L1_E2E_SCRIPT = ROOT / "scripts" / "run-l1-e2e-until-verified.sh"
 PICK_L1_PATH_SCRIPT = ROOT / "scripts" / "pick-l1-e2e-path.sh"
 VERIFY_SCRIPT = ROOT / "scripts" / "verify-goal-status.py"
 DISPATCH_SCRIPT = ROOT / "scripts" / "dispatch-goal-fleets.py"
+L1_WORKERS_SCRIPT = ROOT / "scripts" / "dispatch-l1-goal-workers.py"
 L1_SIMULATOR_CONTEXT = (
     "LiPhone unplugged — simulator paths only. "
     "Do NOT run run-l1-physical-bidirectional-e2e.sh or run-l1-ios-phone-* orchestrators. "
@@ -234,6 +235,10 @@ def start_l1_loop_if_needed(status: dict[str, Any]) -> bool:
         env["L1_E2E_SKIP_PHYSICAL_IOS"] = "1"
         env.setdefault("L1_E2E_FORCE_PATH", "simulator")
         env.setdefault("REDWALLET_SKIP_ANDROID_SEED", "1")
+        env.setdefault("REDWALLET_SKIP_IOS_SEED", "1")
+        env.setdefault("L1_E2E_MAX_ATTEMPTS", "9999")
+        env.setdefault("L1_E2E_BALANCE_WAIT_MS", "120000")
+        env.setdefault("L1_E2E_POST_FUND_RELAUNCH", "1")
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"\n=== autocode goal_fleets spawn {now_iso()} path={path} ===\n")
         subprocess.Popen(
@@ -516,6 +521,22 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
 
     # Goal fleets always re-dispatch on verify failure (yolo); never gate on Mac capacity.
     result["dispatch"] = dispatch_incomplete_goals(store, status)
+
+    if l1_incomplete and L1_WORKERS_SCRIPT.is_file() and not l1_busy:
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(L1_WORKERS_SCRIPT)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=str(ROOT),
+            )
+            result["l1_workers"] = {
+                "rc": proc.returncode,
+                "out": (proc.stdout or proc.stderr or "")[:400],
+            }
+        except Exception as exc:
+            result["l1_workers"] = {"error": str(exc)}
 
     _record_goal_tick(store)
     store.event("goal_fleets_tick", **{k: v for k, v in result.items() if k not in {"goals"}})
