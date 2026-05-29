@@ -27,6 +27,15 @@ L1_COMPETING_QUERIES = (
     "fund-l1-e2e",
     "physical-l1-e2e",
     "retry-l1-e2e",
+    # Parallel L1 fix workers (goal1-worker:* chats) must not run during Detox.
+    "goal1-worker",
+    "l1-sim-detox-fix",
+    "l1-electrum-sync-fix",
+    "l1-orchestrator-hardening",
+    "l1-signet-shared-tests",
+    "l1-log-analysis",
+    "l1-blueelectrum-signet",
+    "l1-docs-e2e",
 )
 
 # Fleets that must not run on Mac during L1 (liquid cursor/grok on redwallet).

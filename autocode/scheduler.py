@@ -748,7 +748,7 @@ class Scheduler:
         chat_id = str(row["id"] or "")
         max_turns = (
             "200"
-            if "l1-e2e-until-verified" in chat_id
+            if "l1-e2e-until-verified" in chat_id or "goal1-worker" in chat_id
             else "120"
             if source == "grok.wiki_squad" or "goal-fleet" in chat_id
             else "40"

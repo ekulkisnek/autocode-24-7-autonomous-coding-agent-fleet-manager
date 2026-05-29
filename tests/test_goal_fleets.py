@@ -9,6 +9,8 @@ from autocode.goal_fleets import (
     _failure_context_from_run,
     clear_stale_l1_lock,
     find_latest_l1_run_dir,
+    maybe_refresh_l1_provider_backoff,
+    pause_l1_agent_work_during_shell,
     reconcile_false_complete_fleets,
     tick,
 )
@@ -87,6 +89,52 @@ def test_tick_skips_when_interval_not_due(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(sched, "capacity", lambda: 2)
     result = tick(store, sched)
     assert result.get("skipped") == "interval"
+
+
+def test_maybe_refresh_clears_cursor_when_grok_oauth(tmp_path: Path):
+    store = Store(tmp_path / "autocode.sqlite")
+    from autocode.recovery import backoff_seconds
+    from autocode.util import iso_from_ts, now_ts
+
+    until = iso_from_ts(now_ts() + backoff_seconds("provider_error", 3))
+    with store.connect() as con:
+        con.execute(
+            "insert into provider_health(provider,failure_count,backoff_until,last_error) values(?,?,?,?)",
+            ("grok", 3, until, "Open this URL to sign in: https://auth.x.ai/oauth2/authorize"),
+        )
+        con.execute(
+            "insert into provider_health(provider,failure_count,backoff_until,last_error) values(?,?,?,?)",
+            ("cursor", 5, until, "api error"),
+        )
+    actions = maybe_refresh_l1_provider_backoff(store)
+    assert actions.get("cursor") == "cleared_for_l1_grok_oauth"
+    row = store.row("select failure_count from provider_health where provider=?", ("cursor",))
+    assert int(row["failure_count"] or 0) == 0
+
+
+def test_pause_l1_agent_work_during_shell(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "autocode.sqlite")
+    sched = Scheduler(store)
+    chat = Chat(
+        id="grok:goal1-worker:l1-sim-detox-fix:abc",
+        provider="grok",
+        source="grok.new",
+        provider_chat_id="w1",
+        title="fix",
+        cwd=str(tmp_path),
+        updated_at=now_iso(),
+        latest_text="go",
+        transcript_hash="h",
+        alias="l1-sim-detox-fix",
+        continuation="grok",
+    )
+    store.upsert_chat(chat, 5, "active", "fix detox")
+    monkeypatch.setattr("autocode.goal_fleets._l1_loop_running", lambda: True)
+    monkeypatch.setattr("autocode.goal_fleets._l1_orchestrator_running", lambda: False)
+    paused, killed = pause_l1_agent_work_during_shell(store, sched)
+    assert paused >= 1
+    row = store.row("select paused from chats where id=?", (chat.id,))
+    assert int(row["paused"] or 0) == 1
 
 
 def test_tick_records_when_all_complete(tmp_path: Path, monkeypatch):

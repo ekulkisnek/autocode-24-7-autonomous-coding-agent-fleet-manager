@@ -332,6 +332,18 @@ def windows_slot_available(store: Store) -> bool:
     return used < cap
 
 
+def l1_detox_or_shell_active() -> bool:
+    """True when the exclusive L1 shell loop or a run-l1-* orchestrator is running."""
+    from autocode import coordination
+    from autocode.goal_fleets import _l1_loop_running, _l1_orchestrator_running
+
+    return (
+        coordination.l1_lock_active()
+        or _l1_orchestrator_running()
+        or _l1_loop_running()
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Dispatch L1 parallel fix workers")
     parser.add_argument(
@@ -362,9 +374,16 @@ def main() -> None:
 
     store = Store()
     sched = Scheduler(store)
+    if l1_detox_or_shell_active():
+        print("SKIP dispatch: L1 Detox/shell active — fix workers deferred until idle")
+        print(json.dumps({"dispatched": [], "skipped": "l1_busy", "goal_pct": l1.get("pct")}, indent=2))
+        return
+
     coord = sched.coordination_snapshot()
     mac_can_take = bool(coord.get("mac_can_take_more"))
     dispatched: list[dict] = []
+    mac_dispatched = 0
+    max_mac_fix_workers = int(store.get_config("l1_max_mac_fix_workers", "1") or 1)
 
     for alias in mac_aliases:
         if alias_has_running_job(store, alias):
@@ -381,6 +400,10 @@ def main() -> None:
         if sched.has_active_job(chat_id):
             print(f"SKIP {alias}: active job")
             continue
+        if mac_dispatched >= max_mac_fix_workers:
+            print(f"QUEUE {alias}: mac fix worker cap ({max_mac_fix_workers})")
+            dispatched.append({"alias": alias, "job_id": None, "target": "mac", "queued": True})
+            continue
         if not mac_can_take:
             print(f"QUEUE {alias}: mac at capacity (queued for tick spill)")
             dispatched.append({"alias": alias, "job_id": None, "target": "mac", "queued": True})
@@ -389,12 +412,21 @@ def main() -> None:
         if job_id:
             print(f"DISPATCHED {alias} -> {job_id} (mac)")
             dispatched.append({"alias": alias, "job_id": job_id, "target": "mac"})
+            mac_dispatched += 1
         else:
             print(f"QUEUE {alias}: dispatch deferred")
             dispatched.append({"alias": alias, "job_id": None, "target": "mac", "queued": True})
 
     if windows_aliases and (not mac_can_take or dispatch_all):
         worker = store.row("select * from remote_workers where id='windows-main' and enabled=1")
+        from autocode import recovery
+
+        if recovery.provider_in_backoff(store, "grok"):
+            grok_err = store.row("select last_error from provider_health where provider='grok'")
+            err_blob = str(grok_err["last_error"] or "").lower() if grok_err else ""
+            if any(m in err_blob for m in ("sign in", "oauth", "authorize", "open this url")):
+                print("SKIP windows grok workers: grok OAuth required on windows-main")
+                windows_aliases = []
         for alias in windows_aliases:
             if alias_has_running_job(store, alias):
                 print(f"SKIP {alias}: job running")

@@ -25,7 +25,7 @@ class Store:
         con = sqlite3.connect(self.path, timeout=30)
         con.row_factory = sqlite3.Row
         con.execute("pragma journal_mode=wal")
-        con.execute("pragma busy_timeout=5000")
+        con.execute("pragma busy_timeout=15000")
         try:
             yield con
             con.commit()

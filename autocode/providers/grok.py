@@ -88,7 +88,7 @@ class GrokProvider(Provider):
             "l1-blueelectrum-signet",
             "l1-docs-e2e",
         }:
-            return "120"
+            return "200"
         return "40"
 
     def continue_plan(self, chat: Chat, prompt: str, job_dir: Path) -> ContinuePlan:

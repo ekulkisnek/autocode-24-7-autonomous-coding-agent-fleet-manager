@@ -320,13 +320,69 @@ def pause_l1_competitors_no_lock(store: Store, scheduler: Any) -> tuple[int, int
     return paused, killed
 
 
+def pause_l1_agent_work_during_shell(store: Store, scheduler: Any) -> tuple[int, int]:
+    """Pause/kill agent L1 fleets while the shell retry loop or Detox orchestrator runs."""
+    if not (_l1_orchestrator_running() or _l1_loop_running()):
+        return 0, 0
+    paused = 0
+    killed = 0
+    fleet_alias = GOAL_FLEET_ALIASES["l1-e2e-verified"]
+    rows = store.rows(
+        """
+        select id, alias from chats
+        where paused=0 and done=0
+          and (
+            id like '%goal1-worker%'
+            or alias like '%goal1-worker%'
+            or alias=?
+            or alias like ?
+          )
+        """,
+        (fleet_alias, f"%{fleet_alias}%"),
+    )
+    for row in rows:
+        chat_id = str(row["id"])
+        n = scheduler.runner.kill_chat_jobs(chat_id, "l1_shell_orchestrator_active")
+        store.pause_chat(chat_id)
+        killed += n
+        paused += 1
+    return paused, killed
+
+
+def maybe_refresh_l1_provider_backoff(store: Store) -> dict[str, str]:
+    """Clear expired backoffs; keep cursor available when grok is OAuth-blocked."""
+    from . import recovery
+    from .util import parse_ts, now_ts
+
+    actions: dict[str, str] = {}
+    for provider in ("grok", "cursor"):
+        row = store.row("select backoff_until,last_error,failure_count from provider_health where provider=?", (provider,))
+        if not row:
+            continue
+        until = parse_ts(str(row["backoff_until"] or ""))
+        if until and until <= now_ts():
+            store.clear_provider_health(provider)
+            actions[provider] = "cleared_expired"
+    grok_row = store.row("select last_error from provider_health where provider=?", ("grok",))
+    grok_oauth = grok_row and any(
+        m in str(grok_row["last_error"] or "").lower()
+        for m in ("sign in", "oauth", "authorize", "open this url")
+    )
+    if grok_oauth and not recovery.provider_in_backoff(store, "cursor"):
+        actions["grok"] = actions.get("grok", "oauth_human_gate")
+    elif grok_oauth and recovery.provider_in_backoff(store, "cursor"):
+        # Grok needs login; do not let grok OAuth failures block cursor L1 fix workers.
+        store.clear_provider_health("cursor")
+        actions["cursor"] = "cleared_for_l1_grok_oauth"
+    return actions
+
+
 def pause_duplicate_l1_fleet_chats(store: Store, scheduler: Any) -> tuple[int, int]:
     """Keep only one active l1-e2e-until-verified fleet chat (prefer cursor over grok in backoff)."""
     from . import recovery
 
-    # Shell orchestrator + agent fleet may run together; dedupe only when idle.
     if _l1_orchestrator_running() or _l1_loop_running():
-        return 0, 0
+        return pause_l1_agent_work_during_shell(store, scheduler)
 
     alias = GOAL_FLEET_ALIASES["l1-e2e-verified"]
     rows = store.rows(
@@ -573,6 +629,7 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
     l1_path = pick_l1_e2e_path() if l1_incomplete else ""
     result["l1_path"] = l1_path
     if l1_incomplete:
+        result["provider_backoff"] = maybe_refresh_l1_provider_backoff(store)
         result["l1_fleet_deduped"], result["l1_fleet_jobs_killed"] = pause_duplicate_l1_fleet_chats(store, scheduler)
         if not l1_busy:
             result["competitors_paused"], result["competitor_jobs_killed"] = pause_l1_competitors_no_lock(
@@ -603,20 +660,23 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
     result["dispatch"] = dispatch_incomplete_goals(store, status)
 
     if l1_incomplete and L1_WORKERS_SCRIPT.is_file():
-        try:
-            proc = subprocess.run(
-                [sys.executable, str(L1_WORKERS_SCRIPT)],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                cwd=str(ROOT),
-            )
-            result["l1_workers"] = {
-                "rc": proc.returncode,
-                "out": (proc.stdout or proc.stderr or "")[:400],
-            }
-        except Exception as exc:
-            result["l1_workers"] = {"error": str(exc)}
+        if l1_busy:
+            result["l1_workers"] = {"skipped": "detox_or_shell_active"}
+        else:
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(L1_WORKERS_SCRIPT)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    cwd=str(ROOT),
+                )
+                result["l1_workers"] = {
+                    "rc": proc.returncode,
+                    "out": (proc.stdout or proc.stderr or "")[:400],
+                }
+            except Exception as exc:
+                result["l1_workers"] = {"error": str(exc)}
 
     _record_goal_tick(store)
     store.event("goal_fleets_tick", **{k: v for k, v in result.items() if k not in {"goals"}})
