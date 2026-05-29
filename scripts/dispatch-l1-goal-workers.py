@@ -374,16 +374,17 @@ def main() -> None:
 
     store = Store()
     sched = Scheduler(store)
-    if l1_detox_or_shell_active():
-        print("SKIP dispatch: L1 Detox/shell active — fix workers deferred until idle")
-        print(json.dumps({"dispatched": [], "skipped": "l1_busy", "goal_pct": l1.get("pct")}, indent=2))
-        return
+    l1_busy = l1_detox_or_shell_active()
+    if l1_busy:
+        # Mac fix workers compete with Detox CPU; Windows review workers do not.
+        mac_aliases = []
+        print("L1 Detox/shell active — Mac fix workers deferred; Windows workers OK")
 
     coord = sched.coordination_snapshot()
     mac_can_take = bool(coord.get("mac_can_take_more"))
     dispatched: list[dict] = []
     mac_dispatched = 0
-    max_mac_fix_workers = int(store.get_config("l1_max_mac_fix_workers", "1") or 1)
+    max_mac_fix_workers = int(store.get_config("l1_max_mac_fix_workers", "2") or 2)
 
     for alias in mac_aliases:
         if alias_has_running_job(store, alias):
@@ -417,7 +418,7 @@ def main() -> None:
             print(f"QUEUE {alias}: dispatch deferred")
             dispatched.append({"alias": alias, "job_id": None, "target": "mac", "queued": True})
 
-    if windows_aliases and (not mac_can_take or dispatch_all):
+    if windows_aliases and (l1_busy or not mac_can_take or dispatch_all):
         worker = store.row("select * from remote_workers where id='windows-main' and enabled=1")
         from autocode import recovery
 

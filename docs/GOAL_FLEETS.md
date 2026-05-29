@@ -11,7 +11,7 @@ python3 scripts/verify-goal-status.py
 python3 scripts/verify-goal-status.py --json
 ```
 
-See also: [AUTOCODE_GOAL_DRIVING.md](AUTOCODE_GOAL_DRIVING.md)
+See also: [AUTOCODE_GOAL_DRIVING.md](AUTOCODE_GOAL_DRIVING.md), [CURSOR_GOAL_SUPERVISOR.md](CURSOR_GOAL_SUPERVISOR.md)
 
 ## Autonomous loop (no manual intervention)
 

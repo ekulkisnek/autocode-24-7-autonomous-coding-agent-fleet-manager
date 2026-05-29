@@ -26,6 +26,8 @@ PICK_L1_PATH_SCRIPT = ROOT / "scripts" / "pick-l1-e2e-path.sh"
 VERIFY_SCRIPT = ROOT / "scripts" / "verify-goal-status.py"
 DISPATCH_SCRIPT = ROOT / "scripts" / "dispatch-goal-fleets.py"
 L1_WORKERS_SCRIPT = ROOT / "scripts" / "dispatch-l1-goal-workers.py"
+INFRA_SUPERVISOR_SCRIPT = ROOT / "scripts" / "autocode-infra-supervisor.py"
+META_SUPERVISOR_SCRIPT = ROOT / "scripts" / "dispatch-meta-supervisor.py"
 L1_SIMULATOR_CONTEXT = (
     "LiPhone unplugged — simulator paths only. "
     "Do NOT run run-l1-physical-bidirectional-e2e.sh or run-l1-ios-phone-* orchestrators. "
@@ -250,8 +252,9 @@ def start_l1_loop_if_needed(status: dict[str, Any]) -> bool:
         env.setdefault("REDWALLET_SKIP_IOS_SEED", "1")
         env.setdefault("L1_E2E_MAX_ATTEMPTS", "9999")
         env.setdefault("L1_E2E_BALANCE_WAIT_MS", "120000")
-        env.setdefault("L1_E2E_POST_FUND_RELAUNCH", "1")
-        env.setdefault("L1_E2E_RETRY_SLEEP", "90")
+        env.setdefault("L1_E2E_POST_FUND_RELAUNCH", "0")
+        env.setdefault("L1_E2E_RETRY_SLEEP", "45")
+        env.setdefault("IOS_L1_RECEIVE_ADDRESS", "tb1qnjv0rlz4hjunf3zd0r6klu4j0r8srr2hawahrg")
         env.setdefault("ANDROID_L1_RECEIVE_ADDRESS", "tb1qewdkqej3xc6hh2v5q88rnaekd2zkccf0zq6kdf")
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"\n=== autocode goal_fleets spawn {now_iso()} path={path} ===\n")
@@ -619,6 +622,21 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
 
     result: dict[str, Any] = {"at": now_iso()}
     result["stale_lock_cleared"] = clear_stale_l1_lock()
+
+    if INFRA_SUPERVISOR_SCRIPT.is_file():
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(INFRA_SUPERVISOR_SCRIPT), "--json"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=str(ROOT),
+            )
+            if proc.stdout.strip():
+                result["infra_supervisor"] = json.loads(proc.stdout)
+        except Exception as exc:
+            result["infra_supervisor"] = {"error": str(exc)}
+
     status = load_status()
     result["all_complete"] = status.get("all_complete", False)
     result["goals"] = {g["id"]: g.get("pct", 0) for g in status.get("goals", [])}
@@ -681,6 +699,22 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
                 }
             except Exception as exc:
                 result["l1_workers"] = {"error": str(exc)}
+
+    if not status.get("all_complete") and META_SUPERVISOR_SCRIPT.is_file():
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(META_SUPERVISOR_SCRIPT)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=str(ROOT),
+            )
+            result["meta_supervisor"] = {
+                "rc": proc.returncode,
+                "out": (proc.stdout or proc.stderr or "")[:400],
+            }
+        except Exception as exc:
+            result["meta_supervisor"] = {"error": str(exc)}
 
     _record_goal_tick(store)
     store.event("goal_fleets_tick", **{k: v for k, v in result.items() if k not in {"goals"}})

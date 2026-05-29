@@ -50,7 +50,7 @@ run_orchestrator() {
   export REDWALLET_SKIP_ANDROID_SEED="${REDWALLET_SKIP_ANDROID_SEED:-1}"
   export REDWALLET_SKIP_IOS_SEED="${REDWALLET_SKIP_IOS_SEED:-1}"
   export L1_E2E_BALANCE_WAIT_MS="${L1_E2E_BALANCE_WAIT_MS:-120000}"
-  export L1_E2E_POST_FUND_RELAUNCH="${L1_E2E_POST_FUND_RELAUNCH:-1}"
+  export L1_E2E_POST_FUND_RELAUNCH="${L1_E2E_POST_FUND_RELAUNCH:-0}"
   bash "$ROOT/scripts/l1-e2e-autocode-preflight.sh" || {
     echo "FAIL autocode preflight — retry after infra ready"
     return 2
@@ -74,7 +74,7 @@ run_orchestrator() {
   export ANDROID_L1_RECEIVE_ADDRESS="${ANDROID_L1_RECEIVE_ADDRESS:-$DEFAULT_ANDROID_RECEIVE}"
   export L1_RECEIVE_ADDRESS="${L1_RECEIVE_ADDRESS:-$ANDROID_L1_RECEIVE_ADDRESS}"
   export L1_E2E_BALANCE_WAIT_MS="${L1_E2E_BALANCE_WAIT_MS:-120000}"
-  export L1_E2E_POST_FUND_RELAUNCH="${L1_E2E_POST_FUND_RELAUNCH:-1}"
+  export L1_E2E_POST_FUND_RELAUNCH="${L1_E2E_POST_FUND_RELAUNCH:-0}"
 
   local ios_rc=0 android_rc=0
   set +e
