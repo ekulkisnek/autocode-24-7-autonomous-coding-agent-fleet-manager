@@ -80,10 +80,18 @@ class Scheduler:
         )
         dispatched_chat_ids: set[str] = set()
         if dispatch and limit > 0:
+            from . import coordination
+
+            if coordination.l1_lock_active():
+                coordination.pause_competing_chats(self.store, self)
             for row in queued:
                 if len(sent) >= limit:
                     break
                 if self.has_active_job(row["id"]) or self.has_active_lease(row):
+                    continue
+                if coordination.should_block_mac_dispatch(
+                    str(row["alias"] or ""), str(row["title"] or ""), str(row["cwd"] or "")
+                ):
                     continue
                 grok_watchdog.request("prompt_due")
                 job_id = self.dispatch(row, queue_snapshot_id=snapshot_id)
@@ -103,6 +111,8 @@ class Scheduler:
         should_spill = dispatch and (not mac_can_take_more or mac_utilization >= spill_threshold)
         if should_spill:
             remote_budget = self._remote_dispatch_budget()
+            # Windows remote: one job per worker per tick (sequential dispatch).
+            remote_dispatched_workers: set[str] = set()
             for row in queued:
                 if remote_budget <= 0:
                     break
@@ -115,6 +125,11 @@ class Scheduler:
                 job_weight = self._job_weight(row)
                 worker = self._pick_remote_worker(str(row["provider"] or ""), job_weight)
                 if not worker:
+                    continue
+                wid = str(worker["id"])
+                if wid in remote_dispatched_workers:
+                    continue
+                if self._remote_worker_weight(wid) >= 0.99:
                     continue
                 try:
                     job_id = self.dispatch_remote(row, worker, queue_snapshot_id=snapshot_id)
@@ -131,6 +146,7 @@ class Scheduler:
                     remote_sent.append(job_id)
                     dispatched_chat_ids.add(str(row["id"]))
                     remote_budget = max(0.0, remote_budget - job_weight)
+                    remote_dispatched_workers.add(wid)
 
         coord = self.coordination_snapshot(
             cap=cap,

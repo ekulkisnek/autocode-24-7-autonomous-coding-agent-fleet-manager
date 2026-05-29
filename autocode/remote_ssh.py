@@ -99,7 +99,7 @@ def _remote_command(
     return cmd
 
 
-def ensure_remote_job_dir(worker: Mapping[str, str] | Any, job_id: str, timeout: int = 15) -> subprocess.CompletedProcess[str]:
+def ensure_remote_job_dir(worker: Mapping[str, str] | Any, job_id: str, timeout: int = 45) -> subprocess.CompletedProcess[str]:
     shell = worker_shell(worker)
     if shell == "powershell":
         job_dir = ps_join("$env:USERPROFILE", "autocode-jobs", job_id)
@@ -114,7 +114,7 @@ def scp_prompt_file(
     worker: Mapping[str, str] | Any,
     local_path: str,
     job_id: str,
-    timeout: int = 30,
+    timeout: int = 60,
 ) -> subprocess.CompletedProcess[str]:
     target = ssh_target(worker)
     ssh_key = worker_field(worker, "ssh_key_path").strip()
@@ -179,12 +179,12 @@ _POWERSHELL_RAM_CPU_SCRIPT = (
 def build_probe_resources_command(worker: Mapping[str, str] | Any) -> list[str]:
     shell = worker_shell(worker)
     if shell == "powershell":
-        return _remote_command(worker, *_powershell_encoded_argv(_POWERSHELL_RAM_CPU_SCRIPT), connect_timeout=12)
+        return _remote_command(worker, *_powershell_encoded_argv(_POWERSHELL_RAM_CPU_SCRIPT), connect_timeout=30)
     return _remote_command(
         worker,
         "echo ram_bytes=$(awk '/MemTotal/ {print $2*1024}' /proc/meminfo); "
         "echo cpu_cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)",
-        connect_timeout=12,
+        connect_timeout=30,
     )
 
 
@@ -199,12 +199,12 @@ def build_probe_providers_command(worker: Mapping[str, str] | Any) -> list[str]:
             "$cursor = Get-Command cursor-agent.cmd -ErrorAction SilentlyContinue; "
             "if ($cursor) { Write-Output ('cursor-agent=' + $cursor.Source) } else { Write-Output 'cursor-agent=missing' } }"
         )
-        return _remote_command(worker, "powershell", "-NoProfile", "-Command", ps, connect_timeout=12)
+        return _remote_command(worker, "powershell", "-NoProfile", "-Command", ps, connect_timeout=30)
     return _remote_command(
         worker,
         "command -v grok >/dev/null 2>&1 && echo grok=$(command -v grok) || echo grok=missing; "
         "command -v cursor-agent >/dev/null 2>&1 && echo cursor-agent=$(command -v cursor-agent) || echo cursor-agent=missing",
-        connect_timeout=12,
+        connect_timeout=30,
     )
 
 
@@ -218,7 +218,7 @@ def _parse_probe_kv(text: str) -> dict[str, str]:
     return out
 
 
-def probe_worker_resources(worker: Mapping[str, str] | Any, *, timeout: int = 15) -> dict[str, int | float | str]:
+def probe_worker_resources(worker: Mapping[str, str] | Any, *, timeout: int = 45) -> dict[str, int | float | str]:
     result = subprocess.run(build_probe_resources_command(worker), capture_output=True, text=True, timeout=timeout)
     parsed = _parse_probe_kv(result.stdout or "")
     ram_bytes = int(parsed.get("ram_bytes") or 0)
@@ -234,7 +234,7 @@ def probe_worker_resources(worker: Mapping[str, str] | Any, *, timeout: int = 15
     }
 
 
-def probe_worker_providers(worker: Mapping[str, str] | Any, *, timeout: int = 15) -> dict[str, str]:
+def probe_worker_providers(worker: Mapping[str, str] | Any, *, timeout: int = 45) -> dict[str, str]:
     result = subprocess.run(build_probe_providers_command(worker), capture_output=True, text=True, timeout=timeout)
     parsed = _parse_probe_kv(result.stdout or "")
     return {
@@ -271,11 +271,11 @@ def build_remote_exec_command(
         remote_script = _build_powershell_script(cwd, rewritten, job_id, env=env)
         # Do not allocate a TTY (-tt): Windows OpenSSH + cursor-agent/grok hang or
         # emit ^C under pseudo-terminal allocation. EncodedCommand without TTY is reliable.
-        return _remote_command(worker, *_powershell_encoded_argv(remote_script), tty=False)
+        return _remote_command(worker, *_powershell_encoded_argv(remote_script), tty=False, connect_timeout=45)
     remote_cwd = normalize_cwd(cwd)
     remote_cmd = " ".join(bash_quote(part) for part in rewritten)
     env_prefix = _bash_env_prefix(env)
-    return _remote_command(worker, f"{env_prefix}cd {bash_quote(remote_cwd)} && {remote_cmd}", tty=True)
+    return _remote_command(worker, f"{env_prefix}cd {bash_quote(remote_cwd)} && {remote_cmd}", tty=True, connect_timeout=45)
 
 
 def build_ping_command(worker: Mapping[str, str] | Any) -> list[str]:
@@ -287,12 +287,12 @@ def build_ping_command(worker: Mapping[str, str] | Any) -> list[str]:
             "$cursorCmd = Join-Path $env:LOCALAPPDATA 'cursor-agent/cursor-agent.cmd'\n"
             "if (Test-Path $cursorCmd) { & $cursorCmd --version }"
         )
-        return _remote_command(worker, *_powershell_encoded_argv(ps), connect_timeout=8)
+        return _remote_command(worker, *_powershell_encoded_argv(ps), connect_timeout=30)
     return _remote_command(
         worker,
         "echo ok && grok --version 2>/dev/null || echo 'grok not found'; "
         "cursor-agent --version 2>/dev/null || echo 'cursor-agent not found'",
-        connect_timeout=8,
+        connect_timeout=30,
     )
 
 
@@ -307,12 +307,12 @@ def build_smoke_command(worker: Mapping[str, str] | Any, job_id: str) -> list[st
             "Write-Output ('prompt=' + (Get-Content -Raw $prompt).Trim()); "
             "grok --version 2>$null"
         )
-        return _remote_command(worker, *_powershell_encoded_argv(ps), connect_timeout=15)
+        return _remote_command(worker, *_powershell_encoded_argv(ps), connect_timeout=45)
     return _remote_command(
         worker,
         f"test -f ~/autocode-jobs/{job_id}/prompt.txt && "
         f"echo prompt=$(cat ~/autocode-jobs/{job_id}/prompt.txt) && grok --version",
-        connect_timeout=15,
+        connect_timeout=45,
     )
 
 
@@ -388,11 +388,11 @@ def build_remote_kill_command(worker: Mapping[str, str] | Any, job_id: str) -> l
             "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; "
             "Write-Output killed"
         )
-        return _remote_command(worker, "powershell", "-NoProfile", "-Command", ps, connect_timeout=15)
+        return _remote_command(worker, "powershell", "-NoProfile", "-Command", ps, connect_timeout=30)
     return _remote_command(
         worker,
         f"pkill -f 'autocode-jobs/{job_id}' 2>/dev/null || true; echo killed",
-        connect_timeout=15,
+        connect_timeout=30,
     )
 
 
@@ -410,7 +410,7 @@ def bench_remote_worker(worker: Mapping[str, str] | Any, *, job_id: str = "bench
     out: dict[str, float | int | str] = {"job_id": job_id}
 
     t0 = time.perf_counter()
-    ping = subprocess.run(build_ping_command(worker), capture_output=True, text=True, timeout=20)
+    ping = subprocess.run(build_ping_command(worker), capture_output=True, text=True, timeout=45)
     out["ping_s"] = round(time.perf_counter() - t0, 3)
     out["ping_ok"] = int(ping.returncode == 0)
 
@@ -436,7 +436,7 @@ def bench_remote_worker(worker: Mapping[str, str] | Any, *, job_id: str = "bench
         return out
 
     t0 = time.perf_counter()
-    smoke = subprocess.run(build_smoke_command(worker, job_id), capture_output=True, text=True, timeout=30)
+    smoke = subprocess.run(build_smoke_command(worker, job_id), capture_output=True, text=True, timeout=60)
     out["smoke_s"] = round(time.perf_counter() - t0, 3)
     out["smoke_ok"] = int(smoke.returncode == 0)
     out["total_s"] = round(out["ping_s"] + out["mkdir_s"] + out["scp_s"] + out["smoke_s"], 3)

@@ -892,6 +892,36 @@ def cmd_pause(args: argparse.Namespace) -> None:
     print(f"Paused {row['alias']}; killed {killed} running job(s)")
 
 
+def cmd_coord(args: argparse.Namespace) -> None:
+    from . import coordination
+
+    store = Store()
+    sched = Scheduler(store)
+    if args.coord_cmd == "l1-status":
+        info = coordination.read_l1_lock()
+        active = coordination.l1_lock_active()
+        if getattr(args, "json", False):
+            print(json.dumps({"active": active, "lock": info}, indent=2, sort_keys=True))
+            return
+        if active and info:
+            print(f"L1 lock ACTIVE pid={info.get('pid')} holder={info.get('holder')} run_dir={info.get('run_dir')}")
+        else:
+            print("L1 lock: none")
+    elif args.coord_cmd == "pause-l1-competitors":
+        if not coordination.l1_lock_active():
+            coordination.acquire_l1_lock(run_dir="manual-pause", holder="coord-cli")
+        paused, killed = coordination.pause_competing_chats(store, sched)
+        dupes = coordination.kill_duplicate_l1_processes()
+        print(f"Paused {paused} competing chat(s); killed {killed} job(s); killed {len(dupes)} duplicate l1/detox pids")
+    elif args.coord_cmd == "release-l1":
+        coordination.release_l1_lock()
+        print("L1 lock released")
+    elif args.coord_cmd == "set-windows-sequential":
+        with store.connect() as con:
+            con.execute("update remote_workers set weight_capacity=1.0 where id='windows-main'")
+        print("windows-main weight_capacity=1.0 (one remote job at a time)")
+
+
 def cmd_done(args: argparse.Namespace) -> None:
     store = Store()
     row = store.find_chat(args.query)
@@ -1633,6 +1663,18 @@ def build_parser() -> argparse.ArgumentParser:
     sqc = sqsub.add_parser("collect"); sqc.add_argument("query"); sqc.add_argument("--limit", type=int, default=8); sqc.add_argument("--send-writer", action="store_true"); sqc.set_defaults(func=cmd_squad)
     y = sub.add_parser("yolo"); y.add_argument("state", choices=["on", "off"]); y.set_defaults(func=cmd_yolo)
     pa = sub.add_parser("pause"); pa.add_argument("query"); pa.set_defaults(func=cmd_pause)
+
+    co = sub.add_parser("coord", help="L1 E2E mutex and fleet coordination")
+    cosub = co.add_subparsers(dest="coord_cmd", required=True)
+    col = cosub.add_parser("l1-status", help="show L1 exclusive lock state")
+    col.add_argument("--json", action="store_true")
+    col.set_defaults(func=cmd_coord)
+    cop = cosub.add_parser("pause-l1-competitors", help="pause liquid/patreon/l1 Mac jobs during Detox")
+    cop.set_defaults(func=cmd_coord)
+    cor = cosub.add_parser("release-l1", help="release L1 E2E lock file")
+    cor.set_defaults(func=cmd_coord)
+    cow = cosub.add_parser("set-windows-sequential", help="set windows-main capacity=1")
+    cow.set_defaults(func=cmd_coord)
     dn = sub.add_parser("done"); dn.add_argument("query"); dn.set_defaults(func=cmd_done)
     dep = sub.add_parser("depend")
     dep.add_argument("query", help="chat to inspect or modify dependencies for")
