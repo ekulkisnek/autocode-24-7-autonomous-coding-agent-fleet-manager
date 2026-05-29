@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Goal-driven autocode dispatch: re-queue incomplete goals until success or hard blocker."""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from autocode.models import Chat
+from autocode.scheduler import Scheduler
+from autocode.store import Store
+from autocode.util import now_iso, sha
+
+REDWALLET = "/Volumes/T705/code/work-on-something-to-do-with/redwallet"
+LOG_ROOT = "/Volumes/T705/redwallet-logs"
+
+GOAL_FLEETS = {
+    "l1-e2e-verified": {
+        "alias": "l1-e2e-until-verified",
+        "provider": "grok",
+        "cwd": REDWALLET,
+        "position": -300.0,
+        "goal": f"""RedWallet L1 E2E until verified (Goal 1).
+
+SUCCESS CRITERIA (stop with FLEET_DONE only when ALL met):
+1. Run ./scripts/run-l1-physical-bidirectional-e2e.sh (physical iPhone + Android preferred)
+   OR run ios→android then android→ios orchestrators sequentially with l1-e2e-lock.
+2. Update {LOG_ROOT}/L1_VERIFIED_EVIDENCE.md with TWO mainchain txids, detox_exit=0, verify=ok for BOTH directions.
+3. Do NOT start parallel Detox/orchestrator runs — lock is enforced via scripts/l1-e2e-lock.sh.
+
+If lock is held, wait or inspect current run logs under {LOG_ROOT}/current-l1-physical-bidirectional-e2e.
+If Detox fails on Send navigation, spec uses openWalletSendScreen (no post-create relaunch unless L1_E2E_POST_CREATE_RELAUNCH=1).
+
+Devices: Android 0A201JECB03306, iPhone 00008020-0011204911F3002E.
+Commit redwallet fixes to fork branch codex/redwallet-utreexo-quic-sync; push to ekulkisnek/BlueWallet.
+
+End with FLEET_DONE and paste evidence table rows.""",
+    },
+    "windows-remote-health": {
+        "alias": "windows-remote-health",
+        "provider": "grok",
+        "cwd": "/Users/lukekensik/autocode",
+        "position": 8000.0,
+        "goal": """AutoCode Windows remote health (Goal 2).
+
+SUCCESS:
+- python3 -m autocode worker ping windows-main → ok
+- python3 -m autocode worker bench windows-main → all *_ok=1
+- Dispatch ONE grok job to windows-main that completes with evidence_status=worked (real stdout, not API limit false positive)
+
+Fix if needed: grok OAuth on Windows, cursor-agent path C:\\Users\\Luke\\AppData\\Local\\cursor-agent\\cursor-agent.cmd,
+sequential dispatch (weight_capacity=1), repos at C:\\Users\\Luke\\redwallet and drivechain subrepos.
+
+Run: python3 -m autocode coord set-windows-sequential
+Probe: python3 -c "from autocode.store import Store; from autocode import remote_ssh; print(remote_ssh.probe_worker(dict(Store().row('select * from remote_workers where id=?', ('windows-main',)))))"
+
+End with FLEET_DONE when remote worked job exists.""",
+    },
+    "liquid-utreexo-windows": {
+        "alias": "liquid-utreexo-windows-fleet",
+        "provider": "cursor",
+        "cwd": "C:/Users/Luke",
+        "position": 9000.0,
+        "dispatch_script": "scripts/dispatch-liquid-utreexo-jobs.py",
+    },
+    "github-sync-ekulkisnek": {
+        "alias": "github-sync-ekulkisnek",
+        "provider": "grok",
+        "cwd": REDWALLET,
+        "position": 8500.0,
+        "goal": """Sync ekulkisnek GitHub forks (Goal 4).
+
+Repos/branches:
+- github.com/ekulkisnek/BlueWallet branch codex/redwallet-utreexo-quic-sync
+- github.com/ekulkisnek/Floresta branch codex/mobile-utreexo-quic-sync
+- github.com/ekulkisnek/plain-bitassets branch codex/floresta-utreexo-anchors
+- autocode fixes to github.com/ekulkisnek/autocode if fork exists
+
+Push meaningful commits; do NOT force push. Verify `git status -sb` shows no ahead on fork remote.
+End with FLEET_DONE and push evidence (git log -1 --oneline per repo).""",
+    },
+}
+
+
+def load_status() -> dict:
+    script = Path(__file__).resolve().parent / "verify-goal-status.py"
+    r = subprocess.run([sys.executable, str(script), "--json"], capture_output=True, text=True)
+    if r.returncode not in (0, 1) or not r.stdout.strip():
+        return {"all_complete": False, "goals": []}
+    return json.loads(r.stdout)
+
+
+def ensure_chat(store: Store, spec: dict) -> str:
+    goal = spec.get("goal", "")
+    alias = spec["alias"]
+    provider = spec["provider"]
+    cwd = spec["cwd"]
+    chat_id = f"{provider}:goal-fleet:{alias}:{sha(goal or alias)[:8]}"
+    chat = Chat(
+        id=chat_id,
+        provider=provider,
+        source=f"{provider}.sqlite" if provider != "cursor" else "cursor.new",
+        provider_chat_id=f"goal-{uuid.uuid4().hex[:12]}",
+        title=alias,
+        cwd=cwd,
+        updated_at=now_iso(),
+        latest_text=(goal or alias)[:500],
+        transcript_hash=sha(goal or alias),
+        alias=alias,
+        continuation=provider,
+    )
+    store.upsert_chat(chat, coding_score=20, state="active", objective=goal or alias)
+    if goal:
+        store.set_goal(chat.id, goal, "user")
+    pos = float(spec.get("position", 0))
+    store.queue_add(chat.id, pos)
+    store.queue_bump_front(chat.id) if pos < 0 else None
+    row = store.row("select paused from chats where id=?", (chat.id,))
+    if row and int(row["paused"] or 0):
+        with store.connect() as con:
+            con.execute("update chats set paused=0 where id=?", (chat.id,))
+    return chat.id
+
+
+def main() -> None:
+    store = Store()
+    sched = Scheduler(store)
+
+    # Coordination defaults
+    subprocess.run([sys.executable, "-m", "autocode", "coord", "set-windows-sequential"], check=False)
+    subprocess.run([sys.executable, "-m", "autocode", "yolo", "on"], check=False)
+
+    status = load_status()
+    incomplete = [g for g in status.get("goals", []) if not g.get("complete")]
+    if not incomplete:
+        print("All goals complete.")
+        return
+
+    print(f"Incomplete goals: {len(incomplete)}")
+    dispatched: list[str] = []
+
+    l1_active = any(g["id"] == "l1-e2e-verified" for g in incomplete)
+    if l1_active:
+        from autocode import coordination
+
+        if not coordination.l1_lock_active():
+            print("L1 incomplete — pausing liquid/patreon competitors")
+            coordination.pause_competing_chats(store, sched)
+
+    for g in incomplete:
+        gid = g["id"]
+        spec = GOAL_FLEETS.get(gid)
+        if not spec:
+            print(f"SKIP no fleet spec for {gid}")
+            continue
+        if spec.get("dispatch_script"):
+            script = Path(__file__).resolve().parent / Path(spec["dispatch_script"]).name
+            print(f"RUN {script} for {gid}")
+            subprocess.run([sys.executable, str(script)], check=False)
+            dispatched.append(gid)
+            continue
+        chat_id = ensure_chat(store, spec)
+        row = store.row("select * from chats where id=?", (chat_id,))
+        if not row:
+            continue
+        if sched.has_active_job(chat_id):
+            print(f"SKIP {gid}: job already running for {chat_id}")
+            continue
+        job_id = sched.dispatch(row)
+        if job_id:
+            print(f"DISPATCHED {gid} -> {job_id}")
+            dispatched.append(gid)
+        else:
+            print(f"FAILED dispatch {gid}")
+
+    print(json.dumps({"dispatched": dispatched, "incomplete": [g["id"] for g in incomplete]}, indent=2))
+
+
+if __name__ == "__main__":
+    main()
