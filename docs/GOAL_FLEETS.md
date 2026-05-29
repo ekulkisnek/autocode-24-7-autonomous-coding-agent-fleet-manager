@@ -78,3 +78,57 @@ python3 -m autocode coord release-l1
 - Grok OAuth login on Mac/Windows (if probe shows auth errors)
 - Cursor API billing / rate limits (provider_error with API message)
 - Physical devices unplugged (simulator fallback may still progress)
+
+## L1 send completion checklist
+
+Use this when Goal 1 (`l1-e2e-verified`) is incomplete. Autocode runs these automatically; manual runs should follow the same order.
+
+### Preflight (before each attempt)
+
+1. **florestad Electrum** — `127.0.0.1:60101` reachable; height within ~3 blocks of docker mainchain
+2. **Docker mainchain** — `docker compose -f local-dev/docker-compose.local-minimal.yml ps mainchain` shows Up
+3. **Metro** — `:8081/status` (orchestrator starts if missing)
+4. **adb** — Android `0A201JECB03306` in `device` state
+5. **Detox simulator** — boot `FC7DDD6B-DFCB-432A-98CE-48C453E6EF48` (iPhone 16e-Detox)
+6. **Autocode preflight script** — `scripts/l1-e2e-autocode-preflight.sh`
+
+### Orchestrator env (simulator path — LiPhone unplugged)
+
+```bash
+L1_E2E_FORCE_PATH=simulator
+L1_E2E_SKIP_PHYSICAL_IOS=1
+REDWALLET_SKIP_ANDROID_SEED=1
+REDWALLET_SKIP_IOS_SEED=1
+L1_E2E_BALANCE_WAIT_MS=120000
+L1_E2E_POST_FUND_RELAUNCH=1
+L1_E2E_MAX_ATTEMPTS=9999
+```
+
+### Send-phase gate
+
+After fund + mine, **before Detox send UI**:
+
+```bash
+bash scripts/preflight-electrum-balance.sh <sender_address> <send_sats>
+```
+
+Detox spec calls this via `waitForElectrumBalance()` in `l1SignetShared.js`.
+
+### Success evidence
+
+Update `/Volumes/T705/redwallet-logs/L1_VERIFIED_EVIDENCE.md` with:
+
+- Two mainchain txids (simulator→Android, Android→simulator)
+- `verify=ok` for both directions
+- `detox_exit=0` for both legs
+
+`verify-goal-status.py` marks complete when evidence has ≥2 txid rows + ≥2 verify=ok hits.
+
+### Failure → fix → retry (automatic)
+
+On `goal_incomplete`:
+
+1. `goal_fleets.tick` injects last 50 lines of `detox.log` / `SUMMARY.txt` + latest run dir into fleet prompt
+2. Dispatches `l1-sim-detox-fix` (TransactionValue/app-busy) or `l1-electrum-sync-fix` (balance 0) workers in parallel with runner
+3. Shell loop `run-l1-e2e-until-verified.sh` retries after 90s (does **not** kill active runner unless stuck >45min)
+4. Goals 2–4 deferred until Goal 1 complete (Windows workers not used for L1 sim path)

@@ -77,6 +77,8 @@ class GrokProvider(Provider):
             "github-sync-ekulkisnek",
             "liquid-utreexo-windows-fleet",
         }:
+            return "200" if "l1-e2e-until-verified" in blob or chat.alias == "l1-e2e-until-verified" else "120"
+        if chat.alias in {"l1-sim-detox-fix", "l1-electrum-sync-fix", "l1-log-analysis"}:
             return "120"
         return "40"
 

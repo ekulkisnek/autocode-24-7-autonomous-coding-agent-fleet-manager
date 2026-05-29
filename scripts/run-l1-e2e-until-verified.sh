@@ -42,6 +42,16 @@ run_orchestrator() {
 
   echo "Physical iOS unavailable — simulator-only bidirectional (iOS sim → Android, then Android → iOS sim)"
   kill_physical_orchestrators
+  export L1_E2E_FORCE_PATH="${L1_E2E_FORCE_PATH:-simulator}"
+  export L1_E2E_SKIP_PHYSICAL_IOS="${L1_E2E_SKIP_PHYSICAL_IOS:-1}"
+  export REDWALLET_SKIP_ANDROID_SEED="${REDWALLET_SKIP_ANDROID_SEED:-1}"
+  export REDWALLET_SKIP_IOS_SEED="${REDWALLET_SKIP_IOS_SEED:-1}"
+  export L1_E2E_BALANCE_WAIT_MS="${L1_E2E_BALANCE_WAIT_MS:-120000}"
+  export L1_E2E_POST_FUND_RELAUNCH="${L1_E2E_POST_FUND_RELAUNCH:-1}"
+  bash "$ROOT/scripts/l1-e2e-autocode-preflight.sh" || {
+    echo "FAIL autocode preflight — retry after infra ready"
+    return 2
+  }
   PYTHONPATH="${ROOT}:${PYTHONPATH:-}" python3 -m autocode coord pause-l1-competitors 2>/dev/null || true
   local stamp run_dir
   stamp="$(date +%Y%m%d-%H%M%S)"

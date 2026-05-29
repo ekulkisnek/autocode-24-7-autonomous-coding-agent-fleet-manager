@@ -6,7 +6,9 @@ from unittest.mock import patch
 
 from autocode.goal_fleets import (
     GOAL_FLEET_ALIASES,
+    _failure_context_from_run,
     clear_stale_l1_lock,
+    find_latest_l1_run_dir,
     reconcile_false_complete_fleets,
     tick,
 )
@@ -55,6 +57,27 @@ def test_reconcile_reopens_done_fleet_when_external_goal_fails(tmp_path: Path):
     assert chat.id in reopened
     row = store.row("select done,state from chats where id=?", (chat.id,))
     assert int(row["done"] or 0) == 0
+
+
+def test_failure_context_includes_run_dir_tail(tmp_path: Path):
+    run = tmp_path / "l1-run"
+    leg = run / "ios-to-android"
+    leg.mkdir(parents=True)
+    (leg / "detox.log").write_text("\n".join(f"line{i}" for i in range(60)), encoding="utf-8")
+    ctx = _failure_context_from_run(run)
+    assert "latest_run_dir=" in ctx
+    assert "line59" in ctx
+    assert "line0" not in ctx
+
+
+def test_find_latest_l1_run_dir_from_symlink(tmp_path: Path, monkeypatch):
+    root = tmp_path / "logs"
+    root.mkdir()
+    run = root / "l1-simulator-bidirectional-e2e-test"
+    run.mkdir()
+    (root / "current-l1-simulator-bidirectional-e2e").symlink_to(run)
+    monkeypatch.setattr("autocode.goal_fleets.LOG_ROOT", root)
+    assert find_latest_l1_run_dir() == run
 
 
 def test_tick_skips_when_interval_not_due(tmp_path: Path, monkeypatch):

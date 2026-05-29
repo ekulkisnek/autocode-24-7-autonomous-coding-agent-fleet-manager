@@ -14,6 +14,13 @@ from .store import Store
 from .util import json_dumps, json_loads, now_iso
 
 DEFAULT_GOAL_TICK_INTERVAL = int(os.environ.get("AUTOCODE_GOAL_TICK_INTERVAL", "90"))
+L1_RUNNER_STUCK_SECONDS = int(os.environ.get("L1_E2E_RUNNER_STUCK_SECONDS", "2700"))
+LOG_ROOT = Path("/Volumes/T705/redwallet-logs")
+L1_RUN_SYMLINKS = (
+    "current-l1-simulator-bidirectional-e2e",
+    "current-l1-ios-android-e2e",
+    "current-l1-android-ios-e2e",
+)
 L1_E2E_SCRIPT = ROOT / "scripts" / "run-l1-e2e-until-verified.sh"
 PICK_L1_PATH_SCRIPT = ROOT / "scripts" / "pick-l1-e2e-path.sh"
 VERIFY_SCRIPT = ROOT / "scripts" / "verify-goal-status.py"
@@ -221,7 +228,8 @@ def start_l1_loop_if_needed(status: dict[str, Any]) -> bool:
     if not l1 or l1.get("complete"):
         return False
     if _l1_orchestrator_running() or _l1_loop_running():
-        return False
+        if not _l1_runner_stuck():
+            return False
     if not L1_E2E_SCRIPT.is_file():
         return False
     path = pick_l1_e2e_path()
@@ -239,6 +247,8 @@ def start_l1_loop_if_needed(status: dict[str, Any]) -> bool:
         env.setdefault("L1_E2E_MAX_ATTEMPTS", "9999")
         env.setdefault("L1_E2E_BALANCE_WAIT_MS", "120000")
         env.setdefault("L1_E2E_POST_FUND_RELAUNCH", "1")
+        env.setdefault("L1_E2E_RETRY_SLEEP", "90")
+        env.setdefault("ANDROID_L1_RECEIVE_ADDRESS", "tb1qewdkqej3xc6hh2v5q88rnaekd2zkccf0zq6kdf")
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"\n=== autocode goal_fleets spawn {now_iso()} path={path} ===\n")
         subprocess.Popen(
@@ -360,6 +370,69 @@ def _fleet_chat_for_goal(store: Store, goal_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def find_latest_l1_run_dir() -> Path | None:
+    """Resolve the active L1 simulator run directory from symlinks or newest stamp dir."""
+    for name in L1_RUN_SYMLINKS:
+        link = LOG_ROOT / name
+        if link.is_symlink():
+            target = link.resolve()
+            if target.is_dir():
+                return target
+    candidates = sorted(
+        LOG_ROOT.glob("l1-simulator-bidirectional-e2e-*"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _tail_file(path: Path, *, lines: int = 50) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(content[-lines:])
+    except OSError:
+        return ""
+
+
+def _failure_context_from_run(run_dir: Path | None) -> str:
+    if not run_dir:
+        return ""
+    parts: list[str] = [f"latest_run_dir={run_dir}"]
+    for rel in ("ios-to-android/detox.log", "android-to-ios/detox.log", "detox.log", "SUMMARY.txt", "run.log"):
+        tail = _tail_file(run_dir / rel, lines=50)
+        if tail:
+            parts.append(f"--- tail {rel} ---\n{tail}")
+    return "\n\n".join(parts)
+
+
+def _l1_lock_age_seconds() -> float | None:
+    from . import coordination
+
+    lock = coordination.read_l1_lock()
+    if not lock:
+        return None
+    started = str(lock.get("started_at") or "")
+    if not started:
+        return None
+    try:
+        from datetime import datetime, timezone
+
+        dt = datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return max(0.0, time.time() - dt.timestamp())
+    except ValueError:
+        return None
+
+
+def _l1_runner_stuck() -> bool:
+    """True when an active L1 runner has exceeded the stuck threshold (default 45min)."""
+    if not (_l1_orchestrator_running() or _l1_loop_running()):
+        return False
+    age = _l1_lock_age_seconds()
+    return age is not None and age >= L1_RUNNER_STUCK_SECONDS
+
+
 def _inject_failure_context(store: Store, chat_id: str, goal: dict, reason: str) -> None:
     row = store.row("select metadata_json from chats where id=?", (chat_id,))
     meta = json_loads(str(row["metadata_json"] or "" if row else ""), {})
@@ -368,15 +441,20 @@ def _inject_failure_context(store: Store, chat_id: str, goal: dict, reason: str)
     path = pick_l1_e2e_path()
     if path == "simulator":
         reason = f"{L1_SIMULATOR_CONTEXT}\n{reason}"
+    run_dir = find_latest_l1_run_dir()
+    run_ctx = _failure_context_from_run(run_dir)
+    if run_ctx:
+        reason = f"{reason}\n\n{run_ctx}"
     meta["goal_fleet_retry"] = {
         "goal_id": goal.get("id"),
         "pct": goal.get("pct"),
-        "reason": reason[:500],
+        "reason": reason[:4000],
         "l1_path": path,
+        "latest_run_dir": str(run_dir) if run_dir else "",
         "at": now_iso(),
     }
     meta["remediation_prompt_prefix"] = (
-        f"GOAL INCOMPLETE ({goal.get('id')} at {goal.get('pct')}%): {reason}\n"
+        f"GOAL INCOMPLETE ({goal.get('id')} at {goal.get('pct')}%): {reason[:6000]}\n"
         f"External verify-goal-status still failing. Continue until criteria met.\n\n"
     )
     with store.connect() as con:
@@ -516,13 +594,15 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
             else:
                 result["simulator_killed"] = kill_simulator_l1_runs()
         result["l1_loop_started"] = start_l1_loop_if_needed(status)
+        result["l1_runner_stuck"] = _l1_runner_stuck()
+        result["latest_l1_run_dir"] = str(find_latest_l1_run_dir() or "")
 
     result["reopened"] = reconcile_false_complete_fleets(store, status)
 
     # Goal fleets always re-dispatch on verify failure (yolo); never gate on Mac capacity.
     result["dispatch"] = dispatch_incomplete_goals(store, status)
 
-    if l1_incomplete and L1_WORKERS_SCRIPT.is_file() and not l1_busy:
+    if l1_incomplete and L1_WORKERS_SCRIPT.is_file():
         try:
             proc = subprocess.run(
                 [sys.executable, str(L1_WORKERS_SCRIPT)],
