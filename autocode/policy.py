@@ -75,7 +75,7 @@ def classify_chat(title: str, cwd: str, latest: str) -> tuple[int, str, str]:
         score += 3
     if len(text) > 500:
         score += 1
-    if FLEET_DONE_MARKER.search(latest or "") or (DONE_WORDS.search(latest or "") and not (FLEET_MILESTONE_MARKER.search(latest or "") or MILESTONE_WORDS.search(latest or ""))):
+    if _fleet_done_is_genuine(latest or "") or (DONE_WORDS.search(latest or "") and not (FLEET_MILESTONE_MARKER.search(latest or "") or MILESTONE_WORDS.search(latest or ""))):
         state = "done"
     elif ASK_WORDS.search(latest or ""):
         state = "needs_input"
@@ -97,13 +97,24 @@ def infer_objective(title: str, latest: str, cwd: str) -> str:
     return f"Continue the coding project in {cwd or 'the current workspace'} until it is implemented, tested, and complete."
 
 
+def _fleet_done_is_genuine(text: str) -> bool:
+    """Return True only if FLEET_DONE appears as an actual marker, not quoted or negated."""
+    for m in FLEET_DONE_MARKER.finditer(text):
+        start = m.start()
+        prefix = text[max(0, start - 12):start]
+        if "`" in prefix or re.search(r"\bnot\s*`?$", prefix.rstrip()):
+            continue
+        return True
+    return False
+
+
 def should_continue_after_output(text: str) -> bool:
     if not text:
         return True
     marker = parse_fleet_marker(text)
     if marker:
         return marker.kind != "FLEET_DONE"
-    if FLEET_DONE_MARKER.search(text):
+    if _fleet_done_is_genuine(text):
         return False
     if FLEET_MILESTONE_MARKER.search(text):
         return True
@@ -180,9 +191,13 @@ def assess_output_state(objective: str, output: str) -> OutputAssessment:
     # Explicit done signals take precedence over not_complete / milestone words that may appear
     # in prompt history, recovery text, or verbose work logs (root cause of false goal_incomplete).
     if marker and marker.kind == "FLEET_DONE" and not missing:
+        if ongoing:
+            return OutputAssessment("active", False, "ongoing objective remains active until explicitly stopped")
         if hard_goal and not hard_completion_has_substantial_evidence(objective, text):
             return OutputAssessment("active", False, "hard completion marker lacks substantial evidence")
         return OutputAssessment("done", True, "structured FLEET_DONE marker accepted")
+    if ongoing and completion_claim:
+        return OutputAssessment("active", False, "ongoing objective remains active until explicitly stopped")
     if completion_claim and verified and not (hard_goal and not hard_completion_has_substantial_evidence(objective, text)):
         return OutputAssessment("done", True, "output claims completion with verification")
     if completion_claim and "hard requirement" not in (objective or "").lower():
@@ -197,8 +212,6 @@ def assess_output_state(objective: str, output: str) -> OutputAssessment:
         return OutputAssessment("active", False, "missing hard requirement evidence: " + ", ".join(missing), missing)
     if hard_goal and completion_claim and not hard_completion_has_substantial_evidence(objective, text):
         return OutputAssessment("active", False, "hard completion claim lacks substantial evidence")
-    if ongoing and completion_claim:
-        return OutputAssessment("active", False, "ongoing objective remains active until explicitly stopped")
     return OutputAssessment("active", False, "worked output but no complete verified state", missing)
 
 

@@ -77,7 +77,7 @@ class GrokProvider(Provider):
             "--permission-mode",
             "bypassPermissions",
             "--max-turns",
-            "80" if chat.source == "grok.wiki_squad" else "40",
+            "120" if chat.source == "grok.wiki_squad" else "40",
             "--output-format",
             "plain",
         ]

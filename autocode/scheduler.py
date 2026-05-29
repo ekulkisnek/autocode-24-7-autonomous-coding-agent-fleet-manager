@@ -28,6 +28,17 @@ from .watchers import watch_signature
 # Jobs waiting on an external desktop agent should not consume dispatch slots or repo leases.
 DISPATCH_SLOT_EXCLUDED_EVIDENCE = frozenset({"running_external_idle"})
 
+# Resource weight per provider — how many "slots" a job of this type consumes.
+# A standard grok job = 1.0; heavy jobs (large contexts, long timeouts) = 2.0;
+# cursor is lighter on CPU/RAM; codex is heaviest (blocked for now anyway).
+_PROVIDER_WEIGHT: dict[str, float] = {
+    "grok": 1.0,
+    "cursor": 0.6,
+    "codex": 1.5,
+    "claude": 1.0,
+}
+_HEAVY_TIMEOUT_THRESHOLD = 3600  # grok jobs with >= 1h stall timeout count as 2 slots
+
 
 class Scheduler:
     def __init__(self, store: Store):
@@ -49,9 +60,11 @@ class Scheduler:
         unstuck = recovery.reconcile_killed_chats(self.store)
         stale_leases = self.cleanup_stale_leases()
         discovery_reason = self._maybe_discover()
-        active = self.dispatch_active_job_count()
-        cap = self.capacity()
-        limit = max(0, min(max_projects or cap, cap) - active)
+        active = self.dispatch_active_job_count()  # raw count for reporting/snapshot
+        cap = self.capacity()  # weight budget
+        running_weight = self._running_dispatch_weight()
+        available = max(0.0, float(cap) - running_weight)
+        limit = max(0, min(max_projects if max_projects is not None else cap, int(available)))
         sent: list[str] = []
         queued = self.candidates(limit * 3 if limit else 50)
         snapshot_id = self.store.record_queue_snapshot(
@@ -110,28 +123,70 @@ class Scheduler:
         self.store.set_config("last_discovery_ts", str(time.time()))
         return stats
 
+    def _job_weight(self, row) -> float:
+        """Resource cost in 'slots' for a single job row."""
+        provider = str(row["provider"] or "")
+        base = _PROVIDER_WEIGHT.get(provider, 1.0)
+        try:
+            from .util import json_loads
+            meta = json_loads(str(row.get("metadata_json") or ""), {}) or {}
+            if provider == "grok" and float(meta.get("gw_suggested_timeout") or 0) >= _HEAVY_TIMEOUT_THRESHOLD:
+                base = 2.0
+        except Exception:
+            pass
+        return base
+
+    def _running_dispatch_weight(self) -> float:
+        """Sum of resource weights for running jobs that occupy dispatch slots."""
+        placeholders = ",".join("?" * len(DISPATCH_SLOT_EXCLUDED_EVIDENCE))
+        rows = self.store.rows(
+            f"""
+            select j.id, c.provider, c.metadata_json
+            from jobs j join chats c on c.id=j.chat_id
+            where j.status='running'
+              and coalesce(j.evidence_status, '') not in ({placeholders})
+            """,
+            tuple(DISPATCH_SLOT_EXCLUDED_EVIDENCE),
+        )
+        return sum(self._job_weight(r) for r in rows)
+
     def capacity(self) -> int:
+        """Return weight-budget for dispatch (total slots assuming standard-weight new jobs)."""
         configured = int(self.store.get_config("max_active", str(DEFAULT_MAX_ACTIVE)) or DEFAULT_MAX_ACTIVE)
         yolo = self.store.get_config("yolo", "off").lower() in {"1", "true", "yes", "on"}
         disk_free = disk_free_gb(self.store.path.parent)
         if disk_free is not None and disk_free < 0.75:
             cap = 0
         else:
-            cap = configured
             l1 = load1()
             mem_free = memory_free_percent()
-            if mem_free is not None and mem_free < 12:
-                cap = 0
-            elif mem_free is not None and mem_free < 20:
-                cap = min(cap, 1)
-            elif mem_free is not None and mem_free < 30:
-                cap = min(cap, 2)
-            if l1 >= 10:
-                cap = min(cap, 1)
-            elif l1 >= 7:
-                cap = min(cap, 2)
-            elif l1 >= 5:
-                cap = min(cap, 3)
+            budget = float(configured)
+
+            # Hard floor: system truly overloaded
+            if (mem_free is not None and mem_free < 12) or (l1 is not None and l1 >= 12):
+                budget = 0.0
+            else:
+                # Memory pressure — soft curve instead of hard cliffs.
+                # At 12%: budget=0, at 20%: budget≤1.5, at 30%: budget≤configured.
+                if mem_free is not None:
+                    if mem_free < 20:
+                        t = (mem_free - 12) / 8.0  # 0.0 at 12%, 1.0 at 20%
+                        budget = min(budget, 1.5 * t)
+                    elif mem_free < 30:
+                        t = (mem_free - 20) / 10.0  # 0.0 at 20%, 1.0 at 30%
+                        budget = min(budget, 1.5 + t * max(0, configured - 1.5))
+
+                # Load pressure — soft curve, not hard steps.
+                if l1 is not None:
+                    if l1 >= 10:
+                        budget = min(budget, 1.0)
+                    elif l1 >= 7:
+                        budget = min(budget, 2.5)
+                    elif l1 >= 5:
+                        budget = min(budget, 4.0)
+
+            cap = max(0, int(budget))
+
         if yolo and cap == 0 and configured > 0:
             queued = self.store.row(
                 """
@@ -388,41 +443,34 @@ class Scheduler:
             f"Original chat id: {row['provider_chat_id']}\n\n"
             f"{prompt}\n"
         )
+        prompt_path = job_dir / "prompt.txt"
+        source = str(row["source"] or "")
+        grok_tail = [
+            "--prompt-file",
+            str(prompt_path),
+            "--no-alt-screen",
+            "--permission-mode",
+            "bypassPermissions",
+            "--max-turns",
+            "120" if source == "grok.wiki_squad" else "40",
+            "--output-format",
+            "plain",
+        ]
         if row["provider"] == "codex":
-            prompt_path = job_dir / "prompt.txt"
             return ContinuePlan(
                 True,
                 "grok",
                 cwd,
-                cmd=[
-                    "grok",
-                    "--cwd",
-                    cwd,
-                    "--prompt-file",
-                    str(prompt_path),
-                    "--no-alt-screen",
-                    "--permission-mode",
-                    "bypassPermissions",
-                ],
+                cmd=["grok", "--cwd", cwd, *grok_tail],
                 prompt_file=True,
                 same_chat=False,
                 reason="Codex stalled twice; switching to Grok takeover.",
             )
-        prompt_path = job_dir / "prompt.txt"
         return ContinuePlan(
             True,
             "grok",
             cwd,
-            cmd=[
-                "grok",
-                "--cwd",
-                cwd,
-                "--prompt-file",
-                str(prompt_path),
-                "--no-alt-screen",
-                "--permission-mode",
-                "bypassPermissions",
-            ],
+            cmd=["grok", "--cwd", cwd, *grok_tail],
             prompt_file=True,
             same_chat=False,
             reason=f"{row['provider']} stalled/unsupported; switching to Grok takeover.",

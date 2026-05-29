@@ -59,6 +59,7 @@ def test_grok_wiki_squad_uses_fresh_cwd_session(tmp_path: Path, monkeypatch):
     assert plan.same_chat is False
     assert plan.cmd[:3] == ["grok", "--cwd", str(tmp_path)]
     assert "--resume" not in plan.cmd
+    assert "120" in plan.cmd
     assert grok_session_resume_id(chat) is None
 
 

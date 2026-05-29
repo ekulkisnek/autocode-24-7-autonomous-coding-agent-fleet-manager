@@ -375,6 +375,9 @@ def should_use_fallback(row: Row, failure_count: int | None = None) -> bool:
     kind = str(meta.get("last_failure_kind") or "")
     source = str(row["source"] or "")
     provider = str(row["provider"] or "")
+    # Wiki squad lanes already run on Grok with tuned cwd/max-turns; fallback strips flags.
+    if provider == "grok" and source == "grok.wiki_squad":
+        return False
     if kind == "provider_error" and provider == "grok" and source == "grok.new":
         return failures >= 1
     if kind == "silent_failed":
