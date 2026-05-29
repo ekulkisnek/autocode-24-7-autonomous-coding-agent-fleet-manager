@@ -199,7 +199,11 @@ def kill_simulator_l1_runs() -> list[int]:
 def _l1_orchestrator_running() -> bool:
     try:
         out = subprocess.run(
-            ["pgrep", "-f", r"run-l1-(physical|ios-phone|android-phone).*e2e\.sh"],
+            [
+                "pgrep",
+                "-f",
+                r"run-l1-(physical|ios-phone|android-phone|ios-simulator-to-android|android-phone-to-ios-simulator).*e2e\.sh",
+            ],
             capture_output=True,
             text=True,
             timeout=5,
