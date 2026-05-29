@@ -84,39 +84,34 @@ def release_l1_lock() -> None:
 
 
 def kill_duplicate_l1_processes(*, keep_pid: int | None = None) -> list[int]:
-    """Kill stray run-l1-* / detox orchestrators (not the lock holder)."""
+    """Kill stray run-l1-* orchestrators (not the lock holder)."""
     lock = read_l1_lock()
     holder_pid = int((lock or {}).get("pid") or 0)
     keep = keep_pid or holder_pid or 0
-    patterns = ("run-l1-", "detox test", "detox/build")
     killed: list[int] = []
     try:
-        out = subprocess.run(["pgrep", "-fl", "run-l1-"], capture_output=True, text=True, timeout=5)
-        lines = (out.stdout or "").splitlines()
+        out = subprocess.run(
+            ["pgrep", "-f", r"run-l1-(physical|ios|android).*e2e\.sh"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        pids = [int(p.strip()) for p in (out.stdout or "").splitlines() if p.strip().isdigit()]
     except Exception:
-        lines = []
+        pids = []
     my_pid = os.getpid()
-    for line in lines:
-        parts = line.strip().split(None, 1)
-        if not parts:
-            continue
-        try:
-            pid = int(parts[0])
-        except ValueError:
-            continue
+    for pid in pids:
         if pid in {my_pid, os.getppid()}:
             continue
         if keep and pid == keep:
             continue
-        # Never kill the lock holder or its parent shell chain.
         if holder_pid and pid == holder_pid:
             continue
-        if any(p in line for p in patterns):
-            try:
-                os.kill(pid, 9)
-                killed.append(pid)
-            except OSError:
-                pass
+        try:
+            os.kill(pid, 9)
+            killed.append(pid)
+        except OSError:
+            pass
     return killed
 
 
