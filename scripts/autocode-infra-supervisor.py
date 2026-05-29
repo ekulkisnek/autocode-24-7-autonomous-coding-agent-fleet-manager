@@ -39,6 +39,21 @@ def _pgrep(pattern: str) -> list[int]:
     return [int(x) for x in out.split() if x.isdigit()]
 
 
+def _l1_loop_pids() -> list[int]:
+    """PIDs running the until-verified shell loop (exclude cursor-agent prompts mentioning the script)."""
+    pids: list[int] = []
+    for pid in _pgrep(r"run-l1-e2e-until-verified\.sh"):
+        rc, cmd = _run(["ps", "-p", str(pid), "-o", "command="], timeout=5)
+        if rc != 0:
+            continue
+        cmd = (cmd or "").strip()
+        if "cursor-agent" in cmd:
+            continue
+        if "bash" in cmd and "run-l1-e2e-until-verified.sh" in cmd:
+            pids.append(pid)
+    return pids
+
+
 def _port_open(host: str, port: int, timeout: float = 2.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -80,7 +95,7 @@ def ensure_l1_loop(actions: list[str], status: dict) -> bool:
     l1 = next((g for g in status.get("goals", []) if g.get("id") == "l1-e2e-verified"), None)
     if not l1 or l1.get("complete"):
         return False
-    if _pgrep(r"run-l1-e2e-until-verified\.sh"):
+    if _l1_loop_pids():
         return False
     if not L1_LOOP_SCRIPT.is_file():
         actions.append("missing_l1_loop_script")
@@ -163,7 +178,7 @@ def run_supervisor(*, json_out: bool = False) -> dict:
         "goals": {g["id"]: g.get("pct", 0) for g in status.get("goals", [])},
         "actions": actions,
         "daemon_pids": _pgrep("autocode.cli daemon run"),
-        "l1_loop_pids": _pgrep(r"run-l1-e2e-until-verified\.sh"),
+        "l1_loop_pids": _l1_loop_pids(),
         "detox_pids": _pgrep("detox test"),
         "electrum_up": _port_open("127.0.0.1", 60101),
         "l1_lock": (LOG_ROOT / ".l1-e2e-lock").is_file(),
