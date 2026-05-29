@@ -2,6 +2,7 @@
 """Dispatch parallel L1 fix workers (code/analysis) without touching the exclusive E2E runner."""
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
@@ -16,12 +17,14 @@ from autocode.store import Store
 from autocode.util import now_iso, sha
 
 REDWALLET = "/Volumes/T705/code/work-on-something-to-do-with/redwallet"
+WIN_REDWALLET = "C:/Users/Luke/redwallet"
 LOG_ROOT = Path("/Volumes/T705/redwallet-logs")
 
-WORKER_SPECS = {
+# Mac-local code fix workers (never run run-l1-* orchestrators).
+MAC_WORKER_SPECS: dict[str, dict] = {
     "l1-sim-detox-fix": {
-        "provider": "grok",
-        "fallback_provider": "cursor",
+        "provider": "cursor",
+        "fallback_provider": "grok",
         "cwd": REDWALLET,
         "position": -5000.0,
         "patterns": (
@@ -32,6 +35,7 @@ WORKER_SPECS = {
             "createtransactionbutton",
             "l1sende2e",
             "detox",
+            "walletslist",
         ),
         "goal_template": """L1 simulator Detox send fix (Goal 1 worker — code only, NO orchestrator).
 
@@ -41,6 +45,7 @@ Latest failure context:
 Fix tests/e2e/l1_ios_simulator_to_android.spec.js and l1_android_phone_to_ios_simulator.spec.js:
 - TransactionValue timeout after CreateTransactionButton
 - Detox app-busy after fund (avoid Skip/Continue alert loops; use resetToWalletsList)
+- WalletsList timeout after L1_E2E_POST_FUND_RELAUNCH (fix relaunch/sync path)
 - L1_E2E_BALANCE_WAIT_MS=120000, test timeout 1200000ms
 
 Do NOT run run-l1-* orchestrators (exclusive shell loop owns that).
@@ -49,8 +54,8 @@ Commit to codex/redwallet-utreexo-quic-sync; push ekulkisnek/BlueWallet.
 End FLEET_DONE when changes pushed.""",
     },
     "l1-electrum-sync-fix": {
-        "provider": "grok",
-        "fallback_provider": "cursor",
+        "provider": "cursor",
+        "fallback_provider": "grok",
         "cwd": REDWALLET,
         "position": -4990.0,
         "patterns": (
@@ -73,9 +78,48 @@ Check blue_modules/BlueElectrum.ts sync path; florestad electrum at 127.0.0.1:60
 Do NOT run L1 orchestrators. Commit/push fork branch codex/redwallet-utreexo-quic-sync.
 End FLEET_DONE when fix pushed.""",
     },
+    "l1-orchestrator-hardening": {
+        "provider": "cursor",
+        "fallback_provider": "grok",
+        "cwd": REDWALLET,
+        "position": -4985.0,
+        "patterns": ("fund", "verify", "skip-seed", "lock", "orchestrator"),
+        "goal_template": """L1 orchestrator hardening (Goal 1 worker — scripts only, NO live orchestrator).
+
+Latest failure context:
+{failure_context}
+
+Improve RedWallet L1 scripts (do NOT run them):
+- scripts/fund-l1-e2e-wallet.sh / send-ios-btc-l1.sh verifyTxPaysAddress checks
+- REDWALLET_SKIP_ANDROID_SEED / REDWALLET_SKIP_IOS_SEED handling in orchestrators
+- scripts/l1-e2e-lock.sh duplicate-kill safety
+
+Also review autocode scripts/run-l1-e2e-until-verified.sh preflight + retry loop.
+Commit redwallet + autocode fixes; push ekulkisnek forks.
+End FLEET_DONE when pushed.""",
+    },
+    "l1-signet-shared-tests": {
+        "provider": "cursor",
+        "fallback_provider": "grok",
+        "cwd": REDWALLET,
+        "position": -4982.0,
+        "patterns": ("verifytxpaysaddress", "sumpaidsats", "l1signetshared"),
+        "goal_template": """L1 l1SignetShared unit tests (Goal 1 worker — tests only).
+
+Latest failure context:
+{failure_context}
+
+Add/extend tests/unit/l1SignetShared.test.js for:
+- verifyTxPaysAddress (known signet txids from {log_root}/L1_VERIFIED_EVIDENCE.md)
+- sumPaidSatsToAddress edge cases
+
+Run: npm run unit -- tests/unit/l1SignetShared.test.js
+Do NOT run L1 orchestrators. Commit/push codex/redwallet-utreexo-quic-sync.
+End FLEET_DONE when tests pass and pushed.""",
+    },
     "l1-log-analysis": {
-        "provider": "grok",
-        "fallback_provider": "cursor",
+        "provider": "cursor",
+        "fallback_provider": "grok",
         "cwd": REDWALLET,
         "position": -4980.0,
         "patterns": tuple(),
@@ -93,6 +137,65 @@ Output: top 3 blockers + exact file/line fixes. Do NOT run orchestrators or edit
 End FLEET_DONE with written analysis in job stdout.""",
     },
 }
+
+# Windows spill workers — review/docs only (no Mac Detox).
+WINDOWS_WORKER_SPECS: dict[str, dict] = {
+    "l1-detox-spec-review": {
+        "provider": "cursor",
+        "fallback_provider": "grok",
+        "cwd": WIN_REDWALLET,
+        "position": -4975.0,
+        "goal_template": """RedWallet L1 Detox spec review (Windows worker — read/fix spec only).
+
+Latest failure context:
+{failure_context}
+
+Review tests/e2e/l1_ios_simulator_to_android.spec.js and l1_android_phone_to_ios_simulator.spec.js:
+- post-funding navigation (WalletsList, openWalletSendScreen, L1SendE2E)
+- L1_E2E_POST_FUND_RELAUNCH handling
+- resetToWalletsList / alert dismissal patterns
+
+Repo: C:\\Users\\Luke\\redwallet (sync from Mac if stale).
+Do NOT run Detox or run-l1-* on Windows. Commit/push if fixes made.
+End FLEET_DONE with review summary or pushed fixes.""",
+    },
+    "l1-blueelectrum-signet": {
+        "provider": "cursor",
+        "fallback_provider": "grok",
+        "cwd": WIN_REDWALLET,
+        "position": -4970.0,
+        "goal_template": """BlueElectrum dev peer config for signet (Windows worker — code review).
+
+Latest failure context:
+{failure_context}
+
+Review blue_modules/BlueElectrum.ts default signet peer list and florestad :60101 usage.
+Document recommended dev peer config in docs/L1_IOS_ANDROID_E2E.md if missing.
+Do NOT run L1 orchestrators. Commit/push if changes made.
+End FLEET_DONE with summary or pushed doc.""",
+    },
+    "l1-docs-e2e": {
+        "provider": "cursor",
+        "fallback_provider": "grok",
+        "cwd": WIN_REDWALLET,
+        "position": -4965.0,
+        "goal_template": """L1 E2E documentation (Windows worker).
+
+Latest failure context:
+{failure_context}
+
+Update or create docs/L1_IOS_ANDROID_E2E.md covering:
+- simulator vs physical paths
+- run-l1-ios-simulator-to-android-phone-e2e.sh commands
+- verify=ok evidence format for L1_VERIFIED_EVIDENCE.md
+- known blockers (WalletsList, balance sync, skip-seed flags)
+
+Do NOT run orchestrators. Commit/push if doc updated.
+End FLEET_DONE when doc committed.""",
+    },
+}
+
+WORKER_SPECS = {**MAC_WORKER_SPECS, **WINDOWS_WORKER_SPECS}
 
 
 def load_status() -> dict:
@@ -143,29 +246,53 @@ def failure_blob(run_dir: Path | None) -> str:
     return "\n".join(parts).lower()
 
 
-def workers_for_failure(blob: str) -> list[str]:
-    matched: list[str] = []
-    for alias, spec in WORKER_SPECS.items():
+def workers_for_failure(blob: str, *, dispatch_all: bool) -> tuple[list[str], list[str]]:
+    """Return (mac_aliases, windows_aliases) to dispatch."""
+    if dispatch_all:
+        mac = list(MAC_WORKER_SPECS.keys())
+        windows = list(WINDOWS_WORKER_SPECS.keys())
+        return mac, windows
+
+    matched_mac: list[str] = []
+    for alias, spec in MAC_WORKER_SPECS.items():
         if alias == "l1-log-analysis":
             continue
-        if any(p in blob for p in spec["patterns"]):
-            matched.append(alias)
-    if not matched:
-        matched.append("l1-log-analysis")
-    elif "l1-log-analysis" not in matched and len(matched) < 2:
-        matched.append("l1-log-analysis")
-    return matched
+        if any(p in blob for p in spec.get("patterns", ())):
+            matched_mac.append(alias)
+    if not matched_mac:
+        matched_mac.append("l1-log-analysis")
+    elif "l1-log-analysis" not in matched_mac:
+        matched_mac.append("l1-log-analysis")
+    return matched_mac, []
 
 
 def pick_provider(store: Store, spec: dict) -> str:
     from autocode import recovery
 
-    provider = spec["provider"]
+    primary = spec["provider"]
     fallback = spec.get("fallback_provider", "")
-    if fallback and recovery.provider_in_backoff(store, provider):
+    if recovery.provider_in_backoff(store, primary) and fallback:
         if not recovery.provider_in_backoff(store, fallback):
             return fallback
-    return provider
+    # Grok goal1 workers hit provider_error repeatedly — prefer cursor when grok unhealthy.
+    if primary == "grok" and fallback == "cursor" and recovery.provider_in_backoff(store, "grok"):
+        return "cursor"
+    if primary == "cursor" and recovery.provider_in_backoff(store, "cursor") and fallback:
+        if not recovery.provider_in_backoff(store, fallback):
+            return fallback
+    return primary
+
+
+def alias_has_running_job(store: Store, alias: str) -> bool:
+    row = store.row(
+        """
+        select count(*) c from jobs j
+        join chats c on c.id=j.chat_id
+        where j.status='running' and c.alias=?
+        """,
+        (alias,),
+    )
+    return bool(row and int(row["c"] or 0) > 0)
 
 
 def ensure_worker(store: Store, alias: str, spec: dict, goal: str) -> str:
@@ -193,7 +320,34 @@ def ensure_worker(store: Store, alias: str, spec: dict, goal: str) -> str:
     return chat.id
 
 
+def windows_slot_available(store: Store) -> bool:
+    worker = store.row("select * from remote_workers where id='windows-main' and enabled=1")
+    if not worker:
+        return False
+    row = store.row(
+        "select count(*) c from jobs where status='running' and worker_id='windows-main'"
+    )
+    cap = float(worker["weight_capacity"] or 1.0)
+    used = int(row["c"] or 0) if row else 0
+    return used < cap
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Dispatch L1 parallel fix workers")
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        default=True,
+        help="Dispatch all fix workers when Goal 1 incomplete (default: on)",
+    )
+    parser.add_argument(
+        "--pattern-only",
+        action="store_true",
+        help="Only dispatch workers matching failure log patterns",
+    )
+    args = parser.parse_args()
+    dispatch_all = not args.pattern_only
+
     status = load_status()
     l1 = next((g for g in status.get("goals", []) if g.get("id") == "l1-e2e-verified"), None)
     if not l1 or l1.get("complete"):
@@ -202,27 +356,21 @@ def main() -> None:
 
     run_dir = find_latest_run_dir()
     blob = failure_blob(run_dir)
-    aliases = workers_for_failure(blob)
+    mac_aliases, windows_aliases = workers_for_failure(blob, dispatch_all=dispatch_all)
     failure_context = blob[:3000] if blob else "(no recent detox.log tail)"
     run_dir_str = str(run_dir or LOG_ROOT / "current-l1-simulator-bidirectional-e2e")
 
     store = Store()
     sched = Scheduler(store)
-    dispatched: list[str] = []
+    coord = sched.coordination_snapshot()
+    mac_can_take = bool(coord.get("mac_can_take_more"))
+    dispatched: list[dict] = []
 
-    for alias in aliases:
-        spec = WORKER_SPECS[alias]
-        active = store.row(
-            """
-            select count(*) c from jobs j
-            join chats c on c.id=j.chat_id
-            where j.status='running' and c.alias=?
-            """,
-            (alias,),
-        )
-        if active and int(active["c"] or 0) > 0:
+    for alias in mac_aliases:
+        if alias_has_running_job(store, alias):
             print(f"SKIP {alias}: job running")
             continue
+        spec = MAC_WORKER_SPECS[alias]
         goal = spec["goal_template"].format(
             failure_context=failure_context,
             run_dir=run_dir_str,
@@ -233,12 +381,62 @@ def main() -> None:
         if sched.has_active_job(chat_id):
             print(f"SKIP {alias}: active job")
             continue
+        if not mac_can_take:
+            print(f"QUEUE {alias}: mac at capacity (queued for tick spill)")
+            dispatched.append({"alias": alias, "job_id": None, "target": "mac", "queued": True})
+            continue
         job_id = sched.dispatch(row)
         if job_id:
-            print(f"DISPATCHED {alias} -> {job_id}")
-            dispatched.append(job_id)
+            print(f"DISPATCHED {alias} -> {job_id} (mac)")
+            dispatched.append({"alias": alias, "job_id": job_id, "target": "mac"})
+        else:
+            print(f"QUEUE {alias}: dispatch deferred")
+            dispatched.append({"alias": alias, "job_id": None, "target": "mac", "queued": True})
 
-    print(json.dumps({"dispatched": dispatched, "run_dir": run_dir_str, "workers": aliases}, indent=2))
+    if windows_aliases and (not mac_can_take or dispatch_all):
+        worker = store.row("select * from remote_workers where id='windows-main' and enabled=1")
+        for alias in windows_aliases:
+            if alias_has_running_job(store, alias):
+                print(f"SKIP {alias}: job running")
+                continue
+            if not windows_slot_available(store):
+                print(f"QUEUE {alias}: windows-main busy")
+                dispatched.append({"alias": alias, "job_id": None, "target": "windows", "queued": True})
+                continue
+            spec = WINDOWS_WORKER_SPECS[alias]
+            goal = spec["goal_template"].format(
+                failure_context=failure_context,
+                run_dir=run_dir_str,
+                log_root=str(LOG_ROOT),
+            )
+            chat_id = ensure_worker(store, alias, spec, goal)
+            row = store.row("select * from chats where id=?", (chat_id,))
+            if sched.has_active_job(chat_id):
+                print(f"SKIP {alias}: active job")
+                continue
+            if worker:
+                job_id = sched.dispatch_remote(row, dict(worker))
+                if job_id:
+                    print(f"DISPATCHED {alias} -> {job_id} (windows-main)")
+                    dispatched.append({"alias": alias, "job_id": job_id, "target": "windows-main"})
+                else:
+                    print(f"QUEUE {alias}: windows dispatch failed")
+            else:
+                print(f"SKIP {alias}: windows-main unavailable")
+
+    print(
+        json.dumps(
+            {
+                "dispatched": dispatched,
+                "run_dir": run_dir_str,
+                "mac_workers": mac_aliases,
+                "windows_workers": windows_aliases,
+                "mac_can_take_more": mac_can_take,
+                "goal_pct": l1.get("pct"),
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
