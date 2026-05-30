@@ -77,6 +77,8 @@ def failure_kind(evidence_status: str, evidence_reason: str, job: Row | None = N
     if status in {"silent_failed", "running_silent"}:
         return "silent_failed"
     if status == "provider_error":
+        if "max_turns" in reason:
+            return "goal_incomplete"
         return "provider_error"
     if status == "timed_out_with_work":
         return "timed_out_with_work"
@@ -180,6 +182,17 @@ def schedule_retry(
     failures = int(row["failure_count"] or 0)
     delay = 0 if immediate else backoff_seconds(kind, failures)
     retry_at = now_ts() + delay
+    # Ensure provider_in_backoff() is respected before re-dispatch: align chat retry
+    # timer to provider backoff horizon so candidates() will not see a ready chat
+    # on a provider that is still unhealthy.
+    prov = str(row["provider"] or "")
+    if prov:
+        pb = store.row("select backoff_until from provider_health where provider=?", (prov,))
+        if pb:
+            until = parse_ts(str(pb["backoff_until"] or ""))
+            if until > retry_at:
+                retry_at = until
+                delay = max(0, int(retry_at - now_ts()))
     meta = chat_metadata(row)
     meta["last_failure_kind"] = kind
     meta["last_failure_status"] = evidence_status

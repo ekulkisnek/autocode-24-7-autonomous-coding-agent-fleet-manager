@@ -153,6 +153,16 @@ End with FLEET_DONE and gap list.
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Dispatch Liquid/Floresta utreexo Windows jobs")
+    parser.add_argument(
+        "--one",
+        action="store_true",
+        help="Dispatch only the first job that has no active/running work",
+    )
+    args = parser.parse_args()
+
     store = Store()
     sched = Scheduler(store)
     worker = store.row("select * from remote_workers where id='windows-main' and enabled=1")
@@ -179,7 +189,27 @@ def main() -> None:
         return not remote_busy()
 
     for index, spec in enumerate(JOBS):
-        if index > 0 and not wait_for_remote_slot():
+        if args.one:
+            active = store.row(
+                """
+                select count(*) c from jobs j
+                join chats c on c.id=j.chat_id
+                where j.status in ('running','pending')
+                  and c.alias=?
+                """,
+                (spec["alias"],),
+            )
+            if active and int(active["c"] or 0) > 0:
+                print(f"SKIP {spec['alias']}: already active")
+                continue
+            done = store.row(
+                "select done from chats where alias=? order by updated_at desc limit 1",
+                (spec["alias"],),
+            )
+            if done and int(done["done"] or 0):
+                print(f"SKIP {spec['alias']}: chat marked done")
+                continue
+        if index > 0 and not args.one and not wait_for_remote_slot():
             print(f"SKIP {spec['alias']}: windows-main still busy after timeout")
             continue
         chat_id = f"cursor:liquid-utreexo:{spec['alias']}:{sha(spec['goal'])[:8]}"
@@ -204,6 +234,8 @@ def main() -> None:
         if job_id:
             dispatched.append((spec["alias"], job_id, chat.id))
             print(f"DISPATCHED {spec['alias']} -> {job_id}")
+            if args.one:
+                break
             time.sleep(30)
         else:
             print(f"FAILED {spec['alias']}")

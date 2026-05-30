@@ -211,8 +211,16 @@ def kill_duplicate_l1_processes(*, keep_pid: int | None = None) -> list[int]:
 
 
 def chat_matches_l1_competitor(alias: str, title: str, cwd: str) -> bool:
+    if is_windows_remote_cwd(cwd):
+        return False
     blob = f"{alias} {title}".lower()
     return any(tag in blob for tag in L1_MAC_BLOCK_TAGS)
+
+
+def is_windows_remote_cwd(cwd: str) -> bool:
+    """True when chat work runs on the Windows worker (not Mac L1 Detox)."""
+    c = (cwd or "").replace("\\", "/").lower()
+    return c.startswith("c:/users/luke") or c.startswith("c:/users/luke/")
 
 
 def should_block_mac_dispatch(alias: str, title: str, cwd: str) -> bool:

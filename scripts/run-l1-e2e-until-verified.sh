@@ -50,7 +50,8 @@ run_orchestrator() {
   export REDWALLET_SKIP_ANDROID_SEED="${REDWALLET_SKIP_ANDROID_SEED:-1}"
   export REDWALLET_SKIP_IOS_SEED="${REDWALLET_SKIP_IOS_SEED:-1}"
   export L1_E2E_BALANCE_WAIT_MS="${L1_E2E_BALANCE_WAIT_MS:-180000}"
-  export L1_E2E_POST_FUND_RELAUNCH=0
+  export L1_E2E_POST_FUND_RELAUNCH="${L1_E2E_POST_FUND_RELAUNCH:-1}"
+  export L1_E2E_POST_FUND_MINE_BLOCKS="${L1_E2E_POST_FUND_MINE_BLOCKS:-6}"
   export L1_E2E_DETOX_REUSE=0
   bash "$ROOT/scripts/l1-e2e-autocode-preflight.sh" || {
     echo "FAIL autocode preflight — retry after infra ready"
@@ -75,7 +76,8 @@ run_orchestrator() {
   export ANDROID_L1_RECEIVE_ADDRESS="${ANDROID_L1_RECEIVE_ADDRESS:-$DEFAULT_ANDROID_RECEIVE}"
   export L1_RECEIVE_ADDRESS="${L1_RECEIVE_ADDRESS:-$ANDROID_L1_RECEIVE_ADDRESS}"
   export L1_E2E_BALANCE_WAIT_MS="${L1_E2E_BALANCE_WAIT_MS:-180000}"
-  export L1_E2E_POST_FUND_RELAUNCH=0
+  export L1_E2E_POST_FUND_RELAUNCH="${L1_E2E_POST_FUND_RELAUNCH:-1}"
+  export L1_E2E_POST_FUND_MINE_BLOCKS="${L1_E2E_POST_FUND_MINE_BLOCKS:-6}"
   export L1_E2E_DETOX_REUSE=0
 
   local ios_rc=0 android_rc=0
@@ -122,7 +124,59 @@ run_orchestrator() {
     final_rc=1
   fi
   echo "simulator_bidirectional ios_rc=$ios_rc android_rc=$android_rc final_rc=$final_rc"
+  append_l1_evidence "$run_dir" "$ios_rc" "$android_rc"
   return "$final_rc"
+}
+
+parse_summary_field() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return
+  grep -E "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+append_l1_evidence() {
+  local run_dir="$1" ios_rc="$2" android_rc="$3"
+  local ios_summary="$run_dir/ios-to-android/SUMMARY.txt"
+  local android_summary="$run_dir/android-to-ios/SUMMARY.txt"
+  local ios_txid android_txid ios_verify android_verify
+
+  ios_txid="$(parse_summary_field "$ios_summary" ios_to_android_txid)"
+  [[ -z "$ios_txid" || "$ios_txid" == "unset" ]] && ios_txid="$(grep -Eo 'L1_IOS_ANDROID_E2E\] txid=[0-9a-f]{64}' "$run_dir/ios-to-android/detox.log" 2>/dev/null | tail -1 | sed 's/.*txid=//' || true)"
+  android_txid="$(parse_summary_field "$android_summary" txid)"
+  [[ -z "$android_txid" || "$android_txid" == "unset" ]] && android_txid="$(grep -Eo 'L1_ANDROID_IOS_E2E\] txid=[0-9a-f]{64}' "$run_dir/android-to-ios/detox.log" 2>/dev/null | tail -1 | sed 's/.*txid=//' || true)"
+
+  ios_verify="$(parse_summary_field "$ios_summary" ios_to_android_verify)"
+  android_verify="$(grep -E '^verify=' "$android_summary" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+
+  if [[ "$ios_rc" -ne 0 || "$android_rc" -ne 0 ]]; then
+    echo "evidence_skip rc ios=$ios_rc android=$android_rc"
+    return
+  fi
+  if [[ ! "$ios_txid" =~ ^[0-9a-f]{64}$ || ! "$android_txid" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "evidence_skip missing txids ios=${ios_txid:-unset} android=${android_txid:-unset}"
+    return
+  fi
+  if [[ "$ios_verify" != "ok" || "$android_verify" != "ok" ]]; then
+    echo "evidence_skip verify ios=$ios_verify android=$android_verify"
+    return
+  fi
+
+  cat >>"$EVIDENCE" <<EOM
+
+## L1 E2E Run $(date -u +%Y-%m-%dT%H:%M:%SZ) simulator bidirectional VERIFIED
+
+| Direction | detox_exit | txid | verify |
+|-----------|------------|------|--------|
+| ios→android | 0 | $ios_txid | ok |
+| android→ios | 0 | $android_txid | ok |
+
+**run_dir:** $run_dir
+detox_exit=0
+ios_to_android_verify=ok
+android_to_ios_verify=ok
+
+EOM
+  echo "evidence_appended run_dir=$run_dir"
 }
 
 attempt=0

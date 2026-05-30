@@ -49,6 +49,9 @@ GOAL_FLEET_ALIASES: dict[str, str] = {
     "github-sync-ekulkisnek": "github-sync-ekulkisnek",
 }
 
+# Remote Windows goals may run in parallel with Mac L1 Detox (no Mac slot competition).
+WINDOWS_PARALLEL_GOAL_IDS = frozenset({"liquid-utreexo-windows", "windows-remote-health"})
+
 
 def external_goal_complete_for_chat(store: Store, chat_id: str) -> tuple[bool, str, str | None]:
     """Return (complete, goal_id, reason) for fleet chats tied to external verify criteria."""
@@ -326,11 +329,61 @@ def pause_l1_competitors_no_lock(store: Store, scheduler: Any) -> tuple[int, int
             continue
         if not coordination.chat_matches_l1_competitor(alias, title, cwd):
             continue
+        if coordination.is_windows_remote_cwd(cwd):
+            continue
         n = scheduler.runner.kill_chat_jobs(str(row["id"]), "l1_goal_competitor_pause")
         store.pause_chat(str(row["id"]))
         killed += n
         paused += 1
     return paused, killed
+
+
+def ensure_liquid_windows_running(store: Store, scheduler: Any) -> dict[str, Any]:
+    """Unpause and dispatch Liquid/utreexo work on windows-main (parallel with Mac L1)."""
+    from . import coordination
+
+    worker = store.row("select * from remote_workers where id='windows-main' and enabled=1")
+    if not worker:
+        return {"skipped": "windows-main disabled or missing"}
+
+    unpaused: list[str] = []
+    for row in store.rows(
+        """
+        select id, alias, cwd from chats
+        where paused=1 and done=0
+          and (alias like 'liquid-%' or alias like '%liquid-utreexo%')
+        """
+    ):
+        cwd = str(row["cwd"] or "")
+        if not coordination.is_windows_remote_cwd(cwd):
+            continue
+        with store.connect() as con:
+            con.execute("update chats set paused=0, state='active' where id=?", (row["id"],))
+        unpaused.append(str(row["alias"] or row["id"]))
+
+    busy = store.row("select count(*) c from jobs where status='running' and worker_id='windows-main'")
+    if busy and int(busy["c"] or 0) > 0:
+        return {"unpaused": unpaused, "skipped": "windows_busy"}
+
+    liquid_script = ROOT / "scripts" / "dispatch-liquid-utreexo-jobs.py"
+    if not liquid_script.is_file():
+        return {"unpaused": unpaused, "error": "dispatch script missing"}
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(liquid_script), "--one"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=str(ROOT),
+        )
+        return {
+            "unpaused": unpaused,
+            "dispatch_rc": proc.returncode,
+            "dispatch_out": (proc.stdout or proc.stderr or "")[:600],
+        }
+    except Exception as exc:
+        return {"unpaused": unpaused, "error": str(exc)}
 
 
 def pause_l1_agent_work_during_shell(store: Store, scheduler: Any) -> tuple[int, int]:
@@ -607,8 +660,8 @@ def dispatch_incomplete_goals(
     l1_incomplete = any(g.get("id") == "l1-e2e-verified" for g in incomplete)
     for goal in incomplete:
         gid = str(goal["id"])
-        # Goal 1 blocks goals 2-4 until L1_VERIFIED_EVIDENCE has two verify=ok txids.
-        if l1_incomplete and gid != "l1-e2e-verified":
+        # Goal 1 blocks Mac-only goals until verified; Windows remote goals run in parallel.
+        if l1_incomplete and gid not in WINDOWS_PARALLEL_GOAL_IDS and gid != "l1-e2e-verified":
             skipped.append(gid)
             continue
         gid = str(goal["id"])
@@ -706,6 +759,8 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
         result["latest_l1_run_dir"] = str(find_latest_l1_run_dir() or "")
 
     result["reopened"] = reconcile_false_complete_fleets(store, status, adaptive_ctx=adaptive_ctx)
+
+    result["liquid_windows"] = ensure_liquid_windows_running(store, scheduler)
 
     # Goal fleets always re-dispatch on verify failure (yolo); never gate on Mac capacity.
     result["dispatch"] = dispatch_incomplete_goals(store, status, adaptive_ctx=adaptive_ctx)

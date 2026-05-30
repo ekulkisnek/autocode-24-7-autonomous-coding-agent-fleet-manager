@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from autocode.goal_fleets import WINDOWS_PARALLEL_GOAL_IDS
 from autocode.models import Chat
 from autocode.scheduler import Scheduler
 from autocode.store import Store
@@ -180,7 +181,7 @@ def main() -> None:
     l1_incomplete = any(g["id"] == "l1-e2e-verified" for g in incomplete)
     for g in incomplete:
         gid = g["id"]
-        if l1_incomplete and gid != "l1-e2e-verified":
+        if l1_incomplete and gid not in WINDOWS_PARALLEL_GOAL_IDS and gid != "l1-e2e-verified":
             print(f"SKIP {gid}: Goal 1 (l1-e2e-verified) incomplete — defer until verified")
             continue
         spec = GOAL_FLEETS.get(gid)
