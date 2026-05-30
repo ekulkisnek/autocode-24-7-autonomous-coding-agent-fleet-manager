@@ -63,6 +63,13 @@ export L1_E2E_REQUIRE_ADB=1
 export ANDROID_SERIAL
 export REDWALLET_ELECTRUM_HOST="127.0.0.1"
 export REDWALLET_ELECTRUM_PORT="$ELECTRUM_PORT"
+# Fix ANDROID_SDK_ROOT propagation for detox/android paths (windows remote + mac local)
+if [[ -z "${ANDROID_SDK_ROOT:-}" ]]; then
+  for sdk in "$HOME/Library/Android/sdk" "$HOME/Android/sdk" "/opt/homebrew/share/android-commandlinetools" "/usr/local/share/android-sdk"; do
+    if [[ -d "$sdk" ]]; then export ANDROID_SDK_ROOT="$sdk"; break; fi
+  done
+fi
+[[ -n "${ANDROID_SDK_ROOT:-}" ]] && log "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" || log "ANDROID_SDK_ROOT unset (ok for simulator-only)"
 bash "$REDWALLET/scripts/l1-e2e-preflight.sh" || exit 2
 
 if ! probe_tcp 127.0.0.1 "$METRO_PORT" 2>/dev/null; then

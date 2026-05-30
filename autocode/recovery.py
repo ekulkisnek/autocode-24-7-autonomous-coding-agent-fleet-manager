@@ -384,6 +384,9 @@ def should_use_fallback(row: Row, failure_count: int | None = None) -> bool:
     kind = str(meta.get("last_failure_kind") or "")
     source = str(row["source"] or "")
     provider = str(row["provider"] or "")
+    # max_turns is unrecoverable on the same provider — always switch
+    if "max_turns" in str(meta.get("last_failure_reason") or "").lower():
+        return True
     # Wiki squad lanes already run on Grok with tuned cwd/max-turns; fallback strips flags.
     if provider == "grok" and source == "grok.wiki_squad":
         return False

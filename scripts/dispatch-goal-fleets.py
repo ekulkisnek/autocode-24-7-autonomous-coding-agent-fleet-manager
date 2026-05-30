@@ -188,6 +188,9 @@ def main() -> None:
             print(f"SKIP no fleet spec for {gid}")
             continue
         if gid == "l1-e2e-verified":
+            if _l1_loop_running() or _l1_orchestrator_running():
+                print(f"SKIP {gid}: shell orchestrator active — fleet dispatch deferred")
+                continue
             alias = spec["alias"]
             active = store.row(
                 """
