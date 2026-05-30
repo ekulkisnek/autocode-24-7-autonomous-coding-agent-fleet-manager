@@ -32,6 +32,7 @@ PICK_L1_PATH_SCRIPT = ROOT / "scripts" / "pick-l1-e2e-path.sh"
 VERIFY_SCRIPT = ROOT / "scripts" / "verify-goal-status.py"
 DISPATCH_SCRIPT = ROOT / "scripts" / "dispatch-goal-fleets.py"
 L1_WORKERS_SCRIPT = ROOT / "scripts" / "dispatch-l1-goal-workers.py"
+GAMECUBE_TCG_WORKERS_SCRIPT = ROOT / "scripts" / "dispatch-gamecube-tcg-workers.py"
 INFRA_SUPERVISOR_SCRIPT = ROOT / "scripts" / "autocode-infra-supervisor.py"
 META_SUPERVISOR_SCRIPT = ROOT / "scripts" / "dispatch-meta-supervisor.py"
 L1_SIMULATOR_CONTEXT = (
@@ -47,10 +48,19 @@ GOAL_FLEET_ALIASES: dict[str, str] = {
     "windows-remote-health": "windows-remote-health",
     "liquid-utreexo-windows": "liquid-utreexo-windows",
     "github-sync-ekulkisnek": "github-sync-ekulkisnek",
+    "gamecube-tcg-falsebound": "gamecube-tcg-falsebound-fleet",
 }
 
-# Remote Windows goals may run in parallel with Mac L1 Detox (no Mac slot competition).
-WINDOWS_PARALLEL_GOAL_IDS = frozenset({"liquid-utreexo-windows", "windows-remote-health"})
+# Goals that may run in parallel with Mac L1 Detox (no deferral when L1 incomplete).
+PARALLEL_WITH_L1_GOAL_IDS = frozenset(
+    {
+        "liquid-utreexo-windows",
+        "windows-remote-health",
+        "gamecube-tcg-falsebound",
+    }
+)
+# Back-compat alias used by dispatch scripts.
+WINDOWS_PARALLEL_GOAL_IDS = PARALLEL_WITH_L1_GOAL_IDS
 
 
 def external_goal_complete_for_chat(store: Store, chat_id: str) -> tuple[bool, str, str | None]:
@@ -253,6 +263,22 @@ def _l1_loop_running() -> bool:
     return False
 
 
+def _l1_lock_holder_alive() -> bool:
+    from . import coordination
+
+    info = coordination.read_l1_lock()
+    if not info:
+        return False
+    pid = int(info.get("pid") or 0)
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def start_l1_loop_if_needed(status: dict[str, Any]) -> bool:
     """Spawn L1 retry loop when goal incomplete and nothing is running."""
     l1 = next((g for g in status.get("goals", []) if g.get("id") == "l1-e2e-verified"), None)
@@ -261,6 +287,8 @@ def start_l1_loop_if_needed(status: dict[str, Any]) -> bool:
     if _l1_orchestrator_running() or _l1_loop_running():
         if not _l1_runner_stuck():
             return False
+    elif _l1_lock_holder_alive():
+        return False
     if not L1_E2E_SCRIPT.is_file():
         return False
     path = pick_l1_e2e_path()
@@ -308,6 +336,8 @@ def goal_id_for_chat(alias: str, objective: str) -> str | None:
         return "github-sync-ekulkisnek"
     if "liquid-utreexo" in blob:
         return "liquid-utreexo-windows"
+    if "gamecube-tcg-falsebound" in blob or "falsebound" in blob and "tcg" in blob:
+        return "gamecube-tcg-falsebound"
     return None
 
 
@@ -400,6 +430,48 @@ def ensure_liquid_windows_running(store: Store, scheduler: Any) -> dict[str, Any
         }
     except Exception as exc:
         return {"unpaused": unpaused, "error": str(exc)}
+
+
+def ensure_gamecube_tcg_running(
+    store: Store,
+    scheduler: Any,
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    """Dispatch GameCube TCG workers when optional goal incomplete and idle."""
+    goal = next((g for g in status.get("goals", []) if g.get("id") == "gamecube-tcg-falsebound"), None)
+    if not goal or goal.get("complete"):
+        return {"skipped": "gamecube-tcg-falsebound complete or missing"}
+
+    alias_hint = GOAL_FLEET_ALIASES.get("gamecube-tcg-falsebound", "")
+    if alias_hint:
+        row = store.row(
+            """
+            select count(*) c from jobs j
+            join chats c on c.id=j.chat_id
+            where j.status='running' and (c.alias=? or c.alias like 'gamecube-tcg-%')
+            """,
+            (alias_hint,),
+        )
+        if row and int(row["c"] or 0) > 0:
+            return {"skipped": "gamecube worker already running"}
+
+    if not GAMECUBE_TCG_WORKERS_SCRIPT.is_file():
+        return {"error": "dispatch-gamecube-tcg-workers.py missing"}
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(GAMECUBE_TCG_WORKERS_SCRIPT), "--one"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            cwd=str(ROOT),
+        )
+        return {
+            "dispatch_rc": proc.returncode,
+            "dispatch_out": (proc.stdout or proc.stderr or "")[:600],
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 def pause_l1_agent_work_during_shell(store: Store, scheduler: Any) -> tuple[int, int]:
@@ -677,7 +749,7 @@ def dispatch_incomplete_goals(
     for goal in incomplete:
         gid = str(goal["id"])
         # Goal 1 blocks Mac-only goals until verified; Windows remote goals run in parallel.
-        if l1_incomplete and gid not in WINDOWS_PARALLEL_GOAL_IDS and gid != "l1-e2e-verified":
+        if l1_incomplete and gid not in PARALLEL_WITH_L1_GOAL_IDS and gid != "l1-e2e-verified":
             skipped.append(gid)
             continue
         gid = str(goal["id"])
@@ -777,6 +849,7 @@ def tick(store: Store, scheduler: Any, *, force: bool = False) -> dict[str, Any]
     result["reopened"] = reconcile_false_complete_fleets(store, status, adaptive_ctx=adaptive_ctx)
 
     result["liquid_windows"] = ensure_liquid_windows_running(store, scheduler)
+    result["gamecube_tcg"] = ensure_gamecube_tcg_running(store, scheduler, status)
 
     # Goal fleets always re-dispatch on verify failure (yolo); never gate on Mac capacity.
     result["dispatch"] = dispatch_incomplete_goals(store, status, adaptive_ctx=adaptive_ctx)

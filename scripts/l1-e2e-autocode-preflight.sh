@@ -97,6 +97,7 @@ fi
 log "adb ok serial=$ANDROID_SERIAL"
 
 xcrun simctl boot "$SIM_UDID" >/dev/null 2>&1 || true
+xcrun simctl bootstatus "$SIM_UDID" -b >/dev/null 2>&1 || true
 log "detox_simulator boot udid=$SIM_UDID"
 
 if ! probe_tcp 127.0.0.1 "$ELECTRUM_PORT" 2>/dev/null; then

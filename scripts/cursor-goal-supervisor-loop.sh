@@ -20,6 +20,12 @@ if [[ -f "$PID_FILE" ]]; then
 fi
 
 echo $$ >"$PID_FILE"
+
+if [[ -f "${AUTOCODE}/state/PAUSE_TICKS" || -f "${AUTOCODE}/state/PAUSE_GOAL_SUPERVISOR" ]]; then
+  echo "Ticks paused (${AUTOCODE}/state/PAUSE_*); exiting loop"
+  rm -f "$PID_FILE"
+  exit 0
+fi
 trap 'rm -f "$PID_FILE"' EXIT
 
 echo "Cursor goal supervisor loop: every ${INTERVAL}s (PID $$)"

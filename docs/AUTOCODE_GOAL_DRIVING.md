@@ -50,6 +50,11 @@ Override: `L1_E2E_FORCE_PATH=physical|simulator`
 | liquid/patreon steal Mac slots | Competing fleets | pause_l1_competitors_no_lock during L1 |
 | BitAssets RPC down on phone | Environment blocker | Auto-fallback to simulator path |
 | Windows jobs pile up | Parallel remote dispatch | weight_capacity=1 + one job/worker/tick |
+| GameCube TCG idle | Optional goal incomplete | `ensure_gamecube_tcg_running()` dispatches `--one` worker/tick |
+
+## Optional goal: GameCube TCG Falsebound
+
+Goal `gamecube-tcg-falsebound` runs **in parallel with L1** and does **not** affect core `all_complete`. See [GAMECUBE_TCG_FALSEBOUND.md](GAMECUBE_TCG_FALSEBOUND.md).
 
 ## Commands
 

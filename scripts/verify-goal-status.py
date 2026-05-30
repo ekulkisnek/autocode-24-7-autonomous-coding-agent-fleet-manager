@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -11,6 +12,26 @@ from pathlib import Path
 AUTOCODE_ROOT = Path(__file__).resolve().parents[1]
 REDWALLET = Path("/Volumes/T705/code/work-on-something-to-do-with/redwallet")
 EVIDENCE = Path("/Volumes/T705/redwallet-logs/L1_VERIFIED_EVIDENCE.md")
+FBK_TCG_PROJECT = Path("/Users/lukekensik/coding/fbk-tcg-mod")
+FBK_TCG_EVIDENCE = FBK_TCG_PROJECT / "state" / "EVIDENCE.md"
+FBK_TCG_MILESTONES = (
+    "rom_extracted",
+    "iso_converted",
+    "battle_system_mapped",
+    "tcg_design_doc",
+    "rules_engine_scaffold",
+    "emulator_poc",
+)
+# Core RedWallet goals — optional goals (e.g. gamecube-tcg) do not gate all_complete.
+CORE_GOAL_IDS = frozenset(
+    {
+        "l1-e2e-verified",
+        "windows-remote-health",
+        "liquid-utreexo-windows",
+        "github-sync-ekulkisnek",
+    }
+)
+MILESTONE_OK = re.compile(r"(\w+)=ok\b", re.I)
 TXID_OK = re.compile(
     r"\|\s*[^|]+\|\s*0\s*\|\s*[0-9a-f]{64}\s*\|\s*ok\s*\|",
     re.I,
@@ -21,7 +42,10 @@ DETOX_OK = re.compile(r"detox_exit\s*=\s*0|ios_send_exit=0|android_send_exit=0",
 
 def _run(cmd: list[str], *, timeout: int = 30) -> tuple[int, str]:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        env = os.environ.copy()
+        root = str(AUTOCODE_ROOT)
+        env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         return r.returncode, (r.stdout or r.stderr or "").strip()
     except Exception as exc:
         return 1, str(exc)
@@ -158,16 +182,55 @@ def goal_github() -> dict:
     }
 
 
+def goal_gamecube_tcg() -> dict:
+    """Optional goal: Yu-Gi-Oh Falsebound Kingdom battle → TCG conversion."""
+    text = FBK_TCG_EVIDENCE.read_text(encoding="utf-8") if FBK_TCG_EVIDENCE.is_file() else ""
+    milestones: dict[str, bool] = {}
+    for key in FBK_TCG_MILESTONES:
+        milestones[key] = bool(re.search(rf"\b{re.escape(key)}=ok\b", text, re.I))
+    done = sum(1 for v in milestones.values() if v)
+    total = len(FBK_TCG_MILESTONES)
+    complete = done == total and total > 0
+    rom_dir = FBK_TCG_PROJECT / "rom"
+    rom_present = rom_dir.is_dir() and any(rom_dir.iterdir()) if rom_dir.is_dir() else False
+    return {
+        "id": "gamecube-tcg-falsebound",
+        "complete": complete,
+        "pct": 100 if complete else int(100 * done / total) if total else 0,
+        "milestones": milestones,
+        "milestones_done": done,
+        "milestones_total": total,
+        "project_path": str(FBK_TCG_PROJECT),
+        "evidence_path": str(FBK_TCG_EVIDENCE),
+        "rom_dir_populated": rom_present,
+        "optional": True,
+    }
+
+
 def main() -> None:
-    goals = [goal_l1(), goal_windows(), goal_liquid(), goal_github()]
-    all_complete = all(g["complete"] for g in goals)
+    filter_ids: set[str] = set()
+    for arg in sys.argv[1:]:
+        if arg.startswith("--"):
+            continue
+        filter_ids.add(arg)
+
+    goals = [goal_l1(), goal_windows(), goal_liquid(), goal_github(), goal_gamecube_tcg()]
+    if filter_ids:
+        goals = [g for g in goals if g["id"] in filter_ids]
+        if not goals:
+            print(f"No matching goals for: {sorted(filter_ids)}", file=sys.stderr)
+            sys.exit(2)
+
+    core = [g for g in goals if g["id"] in CORE_GOAL_IDS]
+    all_complete = all(g["complete"] for g in core) if core else all(g["complete"] for g in goals)
     report = {"all_complete": all_complete, "goals": goals}
     if "--json" in sys.argv:
         print(json.dumps(report, indent=2))
     else:
         for g in goals:
             mark = "DONE" if g["complete"] else f"{g['pct']}%"
-            print(f"{g['id']}: {mark}")
+            opt = " (optional)" if g.get("optional") else ""
+            print(f"{g['id']}: {mark}{opt}")
         print(f"all_complete={all_complete}")
     sys.exit(0 if all_complete else 1)
 

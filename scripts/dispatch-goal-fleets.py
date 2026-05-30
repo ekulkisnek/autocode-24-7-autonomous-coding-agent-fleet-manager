@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from autocode.goal_fleets import WINDOWS_PARALLEL_GOAL_IDS
+from autocode.goal_fleets import PARALLEL_WITH_L1_GOAL_IDS
 from autocode.models import Chat
 from autocode.scheduler import Scheduler
 from autocode.store import Store
@@ -90,6 +90,28 @@ Repos/branches:
 
 Push meaningful commits; do NOT force push. Verify `git status -sb` shows no ahead on fork remote.
 End with FLEET_DONE and push evidence (git log -1 --oneline per repo).""",
+    },
+    "gamecube-tcg-falsebound": {
+        "alias": "gamecube-tcg-falsebound-fleet",
+        "provider": "cursor",
+        "fallback_provider": "grok",
+        "cwd": "/Users/lukekensik/coding/fbk-tcg-mod",
+        "position": 7500.0,
+        "dispatch_script": "scripts/dispatch-gamecube-tcg-workers.py",
+        "goal": """GameCube Yu-Gi-Oh Falsebound Kingdom → TCG conversion (optional parallel goal).
+
+Project: /Users/lukekensik/coding/fbk-tcg-mod
+ROM: ~/Downloads/Yu-Gi-Oh! The Falsebound Kingdom (USA).7z (NKit ISO)
+Evidence: state/EVIDENCE.md (6 milestones must reach =ok)
+
+Workers dispatch via dispatch-gamecube-tcg-workers.py:
+- gamecube-tcg-rom-analysis (extract + NKit convert)
+- gamecube-tcg-battle-mapping (3v3 → TCG plan)
+- gamecube-tcg-rules-engine (LP, phases, zones)
+- gamecube-tcg-card-mechanics (decks + emulator POC)
+
+Runs in PARALLEL with L1 — do not pause for RedWallet E2E.
+End FLEET_DONE only when verify-goal-status.py gamecube-tcg-falsebound is complete.""",
     },
 }
 
@@ -181,7 +203,7 @@ def main() -> None:
     l1_incomplete = any(g["id"] == "l1-e2e-verified" for g in incomplete)
     for g in incomplete:
         gid = g["id"]
-        if l1_incomplete and gid not in WINDOWS_PARALLEL_GOAL_IDS and gid != "l1-e2e-verified":
+        if l1_incomplete and gid not in PARALLEL_WITH_L1_GOAL_IDS and gid != "l1-e2e-verified":
             print(f"SKIP {gid}: Goal 1 (l1-e2e-verified) incomplete — defer until verified")
             continue
         spec = GOAL_FLEETS.get(gid)

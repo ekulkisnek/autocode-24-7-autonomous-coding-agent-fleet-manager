@@ -257,6 +257,33 @@ def probe_worker(worker: Mapping[str, str] | Any) -> dict[str, Any]:
     }
 
 
+def strip_resume_flag(cmd: Sequence[str]) -> list[str]:
+    """Replace --resume <session_id> with --continue for remote grok dispatch.
+
+    Remote workers don't have the Mac's grok session database so --resume
+    <mac-session-id> fails. --continue resumes the worker's own most recent
+    session for that CWD, enabling genuine multi-turn agentic work.
+
+    Without --continue, --prompt-file is single-turn only (grok exits after 1
+    agent turn regardless of --max-turns). We always add --continue for remote
+    grok dispatches regardless of whether --resume was present.
+    """
+    result: list[str] = []
+    skip_next = False
+    is_grok = bool(cmd) and str(cmd[0]) in {"grok", "grok.exe"}
+    for arg in cmd:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--resume":
+            skip_next = True
+            continue
+        result.append(arg)
+    if is_grok and "--continue" not in result and "-c" not in result:
+        result.append("--continue")
+    return result
+
+
 def build_remote_exec_command(
     worker: Mapping[str, str] | Any,
     cwd: str,
@@ -266,7 +293,7 @@ def build_remote_exec_command(
 ) -> list[str]:
     """Build the local ``ssh`` argv that runs ``cmd`` on the remote worker."""
     shell = worker_shell(worker)
-    rewritten = rewrite_prompt_paths(cmd, job_id, shell)
+    rewritten = rewrite_prompt_paths(strip_resume_flag(cmd), job_id, shell)
     if shell == "powershell":
         remote_script = _build_powershell_script(cwd, rewritten, job_id, env=env)
         # Do not allocate a TTY (-tt): Windows OpenSSH + cursor-agent/grok hang or
@@ -342,6 +369,9 @@ def _build_powershell_script(
         location_expr = ps_quote(location)
     job_dir = ps_join("$env:USERPROFILE", "autocode-jobs", job_id)
     parts = [
+        # SSH sessions on Windows don't inherit User-scope env vars — load them explicitly.
+        # Only load XAI_API_KEY if not already set (allows per-job env override).
+        "$_xaiKey = [System.Environment]::GetEnvironmentVariable('XAI_API_KEY', 'User'); if (-not $env:XAI_API_KEY -and $_xaiKey) { $env:XAI_API_KEY = $_xaiKey }",
         *_powershell_env_setup(env),
         "$cursorAgent = Join-Path $env:LOCALAPPDATA 'cursor-agent/cursor-agent.cmd'",
         f"$jobDir = {job_dir}",
@@ -372,7 +402,28 @@ def _build_powershell_script(
         else:
             rendered.append(ps_quote(token))
     if rendered:
-        parts.append("& " + " ".join(rendered))
+        exec_line = "& " + " ".join(rendered)
+        first_token = rendered[0] if rendered else ""
+        # grok writes output directly to the Windows console handle, bypassing
+        # PowerShell's pipeline. Capture via $output and Write-Output to flush
+        # through the SSH stdout pipe so our local stdout_path file is populated.
+        if first_token not in {"$cursorAgent", "cursor-agent", "cursor-agent.cmd"}:
+            # grok uses a different stdout handle when it detects a project workspace,
+            # so the `& grok` operator loses its output. Use Start-Process with explicit
+            # file redirection, then stream the file back through the SSH pipe.
+            # -ArgumentList takes a comma-separated array, not space-separated.
+            args_array = ",".join(rendered[1:])  # e.g. '--cwd','C:/path','--prompt-file',$prompt
+            parts.append("$_grokout = Join-Path $jobDir 'grok-run.txt'")
+            parts.append("$_grokerr = Join-Path $jobDir 'grok-run-err.txt'")
+            parts.append(
+                f"$_p = Start-Process -FilePath 'grok' -ArgumentList @({args_array}) "
+                f"-NoNewWindow -Wait -PassThru "
+                f"-RedirectStandardOutput $_grokout "
+                f"-RedirectStandardError $_grokerr"
+            )
+            parts.append("if (Test-Path $_grokout) { Get-Content $_grokout -Raw }")
+        else:
+            parts.append(exec_line)
     return "; ".join(parts)
 
 

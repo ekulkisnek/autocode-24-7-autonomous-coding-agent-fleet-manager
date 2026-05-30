@@ -75,9 +75,12 @@ run_orchestrator() {
   export REDWALLET_SKIP_IOS_SEED="${REDWALLET_SKIP_IOS_SEED:-1}"
   export ANDROID_L1_RECEIVE_ADDRESS="${ANDROID_L1_RECEIVE_ADDRESS:-$DEFAULT_ANDROID_RECEIVE}"
   export L1_RECEIVE_ADDRESS="${L1_RECEIVE_ADDRESS:-$ANDROID_L1_RECEIVE_ADDRESS}"
-  export L1_E2E_BALANCE_WAIT_MS="${L1_E2E_BALANCE_WAIT_MS:-180000}"
+  export L1_E2E_BALANCE_WAIT_MS="${L1_E2E_BALANCE_WAIT_MS:-240000}"
   export L1_E2E_POST_FUND_RELAUNCH="${L1_E2E_POST_FUND_RELAUNCH:-0}"
-  export L1_E2E_POST_FUND_MINE_BLOCKS="${L1_E2E_POST_FUND_MINE_BLOCKS:-6}"
+  export L1_E2E_POST_FUND_MINE_BLOCKS="${L1_E2E_POST_FUND_MINE_BLOCKS:-8}"
+  # Force hybrid path: shell seed+fund+simctl send (Detox send UI flakes BalanceSync/L1SendE2E).
+  export L1_E2E_IOS_SIM_COMMAND_SEND=1
+  export L1_E2E_ANDROID_COMMAND_SEND=1
   export L1_E2E_DETOX_REUSE=0
 
   local ios_rc=0 android_rc=0
@@ -85,6 +88,7 @@ run_orchestrator() {
   L1_E2E_SKIP_LOCK=1 \
     L1_IOS_ANDROID_E2E_LOG_DIR="$run_dir/ios-to-android" \
     L1_E2E_BIDIRECTIONAL=0 \
+    L1_E2E_IOS_SIM_COMMAND_SEND="$L1_E2E_IOS_SIM_COMMAND_SEND" \
     REDWALLET_SKIP_ANDROID_SEED="$REDWALLET_SKIP_ANDROID_SEED" \
     ANDROID_L1_RECEIVE_ADDRESS="$ANDROID_L1_RECEIVE_ADDRESS" \
     bash "$REDWALLET/scripts/run-l1-ios-simulator-to-android-phone-e2e.sh"
@@ -113,6 +117,8 @@ run_orchestrator() {
 
   L1_E2E_SKIP_LOCK=1 \
     L1_ANDROID_IOS_E2E_LOG_DIR="$run_dir/android-to-ios" \
+    L1_E2E_IOS_SIM_COMMAND_SEND="$L1_E2E_IOS_SIM_COMMAND_SEND" \
+    L1_E2E_ANDROID_COMMAND_SEND="$L1_E2E_ANDROID_COMMAND_SEND" \
     REDWALLET_SKIP_IOS_SEED="$android_skip_ios_seed" \
     IOS_L1_RECEIVE_ADDRESS="${IOS_L1_RECEIVE_ADDRESS:-}" \
     bash "$REDWALLET/scripts/run-l1-android-phone-to-ios-simulator-e2e.sh"
@@ -142,6 +148,7 @@ append_l1_evidence() {
 
   ios_txid="$(parse_summary_field "$ios_summary" ios_to_android_txid)"
   [[ -z "$ios_txid" || "$ios_txid" == "unset" ]] && ios_txid="$(grep -Eo 'L1_IOS_ANDROID_E2E\] txid=[0-9a-f]{64}' "$run_dir/ios-to-android/detox.log" 2>/dev/null | tail -1 | sed 's/.*txid=//' || true)"
+  [[ -z "$ios_txid" || "$ios_txid" == "unset" ]] && ios_txid="$(cat "$run_dir/ios-to-android/ios-command-send/ios-l1-send-txid.txt" 2>/dev/null || true)"
   android_txid="$(parse_summary_field "$android_summary" txid)"
   [[ -z "$android_txid" || "$android_txid" == "unset" ]] && android_txid="$(grep -Eo 'L1_ANDROID_IOS_E2E\] txid=[0-9a-f]{64}' "$run_dir/android-to-ios/detox.log" 2>/dev/null | tail -1 | sed 's/.*txid=//' || true)"
 

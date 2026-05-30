@@ -806,6 +806,95 @@ def cmd_grok(args: argparse.Namespace) -> None:
             print(f"  title: {compact(chat.title or chat.latest_text, 180)}")
 
 
+_ORCHESTRATOR_SYSTEM_PROMPT = """You are an autonomous orchestrator. Your job is to analyze the goal, break it into concrete subtasks, and output a FLEET_PLAN marker.
+
+Rules:
+- Each subtask must be a self-contained unit of work that one agent can complete independently
+- Assign provider: "grok" for planning/analysis/complex reasoning tasks; "cursor" for hands-on code editing
+- Set cwd to the exact workspace path where the work should happen
+- Keep subtask objectives specific and actionable — not vague like "implement X" but "add X to file Y so that Z works"
+- Output the FLEET_PLAN first, then immediately begin the first subtask yourself
+
+Required output format (output this JSON block exactly once at the start):
+
+FLEET_PLAN: {
+  "goal": "<the overall goal>",
+  "subtasks": [
+    {"title": "short title", "objective": "full actionable description", "provider": "grok", "cwd": "/path/to/workspace", "priority": 10},
+    {"title": "short title", "objective": "full actionable description", "provider": "cursor", "cwd": "/path/to/workspace", "priority": 20}
+  ]
+}
+
+After outputting the FLEET_PLAN, proceed with working on the first subtask directly. Do not stop and wait.
+"""
+
+
+def cmd_orchestrate(args: argparse.Namespace) -> None:
+    """Create a grok orchestrator that plans a goal and spawns subtasks."""
+    import tempfile
+    import urllib.parse
+
+    store = Store()
+    workspace = Path(args.workspace).expanduser()
+    cwd = str(workspace if workspace.exists() else Path.home())
+    goal = args.goal.strip()
+
+    full_prompt = f"{_ORCHESTRATOR_SYSTEM_PROMPT}\n\n## Goal\n{goal}\n\n## Workspace\n{cwd}\n"
+
+    grok_home = Path.home() / ".grok"
+    grok_bin = grok_home / "bin" / "grok"
+    encoded_cwd = urllib.parse.quote(cwd, safe="")
+    sessions_dir = grok_home / "sessions" / encoded_cwd
+    existing: set[str] = set()
+    if sessions_dir.exists():
+        existing = {d.name for d in sessions_dir.iterdir() if d.is_dir() and len(d.name) > 10}
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write(full_prompt)
+        prompt_path = f.name
+
+    print(f"Launching grok orchestrator for: {goal}")
+    print(f"Workspace: {cwd}")
+    max_turns = str(args.max_turns)
+    try:
+        subprocess.run(
+            [str(grok_bin), "--cwd", cwd, "--no-alt-screen",
+             "--output-format", "plain", "--permission-mode", "bypassPermissions",
+             "--max-turns", max_turns, "--prompt-file", prompt_path],
+            timeout=args.timeout,
+        )
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        print("Orchestrator timed out or interrupted.")
+    finally:
+        Path(prompt_path).unlink(missing_ok=True)
+
+    new_session_id = None
+    if sessions_dir.exists():
+        new_dirs = [d for d in sessions_dir.iterdir()
+                    if d.is_dir() and d.name not in existing and len(d.name) > 10]
+        if new_dirs:
+            newest = max(new_dirs, key=lambda d: d.stat().st_mtime)
+            new_session_id = newest.name
+
+    if not new_session_id:
+        print("Warning: could not detect orchestrator session.")
+        return
+
+    chat_id = f"grok:grok.sqlite:{new_session_id}"
+    from .scheduler import Scheduler
+    Scheduler(store).force_discover()
+
+    row = store.find_chat(new_session_id)
+    if row:
+        store.queue_add(row["id"], 1.0)
+        store.set_goal(row["id"], f"[orchestrator] {goal}", "user")
+        print(f"Orchestrator queued: {row['id']}")
+        print("The FLEET_PLAN subtasks will be auto-spawned when the orchestrator finishes.")
+    else:
+        print(f"Session: {chat_id}")
+        print("Run: autocode queue add <session-id> to queue it manually.")
+
+
 def cmd_antigravity(args: argparse.Namespace) -> None:
     from .providers.antigravity import AntigravityProvider
     provider = AntigravityProvider()
@@ -1659,6 +1748,12 @@ def build_parser() -> argparse.ArgumentParser:
     grsub = gr.add_subparsers(dest="grok_cmd", required=True)
     grnew = grsub.add_parser("new"); grnew.add_argument("--workspace", default=str(Path.home())); grnew.add_argument("--goal", required=True); grnew.add_argument("--grok-message-ceiling", type=int, default=60, help="Internal Grok CLI message ceiling; AutoCode turns are interventions, not provider messages."); grnew.add_argument("--queue", action="store_true", help="Add to autocode queue after creation"); grnew.add_argument("--position", type=float, default=None, help="Queue position (lower = higher priority)"); grnew.set_defaults(func=cmd_grok)
     grch = grsub.add_parser("chats"); grch.add_argument("--limit", type=int, default=30); grch.set_defaults(func=cmd_grok)
+    orch = sub.add_parser("orchestrate", help="One-shot: grok plans a goal into subtasks and queues them")
+    orch.add_argument("--goal", required=True, help="High-level goal for the orchestrator to decompose")
+    orch.add_argument("--workspace", default=str(Path.home()), help="Workspace path (cwd for the orchestrator)")
+    orch.add_argument("--max-turns", type=int, default=30, help="Max grok turns for the orchestrator")
+    orch.add_argument("--timeout", type=int, default=600, help="Wall-clock timeout in seconds")
+    orch.set_defaults(func=cmd_orchestrate)
     ag = sub.add_parser("antigravity")
     agsub = ag.add_subparsers(dest="antigravity_cmd", required=True)
     agst = agsub.add_parser("status"); agst.set_defaults(func=cmd_antigravity)

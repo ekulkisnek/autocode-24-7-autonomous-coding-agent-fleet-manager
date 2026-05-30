@@ -94,6 +94,10 @@ def _load_status() -> dict:
 
 
 def ensure_daemon(actions: list[str]) -> bool:
+    pause = Path(os.environ.get("AUTOCODE_HOME", Path.home() / "autocode")) / "state" / "PAUSE_TICKS"
+    if pause.is_file():
+        actions.append("skipped_daemon_start_ticks_paused")
+        return False
     pids = _pgrep("autocode.cli daemon run")
     if pids:
         return False
@@ -110,11 +114,66 @@ def ensure_yolo(actions: list[str]) -> bool:
     return False
 
 
+
+
+def _lock_holder_pid() -> int | None:
+    lock_path = LOG_ROOT / ".l1-e2e-lock"
+    if not lock_path.is_file():
+        return None
+    try:
+        data = json.loads(lock_path.read_text(encoding="utf-8"))
+        pid = int(data.get("pid", 0))
+        if pid > 0:
+            return pid
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return None
+
+
+def dedupe_l1_loops(actions: list[str]) -> bool:
+    """Keep one until-verified loop; prefer the L1 lock holder PID."""
+    loops = _l1_loop_pids()
+    if len(loops) <= 1:
+        return False
+    keeper = _lock_holder_pid()
+    if keeper is not None and keeper in loops:
+        victims = [pid for pid in loops if pid != keeper]
+    elif keeper is not None:
+        # Lock holder not in loop list (transient) — never kill the lock holder.
+        victims = [pid for pid in loops if pid != keeper]
+    else:
+        keeper = min(loops)
+        victims = [pid for pid in loops if pid != keeper]
+    changed = False
+    for pid in victims:
+        if pid == keeper:
+            continue
+        rc, _ = _run(["kill", "-TERM", str(pid)], timeout=5)
+        if rc == 0:
+            actions.append(f"killed_duplicate_l1_loop:{pid}")
+            changed = True
+    return changed
+
+def _l1_lock_holder_alive() -> bool:
+    """True when .l1-e2e-lock exists and holder pid is still running."""
+    pid = _lock_holder_pid()
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def ensure_l1_loop(actions: list[str], status: dict) -> bool:
     l1 = next((g for g in status.get("goals", []) if g.get("id") == "l1-e2e-verified"), None)
     if not l1 or l1.get("complete"):
         return False
     if _l1_loop_pids():
+        return False
+    if _l1_lock_holder_alive():
+        actions.append("skip_l1_loop_active_lock")
         return False
     if not L1_LOOP_SCRIPT.is_file():
         actions.append("missing_l1_loop_script")
@@ -216,6 +275,7 @@ def run_supervisor(*, json_out: bool = False) -> dict:
 
     l1 = next((g for g in status.get("goals", []) if g.get("id") == "l1-e2e-verified"), None)
     if l1 and not l1.get("complete"):
+        dedupe_l1_loops(actions)
         ensure_l1_loop(actions, status)
 
     report = {

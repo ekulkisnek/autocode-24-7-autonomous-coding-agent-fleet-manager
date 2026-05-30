@@ -64,6 +64,11 @@ def main() -> None:
         print("{}")
         return
 
+    pause_flag = AUTOCODE / "state" / "PAUSE_GOAL_SUPERVISOR"
+    if pause_flag.is_file():
+        print("{}")
+        return
+
     # Consume optional stop-hook stdin (workspace, loop count, etc.)
     if not sys.stdin.isatty():
         try:

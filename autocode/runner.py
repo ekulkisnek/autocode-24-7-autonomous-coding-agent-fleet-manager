@@ -302,6 +302,21 @@ class JobRunner:
                         )
         return killed
 
+    def _queue_spawn_intents(self, subtasks: list, parent_chat_id: str) -> None:
+        from .config import HOME
+        for task in subtasks:
+            if not isinstance(task, dict):
+                continue
+            objective = str(task.get("objective") or task.get("goal") or task.get("title") or "").strip()
+            if not objective:
+                continue
+            provider = str(task.get("provider") or "grok").strip().lower()
+            if provider not in {"grok", "cursor", "claude", "codex"}:
+                provider = "grok"
+            cwd = str(task.get("cwd") or task.get("workspace") or str(HOME)).strip()
+            priority = int(task.get("priority") or 50)
+            self.store.add_spawn_intent(provider, cwd, objective, priority=priority, parent_chat_id=parent_chat_id)
+
     def resource_for(self, row: Row) -> str:
         priority_resource = self._row_value(row, "priority_resource_path")
         if priority_resource:
@@ -517,6 +532,7 @@ class JobRunner:
                                     now_iso(),
                                 ),
                             )
+                            self._queue_spawn_intents(subtasks, parent_chat_id=str(job["chat_id"]))
                 if evidence_status == "worked":
                     priority = con.execute(
                         """
@@ -619,10 +635,65 @@ class JobRunner:
         if archive_chat_id:
             self.store.queue_archive(archive_chat_id, reason="completed")
 
+    def _fetch_grok_session_content(self, job: Row) -> None:
+        """After a remote grok job finishes, SCP the session DB and write the latest session content to stdout_path."""
+        from . import remote_ssh
+        import sqlite3, tempfile, urllib.parse, time
+
+        worker_id = str(job["worker_id"] or "").strip()
+        if not worker_id:
+            return
+        worker = self.store.row("select * from remote_workers where id=?", (worker_id,))
+        if not worker or remote_ssh.worker_shell(worker) != "powershell":
+            return
+        out = Path(job["stdout_path"])
+        if out.exists() and out.stat().st_size > 100:
+            return  # already has real content
+        ssh_base = remote_ssh.ssh_base(worker)
+        target = remote_ssh.ssh_target(worker)
+        remote_db = "C:/Users/Luke/.grok/sessions/session_search.sqlite"
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            scp_cmd = ["scp", "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes"]
+            ssh_key = remote_ssh.worker_field(worker, "ssh_key_path").strip()
+            if ssh_key:
+                scp_cmd += ["-i", ssh_key]
+            scp_cmd += [f"{target}:{remote_db}", tmp_path]
+            result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=20)
+            if result.returncode != 0:
+                return
+            con = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True, timeout=5)
+            # Find the most recent session that matches this job's workspace
+            job_cwd = str(job["cwd"] or "").replace("\\", "/")
+            rows = con.execute(
+                "select session_id, cwd, content from session_docs order by updated_at desc limit 10"
+            ).fetchall()
+            best = None
+            for sid, cwd, content in rows:
+                cwd_norm = str(cwd or "").replace("\\", "/").replace("//./", "").lstrip("/")
+                if content and len(content) > 50:
+                    if not best:
+                        best = content
+                    job_cwd_norm = job_cwd.lstrip("/")
+                    if job_cwd_norm and job_cwd_norm in cwd_norm:
+                        best = content
+                        break
+            con.close()
+            if best and len(best) > 50:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(best[-12000:], encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
     def _refresh_one_remote(self, job: Row) -> None:
         """Refresh a job dispatched via SSH to a remote worker (tracks local ssh pid only)."""
         pid = int(job["pid"] or 0)
         running = self._pid_running(pid)
+        if not running and str(job["provider"] or "") == "grok":
+            self._fetch_grok_session_content(job)
         out = Path(job["stdout_path"])
         err = Path(job["stderr_path"])
         out_size = out.stat().st_size if out.exists() else 0
@@ -861,6 +932,9 @@ class JobRunner:
     def _meaningful_stderr(self, path: Path) -> bool:
         text = read_text(path, limit=4000).lower()
         if not text.strip():
+            return False
+        # PowerShell CLIXML (serialized objects from SSH sessions) is not meaningful work output
+        if text.lstrip().startswith("#< clixml"):
             return False
         noisy = ["could not find a git repository", "new version", "warning"]
         return any(line.strip() and not any(n in line.lower() for n in noisy) for line in text.splitlines())

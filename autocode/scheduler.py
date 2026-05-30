@@ -148,6 +148,8 @@ class Scheduler:
                     remote_budget = max(0.0, remote_budget - job_weight)
                     remote_dispatched_workers.add(wid)
 
+        spawn_created = self._process_spawn_intents()
+
         coord = self.coordination_snapshot(
             cap=cap,
             running_weight=self._running_dispatch_weight(),
@@ -177,7 +179,127 @@ class Scheduler:
             "goal_fleets": goal_fleets_result,
             "auto_fix": auto_fix,
             "coordination": coord,
+            "spawn_created": spawn_created,
         }
+
+    def _process_spawn_intents(self) -> int:
+        """Convert pending spawn_intents into real queued grok/cursor sessions."""
+        import subprocess
+        import tempfile
+        import urllib.parse
+
+        intents = self.store.pop_spawn_intents(limit=2)
+        created = 0
+        for intent in intents:
+            provider = str(intent["provider"] or "grok")
+            cwd = str(intent["cwd"] or str(HOME))
+            objective = str(intent["objective"] or "")
+            intent_id = str(intent["id"])
+            priority = int(intent["priority"] or 50)
+            if not objective:
+                self.store.finish_spawn_intent(intent_id, "", failed=True)
+                continue
+            try:
+                if provider == "grok":
+                    chat_id = self._spawn_grok_intent(cwd, objective, priority, intent_id)
+                else:
+                    chat_id = self._spawn_cursor_intent(cwd, objective, priority, intent_id)
+                if chat_id:
+                    self.store.finish_spawn_intent(intent_id, chat_id)
+                    created += 1
+                else:
+                    self.store.finish_spawn_intent(intent_id, "", failed=True)
+            except Exception as exc:
+                self.store.event("spawn_intent_failed", intent_id=intent_id, error=str(exc)[:200])
+                self.store.finish_spawn_intent(intent_id, "", failed=True)
+        return created
+
+    def _spawn_grok_intent(self, cwd: str, objective: str, priority: int, intent_id: str) -> str:
+        """Create a new grok session from a spawn intent and queue it."""
+        import subprocess
+        import tempfile
+        import urllib.parse
+
+        grok_home = HOME / ".grok"
+        grok_bin = grok_home / "bin" / "grok"
+        if not grok_bin.exists():
+            return ""
+        workspace = Path(cwd).expanduser()
+        if not workspace.exists():
+            workspace = HOME
+        cwd_str = str(workspace)
+        encoded_cwd = urllib.parse.quote(cwd_str, safe="")
+        sessions_dir = grok_home / "sessions" / encoded_cwd
+        existing: set[str] = set()
+        if sessions_dir.exists():
+            existing = {d.name for d in sessions_dir.iterdir() if d.is_dir() and len(d.name) > 10}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(objective)
+            prompt_path = f.name
+        try:
+            subprocess.run(
+                [str(grok_bin), "--cwd", cwd_str, "--no-alt-screen",
+                 "--output-format", "plain", "--permission-mode", "bypassPermissions",
+                 "--max-turns", "1", "--prompt-file", prompt_path],
+                timeout=120,
+                capture_output=True,
+            )
+        except Exception:
+            pass
+        finally:
+            Path(prompt_path).unlink(missing_ok=True)
+        new_session_id = None
+        if sessions_dir.exists():
+            new_dirs = [d for d in sessions_dir.iterdir()
+                        if d.is_dir() and d.name not in existing and len(d.name) > 10]
+            if new_dirs:
+                newest = max(new_dirs, key=lambda d: d.stat().st_mtime)
+                new_session_id = newest.name
+        if not new_session_id:
+            return ""
+        chat_id = f"grok:grok.sqlite:{new_session_id}"
+        self.force_discover()
+        row = self.store.find_chat(new_session_id)
+        if row:
+            actual_id = str(row["id"])
+            self.store.queue_add(actual_id, float(priority))
+            self.store.set_goal(actual_id, objective, "orchestrator")
+            self.store.event("spawn_intent_queued", actual_id, intent_id=intent_id, provider="grok")
+            return actual_id
+        return chat_id
+
+    def _spawn_cursor_intent(self, cwd: str, objective: str, priority: int, intent_id: str) -> str:
+        """Create a cursor chat from a spawn intent."""
+        import subprocess
+        import tempfile
+
+        cursor_agent_cmd = HOME / ".cursor" / "bin" / "cursor-agent"
+        if not cursor_agent_cmd.exists():
+            import shutil
+            found = shutil.which("cursor-agent")
+            if not found:
+                return ""
+            cursor_agent_cmd = Path(found)
+        workspace = Path(cwd).expanduser()
+        if not workspace.exists():
+            workspace = HOME
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, dir=HOME / ".autocode-spawns") as f:
+            f.write(objective)
+            prompt_path = f.name
+        try:
+            result = subprocess.run(
+                [str(cursor_agent_cmd), "--workspace", str(workspace), "--prompt-file", prompt_path,
+                 "--output-format", "json", "--max-turns", "1"],
+                timeout=60,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            return ""
+        finally:
+            Path(prompt_path).unlink(missing_ok=True)
+        self.force_discover()
+        return ""
 
     def _maybe_discover(self) -> str:
         last = self.store.get_config("last_discovery_ts", "0")

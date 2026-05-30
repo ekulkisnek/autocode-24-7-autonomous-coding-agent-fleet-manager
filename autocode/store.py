@@ -183,6 +183,20 @@ class Store:
                 );
                 create index if not exists idx_task_plans_chat on task_plans(chat_id, status, updated_at desc);
 
+                create table if not exists spawn_intents (
+                  id text primary key,
+                  provider text not null,
+                  cwd text not null,
+                  objective text not null,
+                  priority integer not null default 50,
+                  parent_chat_id text not null default '',
+                  status text not null default 'pending',
+                  chat_id text not null default '',
+                  created_at text not null,
+                  updated_at text not null
+                );
+                create index if not exists idx_spawn_intents_status on spawn_intents(status, created_at);
+
                 create table if not exists provider_health (
                   provider text primary key,
                   failure_count integer not null default 0,
@@ -770,6 +784,48 @@ class Store:
             )
         self.event("task_plan_created", chat_id, plan_id=pid, subtask_count=len(subtasks))
         return pid
+
+    def add_spawn_intent(
+        self,
+        provider: str,
+        cwd: str,
+        objective: str,
+        *,
+        priority: int = 50,
+        parent_chat_id: str = "",
+    ) -> str:
+        sid = "spawn-" + sha(f"{provider}:{cwd}:{objective}")[:16]
+        with self.connect() as con:
+            con.execute(
+                """
+                insert into spawn_intents(id,provider,cwd,objective,priority,parent_chat_id,status,created_at,updated_at)
+                values(?,?,?,?,?,?,'pending',?,?)
+                on conflict(id) do update set status='pending',updated_at=excluded.updated_at
+                """,
+                (sid, provider, cwd, objective, priority, parent_chat_id, now_iso(), now_iso()),
+            )
+        self.event("spawn_intent_added", parent_chat_id or None, intent_id=sid, provider=provider, cwd=cwd)
+        return sid
+
+    def pop_spawn_intents(self, limit: int = 3) -> list[sqlite3.Row]:
+        rows = self.rows(
+            "select * from spawn_intents where status='pending' order by priority asc, created_at asc limit ?",
+            (limit,),
+        )
+        if rows:
+            ids = [r["id"] for r in rows]
+            with self.connect() as con:
+                con.executemany("update spawn_intents set status='spawning',updated_at=? where id=?",
+                                [(now_iso(), i) for i in ids])
+        return rows
+
+    def finish_spawn_intent(self, intent_id: str, chat_id: str, *, failed: bool = False) -> None:
+        status = "failed" if failed else "done"
+        with self.connect() as con:
+            con.execute(
+                "update spawn_intents set status=?,chat_id=?,updated_at=? where id=?",
+                (status, chat_id, now_iso(), intent_id),
+            )
 
     def task_plan_summary(self, chat_id: str) -> str:
         row = self.row(
