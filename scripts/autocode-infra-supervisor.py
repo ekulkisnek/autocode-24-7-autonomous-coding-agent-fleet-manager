@@ -108,6 +108,7 @@ def ensure_l1_loop(actions: list[str], status: dict) -> bool:
     env.setdefault("L1_E2E_MAX_ATTEMPTS", "9999")
     env.setdefault("L1_E2E_RETRY_SLEEP", "45")
     env.setdefault("L1_E2E_POST_FUND_RELAUNCH", "0")
+    env.setdefault("L1_E2E_DETOX_REUSE", "0")
     with log_path.open("a", encoding="utf-8") as log:
         log.write("\n=== infra-supervisor spawn loop ===\n")
         subprocess.Popen(
