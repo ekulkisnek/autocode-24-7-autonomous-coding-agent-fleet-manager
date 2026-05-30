@@ -254,6 +254,7 @@ def workers_for_failure(blob: str, *, dispatch_all: bool) -> tuple[list[str], li
         return mac, windows
 
     matched_mac: list[str] = []
+    matched_windows: list[str] = []
     for alias, spec in MAC_WORKER_SPECS.items():
         if alias == "l1-log-analysis":
             continue
@@ -263,7 +264,12 @@ def workers_for_failure(blob: str, *, dispatch_all: bool) -> tuple[list[str], li
         matched_mac.append("l1-log-analysis")
     elif "l1-log-analysis" not in matched_mac:
         matched_mac.append("l1-log-analysis")
-    return matched_mac, []
+    # While Mac Detox is exclusive, spill pattern-matched review to Windows (no orchestrator).
+    if "l1sende2e" in blob or "addressinput" in blob or "walletslist" in blob or "detox" in blob:
+        matched_windows.append("l1-detox-spec-review")
+    if "balance" in blob or "electrum" in blob or "0 sats" in blob:
+        matched_windows.append("l1-blueelectrum-signet")
+    return matched_mac, matched_windows
 
 
 def pick_provider(store: Store, spec: dict) -> str:

@@ -70,7 +70,7 @@ End with FLEET_DONE when remote worked job exists.""",
     },
     "liquid-utreexo-windows": {
         "alias": "liquid-utreexo-windows-fleet",
-        "provider": "cursor",
+        "provider": "grok",
         "cwd": "C:/Users/Luke",
         "position": 9000.0,
         "dispatch_script": "scripts/dispatch-liquid-utreexo-jobs.py",

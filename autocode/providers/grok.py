@@ -71,12 +71,12 @@ class GrokProvider(Provider):
         if chat.source == "grok.wiki_squad":
             return "120"
         blob = f"{chat.id} {chat.alias or ''}".lower()
-        if "goal-fleet" in blob or chat.alias in {
+        if "goal-fleet" in blob or "liquid-utreexo" in blob or chat.alias in {
             "l1-e2e-until-verified",
             "windows-remote-health",
             "github-sync-ekulkisnek",
             "liquid-utreexo-windows-fleet",
-        }:
+        } or (chat.alias or "").startswith("liquid-"):
             return "200" if "l1-e2e-until-verified" in blob or chat.alias == "l1-e2e-until-verified" else "120"
         if chat.alias in {
             "l1-sim-detox-fix",

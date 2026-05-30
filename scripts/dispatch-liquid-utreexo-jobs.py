@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dispatch parallel Windows Cursor jobs for Liquid/Floresta utreexo work."""
+"""Dispatch parallel Windows Grok jobs for Liquid/Floresta utreexo work."""
 from __future__ import annotations
 
 import sys
@@ -212,7 +212,7 @@ def main() -> None:
         if index > 0 and not args.one and not wait_for_remote_slot():
             print(f"SKIP {spec['alias']}: windows-main still busy after timeout")
             continue
-        chat_id = f"cursor:liquid-utreexo:{spec['alias']}:{sha(spec['goal'])[:8]}"
+        chat_id = f"grok:liquid-utreexo:{spec['alias']}:{sha(spec['goal'])[:8]}"
         chat = Chat(
             id=chat_id,
             provider="grok",

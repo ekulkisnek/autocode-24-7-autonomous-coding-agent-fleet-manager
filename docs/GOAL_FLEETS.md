@@ -39,7 +39,7 @@ python3 scripts/dispatch-goal-fleets.py
 |----|------------------|-------|
 | `l1-e2e-verified` | `L1_VERIFIED_EVIDENCE.md` has 2 txids + verify=ok + detox_exit=0 | `l1-e2e-until-verified` cursor fleet (+ grok fallback) + shell loop |
 | `windows-remote-health` | ping + bench OK + remote job `worked` | `windows-remote-health` grok chat |
-| `liquid-utreexo-windows` | Mac signet probes + liquid chat progress | `dispatch-liquid-utreexo-jobs.py` |
+| `liquid-utreexo-windows` | Mac signet probes + liquid chat progress | `dispatch-liquid-utreexo-jobs.py` (grok on windows-main) |
 | `github-sync-ekulkisnek` | ekulkisnek forks pushed, no ahead | `github-sync-ekulkisnek` grok chat |
 
 ## L1 path (ONE at a time)

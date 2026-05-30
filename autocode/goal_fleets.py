@@ -232,9 +232,25 @@ def _l1_loop_running() -> bool:
             text=True,
             timeout=5,
         )
-        return bool((out.stdout or "").strip())
+        pids = [int(p.strip()) for p in (out.stdout or "").splitlines() if p.strip().isdigit()]
     except Exception:
         return False
+    for pid in pids:
+        try:
+            ps = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            cmd = (ps.stdout or "").strip()
+            if "cursor-agent" in cmd:
+                continue
+            if "bash" in cmd and "run-l1-e2e-until-verified.sh" in cmd:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def start_l1_loop_if_needed(status: dict[str, Any]) -> bool:

@@ -21,7 +21,7 @@ No manual Cursor subagents or parallel orchestrators.
 |------|-----|---------|
 | L1 E2E | cursor goal-fleet (grok fallback) + shell orchestrator loop | — |
 | Windows health | — | grok on windows-main (sequential) |
-| Liquid/Floresta | cursor dispatch script | grok jobs via dispatch-liquid-utreexo-jobs.py |
+| Liquid/Floresta | grok fleet dispatch (Mac orchestrator) | grok jobs via dispatch-liquid-utreexo-jobs.py on windows-main |
 | GitHub sync | grok goal-fleet on redwallet | — |
 
 ## L1 path selection
