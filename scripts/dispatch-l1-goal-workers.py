@@ -343,11 +343,26 @@ def l1_detox_or_shell_active() -> bool:
     from autocode import coordination
     from autocode.goal_fleets import _l1_loop_running, _l1_orchestrator_running
 
-    return (
+    base = (
         coordination.l1_lock_active()
         or _l1_orchestrator_running()
         or _l1_loop_running()
     )
+    if base:
+        return True
+    # Extra: detect active Detox jest legs even if lock ps missed (prevents concurrent leg launches from parallel supervisors)
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", r"jest.*l1_(ios_simulator_to_android|android_phone_to_ios_simulator)"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if (out.stdout or "").strip():
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def main() -> None:
