@@ -62,6 +62,25 @@ def _port_open(host: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
+def ensure_colima(actions: list[str]) -> bool:
+    rc, _ = _run(["docker", "info"], timeout=15)
+    if rc == 0:
+        return False
+    rc, out = _run(["colima", "status"], timeout=15)
+    if rc != 0:
+        actions.append("starting_colima")
+        rc2, start_out = _run(["colima", "start"], timeout=180)
+        if rc2 != 0:
+            actions.append(f"colima_start_failed:{start_out[:120]}")
+            return False
+        actions.append("colima_started")
+        return True
+    actions.append("colima_reported_running_but_docker_down")
+    _run(["colima", "start"], timeout=180)
+    return True
+
+
+
 def _load_status() -> dict:
     if not VERIFY_SCRIPT.is_file():
         return {"all_complete": False, "goals": []}
@@ -107,7 +126,7 @@ def ensure_l1_loop(actions: list[str], status: dict) -> bool:
     env.setdefault("L1_E2E_SKIP_PHYSICAL_IOS", "1")
     env.setdefault("L1_E2E_MAX_ATTEMPTS", "9999")
     env.setdefault("L1_E2E_RETRY_SLEEP", "45")
-    env.setdefault("L1_E2E_POST_FUND_RELAUNCH", "1")
+    env.setdefault("L1_E2E_POST_FUND_RELAUNCH", "0")
     env.setdefault("L1_E2E_POST_FUND_MINE_BLOCKS", "6")
     env.setdefault("L1_E2E_DETOX_REUSE", "0")
     with log_path.open("a", encoding="utf-8") as log:
@@ -122,6 +141,29 @@ def ensure_l1_loop(actions: list[str], status: dict) -> bool:
         )
     actions.append("spawned_l1_until_verified_loop")
     return True
+
+
+
+MAINCHAIN_CONTAINER = "private-drivechain-local-mainchain-1"
+ELECTRS_CONTAINER = "l1-electrs-shim"
+
+
+def ensure_docker_l1_stack(actions: list[str]) -> bool:
+    """Start mainchain + electrs when electrum port is down but Docker is available."""
+    if _port_open("127.0.0.1", 60101):
+        return False
+    rc, out = _run(["docker", "info"], timeout=20)
+    if rc != 0:
+        actions.append(f"docker_unavailable:{out[:120]}")
+        return False
+    changed = False
+    for name in (MAINCHAIN_CONTAINER, ELECTRS_CONTAINER):
+        rc2, _ = _run(["docker", "start", name], timeout=90)
+        if rc2 == 0:
+            changed = True
+    if changed:
+        actions.append("started_l1_docker_containers")
+    return changed
 
 
 def ensure_electrum(actions: list[str]) -> bool:
@@ -168,6 +210,7 @@ def run_supervisor(*, json_out: bool = False) -> dict:
 
     ensure_daemon(actions)
     ensure_yolo(actions)
+    ensure_docker_l1_stack(actions)
     ensure_electrum(actions)
     clear_provider_backoff(actions)
 

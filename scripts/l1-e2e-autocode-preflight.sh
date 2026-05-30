@@ -53,8 +53,18 @@ mainchain_height() {
 log "preflight start simulator path"
 
 if ! docker info >/dev/null 2>&1; then
+  log "docker down — attempting colima start"
+  if command -v colima >/dev/null 2>&1; then
+    colima start >>"$PREFLIGHT_LOG" 2>&1 || true
+  fi
+fi
+if ! docker info >/dev/null 2>&1; then
   log "BLOCKER docker unavailable"
   exit 2
+fi
+# LMDB stability after Colima cold start
+if [[ -x "$LOCAL_DEV/scripts/ensure-colima-overcommit.sh" ]]; then
+  bash "$LOCAL_DEV/scripts/ensure-colima-overcommit.sh" >>"$PREFLIGHT_LOG" 2>&1 || true
 fi
 
 export L1_E2E_COMPOSE_FILE="$COMPOSE_FILE"
